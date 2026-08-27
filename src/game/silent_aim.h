@@ -23,6 +23,8 @@ namespace Game::SilentAim
         std::uint64_t attackPrepares = 0;
         std::uint64_t crosshairCalls = 0;
         std::uint64_t defaultCrosshairCalls = 0;
+        std::uint64_t nativeCrosshairCoreCalls = 0;
+        std::uint64_t nativeCrosshairCoreRedirects = 0;
     };
 
     // Resolves observation-only effect/attack/crosshair native handlers plus projectile ShootEvent listeners.

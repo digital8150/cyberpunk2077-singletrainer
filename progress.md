@@ -465,3 +465,97 @@
   because no armed shot was fired during this startup-only validation. The next live test must hold the configured
   activation key with a valid target and correlate one ordinary shot against the five counters before any mutation
   is enabled.
+
+## 2026-08-28 - Silent-aim producer classification Step 1a (shared-data reflected probe)
+
+- Live combat with the producer instrumentation showed only `EffectInstance::Run` fires on ordinary gunfire
+  (0 -> 6 within ~240 ms of a shot), while `StartAttack`/`PrepareAttack`/`GetCrosshairData`/`GetDefaultCrosshairData`
+  and the projectile listeners stayed at 0. This confirms native hitscan bypasses the script attack-prep helpers and
+  is consistent with the shipped REDmod recipes (`tankTurret`, `damageSystem` ricochet) driving the shot through the
+  `gameEffectInstance` shared-data pipeline. It does NOT yet prove any of those 6 Run calls is the ballistic/damage
+  effect: a single hitscan shot spawns several cosmetic effects (muzzle flash, tracer, casing, audio, impact) that
+  also route through `Run`, and many are script-driven (`baseBullet.OnShoot`). Classification of the 6 is required.
+- The producer hook logged the Run handler `context` type as `?(0)` because `NativeType()` reads the CClass at
+  `+0x30`, which holds the type only for heavy game entities; `gameEffectInstance` is a lightweight native
+  `IScriptable` whose type comes from its vtable `GetType()`, not `+0x30`. So the null type is a NativeType-path
+  artifact, not evidence the context is wrong. Do not apply guessed offsets to the Run context.
+- The shipped `core/gameplay/gameplayEffects.script` exposes a fully reflected path that needs no internal-function
+  ABI and no IDA: `gameEffectInstance::GetSharedData() : EffectData`, plus the `EffectData` statics
+  `GetVariant/GetBool/GetVector`. The `EffectSharedDataDef` blackboard (`core/blackboard/blackboardDefinitions.script`)
+  carries `attack` (variant, identifies a real combat attack), `playerOwnedWeapon` (bool), `position`,
+  `muzzlePosition`, `forward`, and `raycastEnd` (the game itself sets `raycastEnd` to an enemy chest slot to force a
+  hit in `triggerAttackOnNearbyEnemiesEffector`). This is the same reflected-invocation methodology already proven
+  for LookAt/StatPools, not offset guessing.
+- Implemented Step 1a as an observation-only reflected probe (`kEnableSharedDataProbe`, mutation stays 0). When an
+  `EffectInstance::Run` handler fires while a target is armed, it validates the context vtable is inside the
+  executable, then invokes the 0-argument const getter `GetSharedData()` via the existing `rtti::Invoke`, into a
+  64-byte over-provisioned result buffer (covers a pointer or a small struct return with no stack risk). It is
+  reentrancy-guarded (thread-local) with `__try/__finally` reset, bounded to 256 attempts, and logs the first 16
+  results (`invoked`, `valid`, `shared` handle). Startup resolves the getter once and disables the probe unless it is
+  a 0-parameter function. This is the low-risk increment that settles the central unknown (is `context` really an
+  EffectInstance, and is a reflected call from inside the handler stable) before any field reads or mutation.
+- Release build passed with no warnings (only `silent_aim.cpp` recompiled). Injected into PID 17276 (RED4ext present,
+  our DLL not previously loaded): `shared-data getter: params=0 hasReturn=1`, `producers=5`, no exceptions, process
+  `Responding=True`.
+- **Live result: the probe answered Step 1a's question YES, then froze the game.** During combat it fired
+  `invoked=1 valid=1` with valid `shared` handles (0x27E4xxxx range) and a consistent context vtable
+  `0x7FF75474E6B8` across every call, proving the Run handler `context` is a real `gameEffectInstance` and that
+  `GetSharedData()` returns valid shared data. But the probes ran on many concurrent game threads (e.g. tid 30100 and
+  31432 both at `01:56:38.540`), and after 8 successful probes two threads reentering the script VM
+  (`InternalExecute`) inside the Run dispatch simultaneously deadlocked the game (`Responding=False`, hung — like the
+  earlier synchronous spatial-query freeze; `--unload` cannot recover because the hooked callback never returns, so
+  the process must be force-killed).
+- **Rule reaffirmed / new constraint:** never call a synchronous REDengine or script-VM function from inside a hot
+  native handler on arbitrary game threads. `kEnableSharedDataProbe` is set to `false`; the in-handler reflected call
+  must not be re-enabled. The plain producer counters (no VM call) remain safe as previously verified.
+- **What Step 1b must change:** we already have the confirmed EffectInstance context and a way to obtain the shared
+  data, but not from inside Run concurrently. Options to evaluate next (all still avoiding IDA): (a) serialize probes
+  through a single global gate so at most one thread ever reflects, and cap to a handful of one-shot captures rather
+  than every Run; (b) capture the raw `context`/`shared` pointer during Run and read `playerOwnedWeapon`/`attack`/
+  `position`/`forward` directly from the EffectData/blackboard memory layout without the VM; (c) reconsider whether a
+  lower-frequency, single-threaded producer exists. The safe rebuilt DLL (probe off) is ready to reinject once the
+  frozen PID 17276 is restarted.
+
+## 2026-08-28 - RED4ext.SDK EffectInstance/EffectData layout inspection (Step 1b prep)
+
+- Inspected the RED4ext.SDK generated headers to see how much of the shared-data layout the public SDK already
+  gives us before writing any Step 1b code. Result: the SDK is fully opaque for both types, so field offsets
+  (`raycastEnd`/`forward`/`position`/`muzzlePosition`/`playerOwnedWeapon`) must be reverse-mapped live, not read
+  from the SDK.
+  - `game::EffectInstance` (`gameEffectInstance`) inherits `game::IEffect`, `RED4EXT_ASSERT_SIZE = 0x5AB0`, and its
+    only body is an opaque `uint8_t unk40[0x5AB0 - 0x40]`. No named fields. This is consistent with Step 1a's
+    confirmed context being a large native IScriptable.
+  - `game::EffectData` (`gameEffectData`) is only `RED4EXT_ASSERT_SIZE = 0x8` with a single opaque `unk00[0x8]`.
+    That means the value returned by `GetSharedData()` is an 8-byte handle/pointer to the shared blackboard, not an
+    inline struct — matching Step 1a's `GetSharedData()` returning a pointer-sized `shared` handle. Reads must
+    dereference this handle, not treat the 8 bytes as the data itself.
+  - Takeaway for Step 1b: the reflected `EffectData` statics (`GetVariant`/`GetBool`/`GetVector`) are the only
+    documented way to read named fields; the raw byte offsets behind the handle have to be recovered by comparing
+    a reflected value against raw memory on the game main tick (same reverse-mapping method used for the
+    `isCivilian/isPolice/isGanger` property offsets), because the SDK exposes none of them.
+
+## 2026-08-28 - Silent aim landed via native crosshair core direction redirect
+
+- An experimental combined build (7 producer hooks, `raycastEnd` effect-ray mutation through shared-data slot
+  probing, plus a first native-crosshair-core redirect with verbose per-call logging) fired both mutation paths in
+  live combat at 05:08 (`redirected effect ray` count=2, crosshair redirects count=4), then the game crashed at
+  05:08:51 (`CrashInfo.json`, player position matching the logged shot origin, session 587 s). The crash could not
+  be attributed to a single path because the effect-ray mutation, raw shared-data probing on game threads, and the
+  crosshair hook were all active simultaneously. That combined build was never committed.
+- The source was pared down to a single mutation as the isolation step: hook only the native crosshair core.
+  A 37-byte AOB (1 exact match in 2.31) finds the `TargetingSystem::GetCrosshairData` native wrapper at
+  `Cyberpunk2077.exe+0x2A60F44`; following the `call` at wrapper `+0x3C` resolves the shared core at
+  `Cyberpunk2077.exe+0x4D8354` used by ordinary firearm shots. The MinHook detour calls the original first, then — only while a fresh armed
+  target exists — rewrites the caller-visible `direction` vector (normalized `target - origin`, SEH-guarded,
+  finite/length-checked). All effect-ray mutation, slot probing, and verbose experiments were removed; the five
+  producer hooks stay observation-only. Diagnostics now include the armed target's cached health/dead state.
+- Live validation on PID 2620 (injected 07:19, combat 07:26): while armed, `nativeCrosshairCoreRedirects` grew
+  0 -> 1,500+ with `rejected=0`, armed targets' health dropped in step with fire (e.g. 158.67 -> 46.33 within 2 s;
+  several other targets driven to sub-half health), and the user visually confirmed off-crosshair shots landing on
+  the armed target. No crash, no freeze, game responsive throughout; the earlier `CrashInfo.json` timestamp
+  (05:08:51) did not change. Conclusion: the crosshair-core `direction` out-param alone steers real hitscan
+  ballistics on 2.31 — no shared-data/effect mutation is needed for silent aim.
+- Notes for follow-up: the core is called continuously (~70/s during combat), not per shot, so redirects while
+  armed are frequent by design; one armed target reported `healthValid=0` (stat pool not yet resolved) and one had
+  4,343 max health (likely a vehicle/boss-class puppet) — target filtering may want a health-pool validity check
+  later. Crash-cause isolation for the retired effect-ray path is moot unless that path is ever needed again.

@@ -47,6 +47,15 @@ namespace
     };
     constexpr char kQueueEventInternalMask[] = "xxxxxxxxxxxxxxx?xxxxxxxx????xxxxx";
     static_assert(sizeof(kQueueEventInternalPattern) == sizeof(kQueueEventInternalMask) - 1);
+    // TargetingSystem::GetCrosshairData native wrapper on Cyberpunk 2077 2.31. Its call at +0x3C
+    // resolves the shared native core used by ordinary firearm shots.
+    constexpr std::uint8_t kNativeCrosshairPattern[] = {
+        0x4C, 0x8B, 0xDC, 0x48, 0x83, 0xEC, 0x68, 0x0F, 0x28, 0x05, 0x00, 0x00, 0x00, 0x00,
+        0x8A, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x88, 0x44, 0x24, 0x38, 0x49, 0x8D, 0x43,
+        0xD8, 0x4D, 0x89, 0x4B, 0xC8, 0x4D, 0x8D, 0x4B, 0xE8,
+    };
+    constexpr char kNativeCrosshairMask[] = "xxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxx";
+    static_assert(sizeof(kNativeCrosshairPattern) == sizeof(kNativeCrosshairMask) - 1);
 
     struct DynArrayLayout
     {
@@ -118,6 +127,8 @@ namespace
     using ListenerFn = void (*)(void*, void*);
     using NativeHandlerFn = void (*)(void*, void*, void*, void*);
     using QueueEventInternalFn = void (*)(void*, Game::Rtti::Handle*);
+    using NativeCrosshairCoreFn = void (*)(void*, Vector4Layout*, Vector4Layout*, Vector4Layout*,
+                                           void*, float, void*, bool);
     using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
 
     enum class ListenerHookKind : std::uint8_t
@@ -165,6 +176,8 @@ namespace
         std::atomic_uint64_t attackPrepares{0};
         std::atomic_uint64_t crosshairCalls{0};
         std::atomic_uint64_t defaultCrosshairCalls{0};
+        std::atomic_uint64_t nativeCrosshairCoreCalls{0};
+        std::atomic_uint64_t nativeCrosshairCoreRedirects{0};
     };
 
     State g_state;
@@ -174,6 +187,8 @@ namespace
     const Game::Rtti::Class* g_weaponShootClass = nullptr;
     void* g_queueHookTarget = nullptr;
     QueueEventInternalFn g_originalQueueEventInternal = nullptr;
+    void* g_nativeCrosshairCoreTarget = nullptr;
+    NativeCrosshairCoreFn g_originalNativeCrosshairCore = nullptr;
     std::array<void*, kMaxProducerHooks> g_producerHookTargets{};
     std::array<NativeHandlerFn, kMaxProducerHooks> g_originalProducerHandlers{};
     std::array<ProducerHookKind, kMaxProducerHooks> g_producerHookKinds{};
@@ -223,6 +238,118 @@ namespace
         const Game::Rtti::Class* type = Game::Rtti::NativeType(owner);
         return Game::Rtti::IsClassOrDerived(type, kPlayerPuppetType) ||
                Game::Rtti::IsClassOrDerived(type, kGamePlayerPuppetType);
+    }
+
+    bool RedirectNativeCrosshair(Vector4Layout* origin, Vector4Layout* direction)
+    {
+        if (!origin || !direction)
+            return false;
+        float target[3]{};
+        if (!ReadTarget(target))
+            return false;
+
+        const float dx = target[0] - origin->x;
+        const float dy = target[1] - origin->y;
+        const float dz = target[2] - origin->z;
+        const float lengthSquared = dx * dx + dy * dy + dz * dz;
+        if (!std::isfinite(lengthSquared) || lengthSquared < 0.01f)
+            return false;
+
+        const float inverseLength = 1.0f / std::sqrt(lengthSquared);
+        direction->x = dx * inverseLength;
+        direction->y = dy * inverseLength;
+        direction->z = dz * inverseLength;
+        direction->w = 0.0f;
+        return true;
+    }
+
+    bool RedirectNativeCrosshairSafely(Vector4Layout* origin, Vector4Layout* direction)
+    {
+        __try
+        {
+            return RedirectNativeCrosshair(origin, direction);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_state.rejectedShots.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    void HookNativeCrosshairCore(void* targetingSystem, Vector4Layout* origin,
+                                 Vector4Layout* direction, Vector4Layout* crosshairPosition,
+                                 void* queryContext, float maxDistance, void* filter, bool useRaycast)
+    {
+        HookLifecycle::CallbackGuard guard;
+        if (g_originalNativeCrosshairCore)
+        {
+            g_originalNativeCrosshairCore(targetingSystem, origin, direction, crosshairPosition,
+                                          queryContext, maxDistance, filter, useRaycast);
+        }
+        if (HookLifecycle::IsShuttingDown())
+            return;
+
+        const bool redirected = RedirectNativeCrosshairSafely(origin, direction);
+
+        const std::uint64_t count =
+            g_state.nativeCrosshairCoreCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (redirected)
+            g_state.nativeCrosshairCoreRedirects.fetch_add(1, std::memory_order_relaxed);
+        if (redirected && (count <= 12 || (count & (count - 1)) == 0))
+        {
+            Diagnostics::Log("silent aim crosshair redirected: count=%llu raycast=%u "
+                             "origin=(%.3f,%.3f,%.3f) direction=(%.6f,%.6f,%.6f)",
+                             static_cast<unsigned long long>(count), useRaycast ? 1u : 0u,
+                             origin->x, origin->y, origin->z,
+                             direction->x, direction->y, direction->z);
+        }
+    }
+
+    bool AddNativeCrosshairCoreHook()
+    {
+        const Game::Signatures::ScanResult scan = Game::Signatures::FindInText(
+            GetModuleHandleW(L"Cyberpunk2077.exe"), kNativeCrosshairPattern, kNativeCrosshairMask,
+            sizeof(kNativeCrosshairPattern));
+        Diagnostics::Log("silent aim native crosshair wrapper scan: matches=%zu target=%p",
+                         scan.matches, scan.address);
+        if (scan.matches != 1 || !scan.address)
+            return false;
+
+        void* coreTarget = nullptr;
+        __try
+        {
+            const auto* call = static_cast<const std::uint8_t*>(scan.address) + 0x3C;
+            if (*call == 0xE8)
+            {
+                std::int32_t displacement = 0;
+                std::memcpy(&displacement, call + 1, sizeof(displacement));
+                coreTarget = const_cast<std::uint8_t*>(call + 5 + displacement);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            coreTarget = nullptr;
+        }
+        if (!IsExecutableAddress(coreTarget))
+        {
+            Diagnostics::Log("silent aim native crosshair core resolution failed: wrapper=%p target=%p",
+                             scan.address, coreTarget);
+            return false;
+        }
+
+        const MH_STATUS status = MH_CreateHook(
+            coreTarget, &HookNativeCrosshairCore,
+            reinterpret_cast<void**>(&g_originalNativeCrosshairCore));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(silent aim crosshair core) failed: target=%p status=%s (%d)",
+                             coreTarget, MH_StatusToString(status), status);
+            return false;
+        }
+        g_nativeCrosshairCoreTarget = coreTarget;
+        Diagnostics::Log("silent aim native crosshair core hook created: target=%p original=%p mutation=1",
+                         coreTarget, reinterpret_cast<void*>(g_originalNativeCrosshairCore));
+        return true;
     }
 
     void ObserveWeaponShootEvent(void* event, const Game::Rtti::Class* type)
@@ -803,6 +930,7 @@ namespace Game::SilentAim
         __try
         {
             bool created = false;
+            created = AddNativeCrosshairCoreHook() || created;
             created = AddProducerObservationHook("gameEffectInstance", "Run", ProducerHookKind::EffectRun) || created;
             created = AddProducerObservationHook("gameAttack_GameEffect", "StartAttack",
                                                  ProducerHookKind::AttackStart) || created;
@@ -896,6 +1024,9 @@ namespace Game::SilentAim
         result.attackPrepares = g_state.attackPrepares.load(std::memory_order_relaxed);
         result.crosshairCalls = g_state.crosshairCalls.load(std::memory_order_relaxed);
         result.defaultCrosshairCalls = g_state.defaultCrosshairCalls.load(std::memory_order_relaxed);
+        result.nativeCrosshairCoreCalls = g_state.nativeCrosshairCoreCalls.load(std::memory_order_relaxed);
+        result.nativeCrosshairCoreRedirects =
+            g_state.nativeCrosshairCoreRedirects.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -917,6 +1048,10 @@ namespace Game::SilentAim
         g_queueHookTarget = nullptr;
         g_originalQueueEventInternal = nullptr;
         g_state.queueHookCreated.store(false, std::memory_order_release);
+        if (g_nativeCrosshairCoreTarget)
+            MH_RemoveHook(g_nativeCrosshairCoreTarget);
+        g_nativeCrosshairCoreTarget = nullptr;
+        g_originalNativeCrosshairCore = nullptr;
         const std::uint32_t producerCount = g_state.producerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < producerCount && index < kMaxProducerHooks; ++index)
         {
@@ -929,7 +1064,8 @@ namespace Game::SilentAim
         g_state.hookCreated.store(false, std::memory_order_release);
         Diagnostics::Log("silent aim shutdown: callbacks=%llu queue=%llu projectile=%llu weapon=%llu local=%llu validated=%llu "
                          "redirected=%llu rejected=%llu effectRun=%llu attackStart=%llu attackPrepare=%llu "
-                         "crosshair=%llu defaultCrosshair=%llu",
+                         "crosshair=%llu defaultCrosshair=%llu nativeCrosshairCore=%llu "
+                         "nativeCrosshairRedirects=%llu",
                          static_cast<unsigned long long>(g_state.callbacks.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.queueCallbacks.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.projectileEvents.load(std::memory_order_relaxed)),
@@ -942,6 +1078,8 @@ namespace Game::SilentAim
                          static_cast<unsigned long long>(g_state.attackStarts.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.attackPrepares.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.crosshairCalls.load(std::memory_order_relaxed)),
-                         static_cast<unsigned long long>(g_state.defaultCrosshairCalls.load(std::memory_order_relaxed)));
+                         static_cast<unsigned long long>(g_state.defaultCrosshairCalls.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_state.nativeCrosshairCoreCalls.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_state.nativeCrosshairCoreRedirects.load(std::memory_order_relaxed)));
     }
 }

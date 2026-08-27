@@ -189,11 +189,26 @@ namespace Aimbot
             if (now - lastSilentLogTick >= 2000)
             {
                 const Game::SilentAim::DiagnosticsSnapshot diagnostics = Game::SilentAim::GetDiagnostics();
+                const Game::EntityTracker::PuppetSnapshot* selected = nullptr;
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    if (puppets[i].entityId == bestEntityId)
+                    {
+                        selected = &puppets[i];
+                        break;
+                    }
+                }
                 Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) "
+                                 "healthValid=%u health=%.2f/%.2f dead=%u "
                                  "producerHooks=%u listenerHooks=%u callbacks=%llu projectile=%llu local=%llu validated=%llu "
                                  "effectRun=%llu attackStart=%llu attackPrepare=%llu crosshair=%llu defaultCrosshair=%llu "
-                                 "redirected=%llu rejected=%llu mutation=0",
+                                 "nativeCrosshairCore=%llu nativeCrosshairRedirects=%llu "
+                                 "redirected=%llu rejected=%llu mutation=1",
                                  static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
+                                 selected && selected->healthValid ? 1u : 0u,
+                                 selected ? selected->healthCurrent : 0.0f,
+                                 selected ? selected->healthMax : 0.0f,
+                                 selected && selected->isDead ? 1u : 0u,
                                  diagnostics.producerHooks, diagnostics.listenerHooks,
                                  static_cast<unsigned long long>(diagnostics.callbacks),
                                  static_cast<unsigned long long>(diagnostics.projectileEvents),
@@ -204,6 +219,8 @@ namespace Aimbot
                                  static_cast<unsigned long long>(diagnostics.attackPrepares),
                                  static_cast<unsigned long long>(diagnostics.crosshairCalls),
                                  static_cast<unsigned long long>(diagnostics.defaultCrosshairCalls),
+                                 static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreCalls),
+                                 static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreRedirects),
                                  static_cast<unsigned long long>(diagnostics.redirectedShots),
                                  static_cast<unsigned long long>(diagnostics.rejectedShots));
                 lastSilentLogTick = now;
