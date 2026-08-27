@@ -1,0 +1,3 @@
+[submodule "tools/cheat-engine-mcp-server"]
+	path = tools/cheat-engine-mcp-server
+	url = https://github.com/bethington/cheat-engine-server-python.git

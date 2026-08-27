@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cheat-engine": {
+      "command": "tools/cheat-engine-mcp-server/.venv/Scripts/python.exe",
+      "args": ["tools/cheat-engine-mcp-server/server/main.py", "--read-only"]
+    }
+  }
+}

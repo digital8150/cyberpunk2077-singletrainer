@@ -1,0 +1,26 @@
+# 빌드 산출물 (트레이너 DLL 스캐폴딩 추가 시 확장)
+build/
+out/
+bin/
+obj/
+*.dll
+*.pdb
+*.exp
+*.lib
+
+# 일회성 스크립트 결과물 / 상태
+tools/scripts/temp/*
+!tools/scripts/temp/.gitkeep
+tools/scripts/.memtool_state/
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 에디터/OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
