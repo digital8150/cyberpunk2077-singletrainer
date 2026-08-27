@@ -8,6 +8,18 @@ namespace Game::Rtti
     struct Class;
     struct Function;
 
+    struct FunctionInfo
+    {
+        std::uint64_t fullNameHash = 0;
+        std::uint64_t shortNameHash = 0;
+        const Class* parent = nullptr;
+        std::uint32_t flags = 0;
+        std::uint32_t registrationIndex = 0;
+        std::size_t parameterCount = 0;
+        bool hasReturnValue = false;
+        void* nativeHandler = nullptr;
+    };
+
     // The game uses a two-pointer handle for ref<T>/wref<T>.  Keep this
     // deliberately opaque to callers: it is only exposed so reflected
     // functions can receive the same storage layout as the script VM.
@@ -37,6 +49,8 @@ namespace Game::Rtti
     Class* NativeType(const void* object);
     bool IsClassOrDerived(const Class* type, std::uint64_t nameHash);
     Function* FindFunction(const Class* type, std::uint64_t functionNameHash);
+    const char* ResolveName(std::uint64_t nameHash);
+    bool InspectFunction(const Function* function, FunctionInfo& output);
 
     // Minimal wrappers around the engine RTTI services used by main-tick
     // feature code.  These resolve through RED4ext and are safe no-ops when

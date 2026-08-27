@@ -38,6 +38,7 @@ add_library(cp2077_trainer SHARED
     src/game/aim_assist.cpp
     src/game/animation_data.cpp
     src/game/rtti_invoker.cpp
+    src/game/silent_aim.cpp
     src/game/signature_scanner.cpp
     src/game/entity_tracker.cpp
     src/game/player_modifiers.cpp

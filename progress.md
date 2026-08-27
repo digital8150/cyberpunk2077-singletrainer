@@ -425,3 +425,43 @@
   - 최종 Release 빌드에서 FPP 및 컨트롤러 AOB가 각각 정확히 1개 매치했고 로컬 player/FPP camera 해석과
     게임 응답 상태를 확인했다. 실제 우클 타겟 추적 로그는 아직 발생하지 않았지만, yaw/pitch 각 입력 경로는
     별도의 자동 실메모리 프로브로 화면 반응을 검증했다.
+## 2026-08-28 - Silent-aim weapon event listener path rejected
+
+- Live combat confirmed the original projectile-component listener does not receive ordinary gunfire: target
+  selection armed correctly, but projectile/weapon/redirect counters remained zero.
+- A read-only `Entity::QueueEvent` observer was stable and processed hundreds of thousands of events, but event ID
+  108 (`gameweaponeventsShootEvent`) never traversed that path. The observer was removed from normal startup.
+- Full RTTI enumeration found exactly two native listener entries for event ID 108. Hooking those raw callback code
+  targets was not safe: the targets are reused outside the typed listener dispatch. Treating their second argument as
+  either an `IScriptable` event or the known 0x1E0 payload never produced a valid payload, and the latter experiment
+  generated a new 2.31 crash at 01:09:51 before any payload log was written.
+- Weapon-listener observation hooks and all silent-aim mutation remain disabled. Do not re-enable these raw callback
+  target hooks. Future work must hook a call site that still carries explicit event metadata or the weapon fire/
+  ballistic producer itself.
+
+## 2026-08-28 - Silent-aim producer-path observation instrumentation
+
+- The shipped REDmod scripts confirm that hitscan attacks use the `gameEffectInstance` shared-data pipeline. The
+  native RTTI names differ from their REDscript aliases: `gameEffectInstance`, `gameAttack_GameEffect`, and
+  `gametargetingTargetingSystem`. `StartAttack` is inherited from `gameIAttack`; `PrepareAttack` belongs to
+  `gameAttack_GameEffect`.
+- Extended the RTTI bridge with CName-pool reverse lookup and native function metadata inspection. The public
+  RED4ext SDK describes native instance dispatch as `CBaseFunction_Handlers[regIndex]`, but its relocation resolves
+  to the table base on 2.31. Read-only disassembly of `rtti::Function::InternalCallNative` at
+  `Cyberpunk2077.exe+0x14619C` confirmed the direct `base + 0x33E6E50 + regIndex * 8` lookup; an extra pointer
+  dereference incorrectly produced null handlers and was removed.
+- Added observation-only hooks for five uniform RTTI VM handlers. Live 2.31 resolution produced unique targets:
+  `EffectInstance::Run` at `+0x1070334`, inherited `IAttack::StartAttack` at `+0x1D90FE0`,
+  `Attack_GameEffect::PrepareAttack` at `+0x1D912B0`, `TargetingSystem::GetCrosshairData` at `+0x2512ACC`, and
+  `GetDefaultCrosshairData` at `+0x2512D70`. The detours use the documented native handler ABI, participate in the
+  unload callback guard, immediately pass through when no fresh target is armed, and only increment/log counters.
+  No stack-frame fields, effect data, crosshair outputs, or projectile data are modified.
+- CName reverse lookup identified the two event-108 subscribers as `gameuiCrosshairContainerController` and
+  `gameWeaponAudioComponent` (callback CName `function`). Their unsafe raw targets remain enumeration-only and are
+  never hooked. Startup diagnostics confirmed `producers=5`, `projectileListeners=1`, `weaponListenerHooks=0`,
+  `queueHook=0`, and `mutation=0`.
+- Release build and `git diff --check` passed. Live injection into PID 17276 created all five producer hooks without
+  exceptions and the game remained responsive. Safe unload removed the DLL with all producer counters still zero
+  because no armed shot was fired during this startup-only validation. The next live test must hold the configured
+  activation key with a valid target and correlate one ordinary shot against the five counters before any mutation
+  is enabled.

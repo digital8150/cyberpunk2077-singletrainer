@@ -29,4 +29,12 @@ namespace Features
         Aimbot::DrawOverlay(g_settings.aimbot);
         FpsCounter::Draw(g_settings.showFps);
     }
+
+    void UpdateHeadless(float displayWidth, float displayHeight)
+    {
+        Config::Update();
+        Game::PlayerModifiers::PublishDesired(g_settings.noRecoil);
+        Game::Visibility::BeginFrame();
+        Aimbot::UpdateHeadless(g_settings.aimbot, displayWidth, displayHeight);
+    }
 }

@@ -24,6 +24,8 @@ namespace Features
     struct AimbotSettings
     {
         bool enabled = false;
+        // Selects a target for the observation-gated fire/effect path without moving the camera/controller.
+        bool silentAim = false;
         bool drawFovCircle = true;
         bool targetEnemies = true;
         bool targetPolice = false;
@@ -46,4 +48,5 @@ namespace Features
 
     // ImGui::NewFrame 이후 호출. 메뉴 표시 여부와 무관하게 활성 기능의 HUD 요소를 그린다.
     void DrawOverlay();
+    void UpdateHeadless(float displayWidth, float displayHeight);
 }

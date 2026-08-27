@@ -5,6 +5,7 @@
 #include "../game/aim_assist.h"
 #include "../game/entity_tracker.h"
 #include "../game/projection.h"
+#include "../game/silent_aim.h"
 #include "../game/visibility.h"
 #include "../ui/overlay.h"
 
@@ -27,6 +28,7 @@ namespace Aimbot
         {
             if (g_aimActive)
                 Game::AimAssist::ClearMemoryAim();
+            Game::SilentAim::ClearTarget();
             g_aimActive = false;
             g_lockedEntityId = 0;
             g_lastApplyTick = 0;
@@ -75,7 +77,8 @@ namespace Aimbot
         }
     }
 
-    void DrawOverlay(const Features::AimbotSettings& settings)
+    void RunFrame(const Features::AimbotSettings& settings, float displayWidth, float displayHeight,
+                  ImDrawList* drawList)
     {
         if (!settings.enabled)
         {
@@ -83,15 +86,14 @@ namespace Aimbot
             return;
         }
 
-        Game::AimAssist::ProbePlayerCamera();
+        if (!settings.silentAim)
+            Game::AimAssist::ProbePlayerCamera();
 
-        const ImGuiIO& io = ImGui::GetIO();
-        if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f)
+        if (displayWidth <= 0.0f || displayHeight <= 0.0f)
             return;
 
-        const ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
-        if (settings.drawFovCircle)
+        const ImVec2 center(displayWidth * 0.5f, displayHeight * 0.5f);
+        if (drawList && settings.drawFovCircle)
         {
             drawList->AddCircle(center, settings.fovRadiusPixels, IM_COL32(0, 0, 0, 180), 128, 2.8f);
             drawList->AddCircle(center, settings.fovRadiusPixels, IM_COL32(62, 157, 255, 220), 128, 1.4f);
@@ -119,7 +121,7 @@ namespace Aimbot
             float aimWorld[3]{};
             GetAimPoint(puppet, aimWorld);
             Game::Projection::ScreenPoint point;
-            if (!Game::Projection::WorldToScreen(aimWorld, io.DisplaySize.x, io.DisplaySize.y, point) ||
+            if (!Game::Projection::WorldToScreen(aimWorld, displayWidth, displayHeight, point) ||
                 point.behind || point.depth <= 0.0f || point.depth > settings.maxDistanceMeters)
             {
                 continue;
@@ -166,7 +168,8 @@ namespace Aimbot
             return;
         }
 
-        drawList->AddCircle(ImVec2(bestPoint.x, bestPoint.y), 5.0f, IM_COL32(255, 92, 105, 245), 20, 1.6f);
+        if (drawList)
+            drawList->AddCircle(ImVec2(bestPoint.x, bestPoint.y), 5.0f, IM_COL32(255, 92, 105, 245), 20, 1.6f);
         if (!activationHeld || Overlay::IsVisible() || !IsGameForeground())
         {
             StopAim();
@@ -176,6 +179,38 @@ namespace Aimbot
         if (g_lockedEntityId == 0)
             g_lockedEntityId = bestEntityId;
         const ULONGLONG now = GetTickCount64();
+        if (settings.silentAim)
+        {
+            if (g_aimActive)
+                Game::AimAssist::ClearMemoryAim();
+            g_aimActive = false;
+            Game::SilentAim::PublishTarget(bestWorld, true);
+            static ULONGLONG lastSilentLogTick = 0;
+            if (now - lastSilentLogTick >= 2000)
+            {
+                const Game::SilentAim::DiagnosticsSnapshot diagnostics = Game::SilentAim::GetDiagnostics();
+                Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) "
+                                 "producerHooks=%u listenerHooks=%u callbacks=%llu projectile=%llu local=%llu validated=%llu "
+                                 "effectRun=%llu attackStart=%llu attackPrepare=%llu crosshair=%llu defaultCrosshair=%llu "
+                                 "redirected=%llu rejected=%llu mutation=0",
+                                 static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
+                                 diagnostics.producerHooks, diagnostics.listenerHooks,
+                                 static_cast<unsigned long long>(diagnostics.callbacks),
+                                 static_cast<unsigned long long>(diagnostics.projectileEvents),
+                                 static_cast<unsigned long long>(diagnostics.localPlayerEvents),
+                                 static_cast<unsigned long long>(diagnostics.validatedLocalEvents),
+                                 static_cast<unsigned long long>(diagnostics.effectRuns),
+                                 static_cast<unsigned long long>(diagnostics.attackStarts),
+                                 static_cast<unsigned long long>(diagnostics.attackPrepares),
+                                 static_cast<unsigned long long>(diagnostics.crosshairCalls),
+                                 static_cast<unsigned long long>(diagnostics.defaultCrosshairCalls),
+                                 static_cast<unsigned long long>(diagnostics.redirectedShots),
+                                 static_cast<unsigned long long>(diagnostics.rejectedShots));
+                lastSilentLogTick = now;
+            }
+            return;
+        }
+        Game::SilentAim::ClearTarget();
         const bool hardLock = settings.smoothing <= 0.001f;
         if (hardLock || now - g_lastApplyTick >= 16)
         {
@@ -198,6 +233,17 @@ namespace Aimbot
                              diagnostics.fppCamera, diagnostics.cameraSystem, diagnostics.angularError);
             lastLogTick = now;
         }
+    }
+
+    void DrawOverlay(const Features::AimbotSettings& settings)
+    {
+        const ImGuiIO& io = ImGui::GetIO();
+        RunFrame(settings, io.DisplaySize.x, io.DisplaySize.y, ImGui::GetBackgroundDrawList());
+    }
+
+    void UpdateHeadless(const Features::AimbotSettings& settings, float displayWidth, float displayHeight)
+    {
+        RunFrame(settings, displayWidth, displayHeight, nullptr);
     }
 
     void Shutdown()

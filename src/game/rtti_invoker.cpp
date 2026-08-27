@@ -10,6 +10,8 @@
 namespace
 {
     constexpr std::uint32_t kInternalExecuteAddressHash = 0x1817231Du;
+    constexpr std::uint32_t kNativeFunctionHandlersAddressHash = 0x5A7D28A9u;
+    constexpr std::uint32_t kCNamePoolGetAddressHash = 0x68DF07DCu;
     constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
     constexpr std::uint32_t kCClassCreateInstanceAddressHash = 0x5A800F1Du;
     constexpr std::uint32_t kHandleCtorAddressHash = 0xBA0C115Du;
@@ -42,7 +44,18 @@ namespace
         PropertyLayout* returnType;
         std::uint64_t unk20;
         DynArrayLayout params;
+        DynArrayLayout localVars;
+        std::byte pad48[0xA8 - 0x48];
+        std::uint32_t flags;
+        std::uint32_t unkAC;
+        void* parent;
+        std::uint32_t regIndex;
+        std::uint32_t padBC;
     };
+    static_assert(offsetof(FunctionLayout, params) == 0x28);
+    static_assert(offsetof(FunctionLayout, flags) == 0xA8);
+    static_assert(offsetof(FunctionLayout, parent) == 0xB0);
+    static_assert(offsetof(FunctionLayout, regIndex) == 0xB8);
 
     struct ClassLayout
     {
@@ -83,6 +96,7 @@ namespace
     // CClass::CreateInstance is the RED4ext SDK three-argument relocation: (class, size, zeroMemory).
     using CClassCreateInstanceFn = void* (*)(ClassLayout*, std::uint32_t, bool);
     using HandleCtorFn = void (*)(Game::Rtti::Handle*, void*);
+    using CNamePoolGetFn = const char* (*)(const std::uint64_t&);
 
     void* VirtualFunction(void* object, std::size_t index)
     {
@@ -165,6 +179,63 @@ namespace Game::Rtti
             }
         }
         return nullptr;
+    }
+
+    const char* ResolveName(std::uint64_t nameHash)
+    {
+        if (nameHash == 0)
+            return "";
+        __try
+        {
+            ResolveAddressFn resolve = ResolveAddress();
+            const std::uintptr_t address = resolve ? resolve(kCNamePoolGetAddressHash) : 0;
+            const char* result = address ? reinterpret_cast<CNamePoolGetFn>(address)(nameHash) : nullptr;
+            return result ? result : "";
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return "";
+        }
+    }
+
+    bool InspectFunction(const Function* opaqueFunction, FunctionInfo& output)
+    {
+        output = {};
+        if (!opaqueFunction)
+            return false;
+        __try
+        {
+            const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
+            if (function->params.size > function->params.capacity || function->params.size > 24)
+                return false;
+
+            output.fullNameHash = function->fullNameHash;
+            output.shortNameHash = function->shortNameHash;
+            output.parent = reinterpret_cast<const Class*>(function->parent);
+            output.flags = function->flags;
+            output.registrationIndex = function->regIndex;
+            output.parameterCount = function->params.size;
+            output.hasReturnValue = function->returnType != nullptr;
+
+            const bool isNative = (function->flags & 1u) != 0;
+            const bool isStatic = (function->flags & 2u) != 0;
+            if (isNative && !isStatic && function->regIndex < 1000000u)
+            {
+                ResolveAddressFn resolve = ResolveAddress();
+                const std::uintptr_t address = resolve ? resolve(kNativeFunctionHandlersAddressHash) : 0;
+                // 2.31 InternalCallNative indexes the relocated address directly as Handler_t[regIndex].
+                // It is the table base, not a pointer variable that needs another dereference.
+                void** handlers = reinterpret_cast<void**>(address);
+                if (handlers)
+                    output.nativeHandler = handlers[function->regIndex];
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            output = {};
+            return false;
+        }
     }
 
     Class* GetClass(std::uint64_t nameHash)

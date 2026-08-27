@@ -36,6 +36,7 @@ namespace
                lhs.esp.showUnclassified == rhs.esp.showUnclassified &&
                lhs.esp.maxDistanceMeters == rhs.esp.maxDistanceMeters &&
                lhs.aimbot.enabled == rhs.aimbot.enabled &&
+               lhs.aimbot.silentAim == rhs.aimbot.silentAim &&
                lhs.aimbot.drawFovCircle == rhs.aimbot.drawFovCircle &&
                lhs.aimbot.targetEnemies == rhs.aimbot.targetEnemies &&
                lhs.aimbot.targetPolice == rhs.aimbot.targetPolice &&
@@ -104,6 +105,7 @@ namespace
         ok &= WriteFloat(L"esp", L"max_distance_meters", settings.esp.maxDistanceMeters);
 
         ok &= WriteBool(L"aimbot", L"enabled", settings.aimbot.enabled);
+        ok &= WriteBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
         ok &= WriteBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         ok &= WriteBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         ok &= WriteBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
@@ -169,6 +171,7 @@ namespace Config
             ReadFloat(L"esp", L"max_distance_meters", settings.esp.maxDistanceMeters, 10.0f, 300.0f);
 
         settings.aimbot.enabled = ReadBool(L"aimbot", L"enabled", settings.aimbot.enabled);
+        settings.aimbot.silentAim = ReadBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
         settings.aimbot.drawFovCircle =
             ReadBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         settings.aimbot.targetEnemies = ReadBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);

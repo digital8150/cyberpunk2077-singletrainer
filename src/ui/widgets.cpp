@@ -3,6 +3,7 @@
 #include "../features/features.h"
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
+#include "../game/silent_aim.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
@@ -224,6 +225,7 @@ namespace Widgets
         Features::Settings& settings = Features::GetSettings();
         const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
         const Game::PlayerModifiers::Stats modifierStats = Game::PlayerModifiers::GetStats();
+        const Game::SilentAim::DiagnosticsSnapshot silentStats = Game::SilentAim::GetDiagnostics();
 
         ImGui::TextDisabled("Cyberpunk 2077 2.31  |  Insert: menu  |  End: unload");
         ImGui::Separator();
@@ -311,6 +313,9 @@ namespace Widgets
         ToggleSwitch("##aimbot_toggle", &settings.aimbot.enabled);
 
         ImGui::Indent(14.0f);
+        ImGui::TextUnformatted("Silent aim");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_silent", &settings.aimbot.silentAim);
         ImGui::TextUnformatted("Draw FOV circle");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_fov_circle", &settings.aimbot.drawFovCircle);
@@ -324,9 +329,23 @@ namespace Widgets
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_visible_only", &settings.aimbot.visibleOnly);
         FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
-        FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
+        if (!settings.aimbot.silentAim)
+            FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
-        ImGui::TextDisabled("Hold right mouse for direct camera rotation. Smoothing 0 has no easing.");
+        ImGui::TextDisabled(settings.aimbot.silentAim
+                                ? "Hold right mouse to arm producer diagnostics; mutation is disabled."
+                                : "Hold right mouse for direct camera rotation. Smoothing 0 has no easing.");
+        ImGui::TextDisabled("Silent path: %s | producer hooks %u | projectile hooks %u | mutation off",
+                            silentStats.producerHooks > 0 ? "observing" : "unavailable",
+                            silentStats.producerHooks, silentStats.listenerHooks);
+        ImGui::TextDisabled("Calls: effect %llu | start %llu | prepare %llu | crosshair %llu/%llu | projectile %llu/%llu",
+                            static_cast<unsigned long long>(silentStats.effectRuns),
+                            static_cast<unsigned long long>(silentStats.attackStarts),
+                            static_cast<unsigned long long>(silentStats.attackPrepares),
+                            static_cast<unsigned long long>(silentStats.crosshairCalls),
+                            static_cast<unsigned long long>(silentStats.defaultCrosshairCalls),
+                            static_cast<unsigned long long>(silentStats.projectileEvents),
+                            static_cast<unsigned long long>(silentStats.localPlayerEvents));
         ImGui::Unindent(14.0f);
 
         ImGui::Separator();

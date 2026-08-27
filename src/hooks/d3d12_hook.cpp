@@ -13,6 +13,7 @@
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
+#include "../game/silent_aim.h"
 #include "../game/visibility.h"
 #include "../features/aimbot.h"
 #include "../game/aim_assist.h"
@@ -251,6 +252,8 @@ namespace Hooks
         Game::Visibility::CreateHook();
         // Memory aim is optional and version-gated by unique controller/FPP camera-input signatures.
         Game::AimAssist::CreateHook();
+        // Silent aim starts in observation-only mode on RTTI-identified attack/effect/crosshair producers.
+        Game::SilentAim::CreateHook();
         CursorHook::CreateHooks();
 
         status = MH_EnableHook(MH_ALL_HOOKS);
@@ -315,6 +318,7 @@ namespace Hooks
         Overlay::Shutdown();
         CursorHook::Shutdown();
         Aimbot::Shutdown();
+        Game::SilentAim::Shutdown();
         Game::PlayerModifiers::Shutdown();
         Game::EntityTracker::Shutdown();
         if (g_minHookInitialized)

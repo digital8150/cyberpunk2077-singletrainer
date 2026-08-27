@@ -52,6 +52,7 @@ namespace
     WNDPROC g_originalWndProc = nullptr;
     bool g_wndProcRestored = false;
     bool g_imguiContextCreated = false;
+    bool g_headlessSilentAim = false;
     bool g_win32BackendInitialized = false;
     bool g_dx12BackendInitialized = false;
     bool g_loggedFirstRenderedFrame = false;
@@ -333,6 +334,7 @@ namespace
         g_allocatorMissCount.store(0, std::memory_order_relaxed);
         g_lastTelemetryTick = 0;
         g_telemetryWindows = 0;
+        g_headlessSilentAim = false;
         for (bool& used : g_srvSlotUsed)
             used = false;
     }
@@ -503,6 +505,22 @@ namespace
         Diagnostics::Log("overlay initialization completed");
         return true;
     }
+
+    void RunHeadlessSilentAimFrame(IDXGISwapChain3* swapChain)
+    {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (FAILED(swapChain->GetDesc(&desc)))
+            return;
+
+        if (!g_headlessSilentAim)
+        {
+            g_headlessSilentAim = true;
+            g_swapChain = swapChain;
+            Diagnostics::Log("headless silent-aim diagnostics enabled: no D3D12 overlay submissions");
+        }
+        Features::UpdateHeadless(static_cast<float>(desc.BufferDesc.Width),
+                                 static_cast<float>(desc.BufferDesc.Height));
+    }
 }
 
 namespace Overlay
@@ -510,6 +528,15 @@ namespace Overlay
     void OnPresent(IDXGISwapChain3* swapChain, ID3D12CommandQueue* commandQueue)
     {
         std::lock_guard<std::mutex> renderGuard(g_renderMutex);
+
+        // DRED twice reported a page fault in a freed game resource while this injected overlay was submitting on
+        // a queue inferred after swap-chain creation. Keep silent-aim target selection alive on the CPU, but make
+        // no GPU submissions until the owning presentation queue can be captured authoritatively.
+        if (swapChain && Features::GetSettings().aimbot.silentAim)
+        {
+            RunHeadlessSilentAimFrame(swapChain);
+            return;
+        }
 
         // 렌더 큐를 아직 못 잡았으면(ExecuteCommandLists가 이번 세션에서 아직 한 번도 안 불렸으면) 초기화도
         // 포함해서 이번 프레임은 통째로 건너뛴다 — 새 ImGui DX12 백엔드는 Init 시점에 CommandQueue가 필요함.
