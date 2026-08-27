@@ -19,21 +19,32 @@ namespace
     constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
     constexpr float kRadiansToDegrees = 57.29577951308232f;
     constexpr float kFixedPointScale = 1.0f / static_cast<float>(2 << 16);
-
-    // gameFPPCameraComponent::Update reads its yaw and pitch providers through this helper before applying camera
-    // input. Hooking immediately after those reads lets the trainer replace the two live aim offsets without using
-    // TargetingSystem::LookAt or any of the engine's AimRequest easing path. Verified on Cyberpunk 2077 2.31.
-    constexpr std::uint8_t kReadAimOffsetsPattern[] = {
-        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x68,
-        0x18, 0x48, 0x89, 0x70, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x20,
-        0x48, 0x8B, 0x99, 0x80, 0x03, 0x00, 0x00, 0x48, 0x8B, 0xF1,
-        0x48, 0x8D, 0x48, 0x08, 0x49, 0x8B, 0xE8, 0x48, 0x8B, 0xFA,
-    };
-    constexpr char kReadAimOffsetsMask[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-    static_assert(sizeof(kReadAimOffsetsPattern) == sizeof(kReadAimOffsetsMask) - 1);
-
     constexpr std::size_t kEntityComponentsOffset = 0xA0;
     constexpr std::size_t kComponentWorldTransformOffset = 0xE0;
+    constexpr std::uint64_t kFppCameraType = Game::Rtti::Hash("gameFPPCameraComponent");
+
+    // gameFPPCameraComponent camera-input update, Cyberpunk 2077 2.31. Argument 4 is the raw pitch delta. Yaw is
+    // owned by the surrounding camera controller and written through its live input owner immediately before this
+    // call. Both paths are upstream of the derived projection transform and camera-system matrix caches.
+    constexpr std::uint8_t kFppCameraInputUpdatePattern[] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x78, 0x10, 0x55,
+        0x48, 0x8D, 0x68, 0xD8, 0x48, 0x81, 0xEC, 0x20, 0x01, 0x00, 0x00, 0x80,
+        0xB9, 0xD8, 0x04, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF9,
+    };
+    constexpr char kFppCameraInputUpdateMask[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    static_assert(sizeof(kFppCameraInputUpdatePattern) == sizeof(kFppCameraInputUpdateMask) - 1);
+
+    constexpr std::uint8_t kCameraControllerUpdatePattern[] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x48,
+        0x89, 0x78, 0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x8D, 0x68, 0x98, 0x48, 0x81, 0xEC, 0x40, 0x01, 0x00, 0x00,
+        0x0F, 0x29, 0x70, 0xC8, 0x45, 0x33, 0xED, 0x4C, 0x8B, 0xF2, 0x0F, 0x29,
+        0x78, 0xB8, 0x48, 0x8B, 0xF1, 0x44, 0x0F, 0x29, 0x40, 0xA8, 0x44, 0x0F,
+        0x29, 0x48, 0x98, 0x4C, 0x39, 0x69, 0x50,
+    };
+    constexpr char kCameraControllerUpdateMask[] =
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    static_assert(sizeof(kCameraControllerUpdatePattern) == sizeof(kCameraControllerUpdateMask) - 1);
 
     struct HandleLayout
     {
@@ -67,35 +78,40 @@ namespace
     using GetRttiSystemFn = void* (*)();
     using GetClassFn = void* (*)(void*, std::uint64_t);
     using GetSystemFn = void* (*)(void*, void*);
-    using ReadAimOffsetsFn = void (*)(void*, float*, float*);
+    using FppCameraInputUpdateFn = void (*)(void*, float, float, float, float, float, bool);
+    using CameraControllerUpdateFn = void (*)(void*, void*);
+    using GetYawInputOwnerFn = void* (*)(void*);
 
     struct State
     {
-        bool playerResolverAttempted = false;
+        bool resolverAttempted = false;
         void* playerSystem = nullptr;
+        void* cameraSystem = nullptr;
         Game::Rtti::Function* getLocalPlayer = nullptr;
         std::atomic<void*> fppCamera{nullptr};
         ULONGLONG lastPlayerResolveTick = 0;
 
         std::atomic_bool hookCreated{false};
-        std::atomic_uint64_t hookCallbacks{0};
-        std::atomic_uint64_t appliedWrites{0};
         std::atomic_bool aimActive{false};
         std::atomic<float> targetX{0.0f};
         std::atomic<float> targetY{0.0f};
         std::atomic<float> targetZ{0.0f};
         std::atomic<float> smoothing{0.0f};
         std::atomic_uint64_t targetGeneration{0};
+        std::atomic_uint64_t hookCallbacks{0};
+        std::atomic_uint64_t appliedWrites{0};
+        std::atomic_uint64_t calculationFailures{0};
+        std::atomic<float> angularError{0.0f};
     };
 
     State g_state;
-    ReadAimOffsetsFn g_originalReadAimOffsets = nullptr;
+    FppCameraInputUpdateFn g_originalFppCameraInputUpdate = nullptr;
+    CameraControllerUpdateFn g_originalCameraControllerUpdate = nullptr;
+    thread_local void* g_currentCameraControllerOwner = nullptr;
     ULONGLONG g_lastAimUpdateTick = 0;
     bool g_wasAimActive = false;
     bool g_hasLoggedAimMode = false;
     bool g_lastLoggedHardLock = false;
-    void* g_validatedCamera = nullptr;
-    bool g_hookObservedLogged = false;
 
     void* VirtualFunction(void* object, std::size_t index)
     {
@@ -105,11 +121,11 @@ namespace
         return table ? table[index] : nullptr;
     }
 
-    bool InitializePlayerResolver()
+    bool InitializeResolvers()
     {
-        if (g_state.playerResolverAttempted)
-            return g_state.playerSystem && g_state.getLocalPlayer;
-        g_state.playerResolverAttempted = true;
+        if (g_state.resolverAttempted)
+            return g_state.playerSystem && g_state.cameraSystem && g_state.getLocalPlayer;
+        g_state.resolverAttempted = true;
 
         HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
         const auto resolve = red4ext
@@ -126,13 +142,15 @@ namespace
         void* rttiSystem = rttiGetAddress ? reinterpret_cast<GetRttiSystemFn>(rttiGetAddress)() : nullptr;
         const auto getClass = reinterpret_cast<GetClassFn>(VirtualFunction(rttiSystem, 2));
         const auto getSystem = reinterpret_cast<GetSystemFn>(VirtualFunction(gameInstance, 1));
-        void* playerSystemType = getClass ? getClass(rttiSystem, Game::Rtti::Hash("gameIPlayerSystem")) : nullptr;
-        g_state.playerSystem = getSystem && playerSystemType ? getSystem(gameInstance, playerSystemType) : nullptr;
+        void* playerType = getClass ? getClass(rttiSystem, Game::Rtti::Hash("gameIPlayerSystem")) : nullptr;
+        void* cameraType = getClass ? getClass(rttiSystem, Game::Rtti::Hash("gameICameraSystem")) : nullptr;
+        g_state.playerSystem = getSystem && playerType ? getSystem(gameInstance, playerType) : nullptr;
+        g_state.cameraSystem = getSystem && cameraType ? getSystem(gameInstance, cameraType) : nullptr;
         g_state.getLocalPlayer = Game::Rtti::FindFunction(Game::Rtti::NativeType(g_state.playerSystem),
                                                           Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
-        Diagnostics::Log("memory aim resolver: playerSystem=%p getPlayer=%p", g_state.playerSystem,
-                         g_state.getLocalPlayer);
-        return g_state.playerSystem && g_state.getLocalPlayer;
+        Diagnostics::Log("memory aim resolver: playerSystem=%p cameraSystem=%p getPlayer=%p",
+                         g_state.playerSystem, g_state.cameraSystem, g_state.getLocalPlayer);
+        return g_state.playerSystem && g_state.cameraSystem && g_state.getLocalPlayer;
     }
 
     bool GetPlayerHandle(HandleLayout& player)
@@ -163,28 +181,17 @@ namespace
     {
         if (!playerInstance)
             return nullptr;
-
-        constexpr std::uint64_t fppCameraType = Game::Rtti::Hash("gameFPPCameraComponent");
         auto* components = reinterpret_cast<ComponentArray*>(
             static_cast<std::byte*>(playerInstance) + kEntityComponentsOffset);
         if (!components->entries || components->size > components->capacity || components->size > 512)
             return nullptr;
-
         for (std::uint32_t index = 0; index < components->size; ++index)
         {
             void* component = *reinterpret_cast<void**>(components->entries + static_cast<std::size_t>(index) * 0x10);
-            if (component && Game::Rtti::IsClassOrDerived(Game::Rtti::NativeType(component), fppCameraType))
+            if (component && Game::Rtti::IsClassOrDerived(Game::Rtti::NativeType(component), kFppCameraType))
                 return component;
         }
         return nullptr;
-    }
-
-    float NormalizeAngle(float degrees)
-    {
-        degrees = std::fmod(degrees + 180.0f, 360.0f);
-        if (degrees < 0.0f)
-            degrees += 360.0f;
-        return degrees - 180.0f;
     }
 
     bool ReadPublishedTarget(float target[3], float& smoothing)
@@ -205,7 +212,43 @@ namespace
         return false;
     }
 
-    bool CalculateAimOffsets(void* camera, const float target[3], float& yaw, float& pitch)
+    float QuaternionDot(const float left[4], const float right[4])
+    {
+        return left[0] * right[0] + left[1] * right[1] + left[2] * right[2] + left[3] * right[3];
+    }
+
+    float NormalizeAngle(float degrees)
+    {
+        degrees = std::fmod(degrees + 180.0f, 360.0f);
+        if (degrees < 0.0f)
+            degrees += 360.0f;
+        return degrees - 180.0f;
+    }
+
+    float AimAlpha(float smoothing, ULONGLONG now, ULONGLONG& lastTick, bool wasActive)
+    {
+        if (smoothing <= 0.001f)
+            return 1.0f;
+        const float elapsed = wasActive && now >= lastTick
+                                  ? std::clamp(static_cast<float>(now - lastTick) * 0.001f, 0.0f, 0.1f)
+                                  : 1.0f / 60.0f;
+        return 1.0f - std::exp(-(35.0f / std::max(smoothing, 0.05f)) * elapsed);
+    }
+
+    void* ResolveYawInputOwner()
+    {
+        void* provider = g_currentCameraControllerOwner
+                             ? *reinterpret_cast<void**>(
+                                   static_cast<std::byte*>(g_currentCameraControllerOwner) + 0xC8)
+                             : nullptr;
+        void** table = provider ? *reinterpret_cast<void***>(provider) : nullptr;
+        void* wrapper = table && table[0]
+                            ? reinterpret_cast<GetYawInputOwnerFn>(table[0])(provider)
+                            : nullptr;
+        return wrapper ? *reinterpret_cast<void**>(static_cast<std::byte*>(wrapper) + 0x8) : nullptr;
+    }
+
+    bool CalculateAimDeltas(void* camera, const float target[3], float& yawDelta, float& pitchDelta)
     {
         const auto* transform = reinterpret_cast<const WorldTransformLayout*>(
             static_cast<const std::byte*>(camera) + kComponentWorldTransformOffset);
@@ -220,116 +263,85 @@ namespace
             return false;
 
         const float* orientation = transform->orientation;
-        const float norm = orientation[0] * orientation[0] + orientation[1] * orientation[1] +
-                           orientation[2] * orientation[2] + orientation[3] * orientation[3];
+        const float norm = QuaternionDot(orientation, orientation);
         if (!std::isfinite(norm) || norm < 0.8f || norm > 1.2f)
             return false;
 
-        const float currentForwardX =
-            2.0f * (orientation[0] * orientation[1] - orientation[3] * orientation[2]);
-        const float currentForwardY =
-            1.0f - 2.0f * (orientation[0] * orientation[0] + orientation[2] * orientation[2]);
-        const float currentForwardZ =
-            2.0f * (orientation[1] * orientation[2] + orientation[3] * orientation[0]);
-        const float currentHorizontal = std::hypot(currentForwardX, currentForwardY);
+        const float forwardX = 2.0f * (orientation[0] * orientation[1] - orientation[3] * orientation[2]);
+        const float forwardY = 1.0f - 2.0f * (orientation[0] * orientation[0] + orientation[2] * orientation[2]);
+        const float forwardZ = 2.0f * (orientation[1] * orientation[2] + orientation[3] * orientation[0]);
+        const float currentHorizontal = std::hypot(forwardX, forwardY);
         if (!std::isfinite(currentHorizontal) || currentHorizontal < 0.001f)
             return false;
 
-        const float currentWorldYaw = -std::atan2(currentForwardX, currentForwardY) * kRadiansToDegrees;
-        const float currentWorldPitch = std::atan2(currentForwardZ, currentHorizontal) * kRadiansToDegrees;
-        const float desiredWorldYaw = -std::atan2(deltaX, deltaY) * kRadiansToDegrees;
-        const float desiredWorldPitch = std::atan2(deltaZ, horizontal) * kRadiansToDegrees;
-        const float currentYaw = *reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + 0x42C);
-        const float currentPitch = *reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + 0x430);
-
-        // FPPCameraComponent changes its yaw reference frame in restricted/heading-locked camera states. Derive the
-        // local field delta from the live world quaternion instead of assuming an absolute or player-body basis.
-        yaw = NormalizeAngle(currentYaw + NormalizeAngle(desiredWorldYaw - currentWorldYaw));
-        pitch = currentPitch + (desiredWorldPitch - currentWorldPitch);
-
-        return std::isfinite(yaw) && std::isfinite(pitch);
+        const float currentYaw = -std::atan2(forwardX, forwardY) * kRadiansToDegrees;
+        const float currentPitch = std::atan2(forwardZ, currentHorizontal) * kRadiansToDegrees;
+        const float desiredYaw = -std::atan2(deltaX, deltaY) * kRadiansToDegrees;
+        const float desiredPitch = std::atan2(deltaZ, horizontal) * kRadiansToDegrees;
+        yawDelta = NormalizeAngle(desiredYaw - currentYaw);
+        pitchDelta = desiredPitch - currentPitch;
+        return std::isfinite(yawDelta) && std::isfinite(pitchDelta);
     }
 
-    void ValidateCameraLayout(void* camera)
-    {
-        if (!camera || camera == g_validatedCamera)
-            return;
-
-        const auto* transform = reinterpret_cast<const WorldTransformLayout*>(
-            static_cast<const std::byte*>(camera) + kComponentWorldTransformOffset);
-        const float* orientation = transform->orientation;
-        const float forward[3] = {
-            2.0f * (orientation[0] * orientation[1] - orientation[3] * orientation[2]),
-            1.0f - 2.0f * (orientation[0] * orientation[0] + orientation[2] * orientation[2]),
-            2.0f * (orientation[1] * orientation[2] + orientation[3] * orientation[0]),
-        };
-        const float target[3] = {
-            static_cast<float>(transform->x) * kFixedPointScale + forward[0] * 10.0f,
-            static_cast<float>(transform->y) * kFixedPointScale + forward[1] * 10.0f,
-            static_cast<float>(transform->z) * kFixedPointScale + forward[2] * 10.0f,
-        };
-
-        float resolvedYaw = 0.0f;
-        float resolvedPitch = 0.0f;
-        if (CalculateAimOffsets(camera, target, resolvedYaw, resolvedPitch))
-        {
-            const float currentYaw = *reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + 0x42C);
-            const float currentPitch = *reinterpret_cast<const float*>(static_cast<const std::byte*>(camera) + 0x430);
-            Diagnostics::Log("memory aim layout check: current=(%.3f,%.3f) resolved=(%.3f,%.3f) delta=(%.3f,%.3f)",
-                             currentYaw, currentPitch, resolvedYaw, resolvedPitch,
-                             NormalizeAngle(resolvedYaw - currentYaw), resolvedPitch - currentPitch);
-            g_validatedCamera = camera;
-        }
-    }
-
-    void HookReadAimOffsets(void* camera, float* yaw, float* pitch)
+    void HookFppCameraInputUpdate(void* camera, float deltaTime, float yawInput, float pitchInput,
+                                  float additiveYaw, float additivePitch, bool hasAdditiveInput)
     {
         HookLifecycle::CallbackGuard guard;
-        g_originalReadAimOffsets(camera, yaw, pitch);
         g_state.hookCallbacks.fetch_add(1, std::memory_order_relaxed);
 
-        const bool active = !HookLifecycle::IsShuttingDown() &&
-                            g_state.aimActive.load(std::memory_order_acquire) &&
-                            camera == g_state.fppCamera.load(std::memory_order_acquire) && yaw && pitch;
-        if (!active)
+        const bool matchingCamera = camera && camera == g_state.fppCamera.load(std::memory_order_acquire);
+        const bool active = matchingCamera && !HookLifecycle::IsShuttingDown() &&
+                            g_state.aimActive.load(std::memory_order_acquire);
+        if (active)
         {
-            if (!g_state.aimActive.load(std::memory_order_acquire))
-                g_wasAimActive = false;
-            return;
+            float target[3]{};
+            float smoothing = 0.0f;
+            float yawDelta = 0.0f;
+            float pitchDelta = 0.0f;
+            if (ReadPublishedTarget(target, smoothing) &&
+                CalculateAimDeltas(camera, target, yawDelta, pitchDelta))
+            {
+                const auto* bytes = static_cast<const std::byte*>(camera);
+                const float pitchScale = *reinterpret_cast<const float*>(bytes + 0x49C);
+                void* yawInputOwner = ResolveYawInputOwner();
+                if (yawInputOwner && std::isfinite(pitchScale) && std::abs(pitchScale) > 0.0001f)
+                {
+                    const ULONGLONG now = GetTickCount64();
+                    const float alpha = AimAlpha(smoothing, now, g_lastAimUpdateTick, g_wasAimActive);
+                    *reinterpret_cast<float*>(static_cast<std::byte*>(yawInputOwner) + 0x9C) =
+                        yawDelta * alpha;
+                    pitchInput = pitchDelta * alpha / pitchScale;
+                    g_state.angularError.store(std::hypot(yawDelta, pitchDelta), std::memory_order_relaxed);
+                    g_state.appliedWrites.fetch_add(1, std::memory_order_relaxed);
+                    g_lastAimUpdateTick = now;
+                    g_wasAimActive = true;
+                }
+                else
+                {
+                    g_state.calculationFailures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            else
+            {
+                g_state.calculationFailures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        else if (!g_state.aimActive.load(std::memory_order_acquire))
+        {
+            g_wasAimActive = false;
         }
 
-        float target[3]{};
-        float smoothing = 0.0f;
-        float desiredYaw = 0.0f;
-        float desiredPitch = 0.0f;
-        if (!ReadPublishedTarget(target, smoothing) ||
-            !CalculateAimOffsets(camera, target, desiredYaw, desiredPitch))
-        {
-            return;
-        }
+        g_originalFppCameraInputUpdate(camera, deltaTime, yawInput, pitchInput,
+                                       additiveYaw, additivePitch, hasAdditiveInput);
+    }
 
-        const ULONGLONG now = GetTickCount64();
-        const bool hardLock = smoothing <= 0.001f;
-        if (hardLock)
-        {
-            *yaw = desiredYaw;
-            *pitch = desiredPitch;
-        }
-        else
-        {
-            const float elapsed = g_wasAimActive && now >= g_lastAimUpdateTick
-                                      ? std::clamp(static_cast<float>(now - g_lastAimUpdateTick) * 0.001f,
-                                                   0.0f, 0.1f)
-                                      : 1.0f / 60.0f;
-            const float response = 35.0f / std::max(smoothing, 0.05f);
-            const float alpha = 1.0f - std::exp(-response * elapsed);
-            *yaw = NormalizeAngle(*yaw + NormalizeAngle(desiredYaw - *yaw) * alpha);
-            *pitch += (desiredPitch - *pitch) * alpha;
-        }
-
-        g_lastAimUpdateTick = now;
-        g_wasAimActive = true;
-        g_state.appliedWrites.fetch_add(1, std::memory_order_relaxed);
+    void HookCameraControllerUpdate(void* owner, void* tickContext)
+    {
+        HookLifecycle::CallbackGuard guard;
+        void* previous = g_currentCameraControllerOwner;
+        g_currentCameraControllerOwner = owner;
+        g_originalCameraControllerUpdate(owner, tickContext);
+        g_currentCameraControllerOwner = previous;
     }
 }
 
@@ -337,37 +349,51 @@ namespace Game::AimAssist
 {
     bool CreateHook()
     {
-        const auto scan = Game::Signatures::FindInText(GetModuleHandleW(nullptr), kReadAimOffsetsPattern,
-                                                       kReadAimOffsetsMask, sizeof(kReadAimOffsetsPattern));
-        Diagnostics::Log("memory aim signature scan: matches=%zu address=%p", scan.matches, scan.address);
+        const auto scan = Game::Signatures::FindInText(GetModuleHandleW(nullptr), kFppCameraInputUpdatePattern,
+                                                       kFppCameraInputUpdateMask,
+                                                       sizeof(kFppCameraInputUpdatePattern));
+        Diagnostics::Log("memory aim input signature scan: matches=%zu address=%p", scan.matches, scan.address);
         if (scan.matches != 1 || !scan.address)
             return false;
-
-        const MH_STATUS status = MH_CreateHook(scan.address, &HookReadAimOffsets,
-                                               reinterpret_cast<void**>(&g_originalReadAimOffsets));
+        const auto controllerScan = Game::Signatures::FindInText(
+            GetModuleHandleW(nullptr), kCameraControllerUpdatePattern, kCameraControllerUpdateMask,
+            sizeof(kCameraControllerUpdatePattern));
+        Diagnostics::Log("memory aim controller signature scan: matches=%zu address=%p",
+                         controllerScan.matches, controllerScan.address);
+        if (controllerScan.matches != 1 || !controllerScan.address)
+            return false;
+        const MH_STATUS status = MH_CreateHook(scan.address, &HookFppCameraInputUpdate,
+                                               reinterpret_cast<void**>(&g_originalFppCameraInputUpdate));
         if (status != MH_OK)
         {
-            Diagnostics::Log("MH_CreateHook(memory aim) failed: %s (%d)", MH_StatusToString(status), status);
+            Diagnostics::Log("MH_CreateHook(memory aim input) failed: %s (%d)", MH_StatusToString(status), status);
+            return false;
+        }
+        const MH_STATUS controllerStatus = MH_CreateHook(
+            controllerScan.address, &HookCameraControllerUpdate,
+            reinterpret_cast<void**>(&g_originalCameraControllerUpdate));
+        if (controllerStatus != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(memory aim controller) failed: %s (%d)",
+                             MH_StatusToString(controllerStatus), controllerStatus);
+            MH_RemoveHook(scan.address);
+            g_originalFppCameraInputUpdate = nullptr;
             return false;
         }
         g_state.hookCreated.store(true, std::memory_order_release);
-        Diagnostics::Log("memory aim hook created: target=%p yawOffset=0x42C pitchOffset=0x430",
-                         scan.address);
+        Diagnostics::Log("memory aim hooks created: pitch=%p yawController=%p yawField=controllerInput+0x9C",
+                         scan.address, controllerScan.address);
         return true;
     }
 
     void ProbePlayerCamera()
     {
         const ULONGLONG now = GetTickCount64();
-        if (g_state.fppCamera.load(std::memory_order_acquire) &&
-            now - g_state.lastPlayerResolveTick < 1000)
-        {
+        if (g_state.fppCamera.load(std::memory_order_acquire) && now - g_state.lastPlayerResolveTick < 1000)
             return;
-        }
-
         __try
         {
-            if (!InitializePlayerResolver())
+            if (!InitializeResolvers())
                 return;
             HandleLayout player;
             if (!GetPlayerHandle(player))
@@ -376,19 +402,8 @@ namespace Game::AimAssist
             void* previous = g_state.fppCamera.exchange(camera, std::memory_order_acq_rel);
             g_state.lastPlayerResolveTick = now;
             if (camera != previous)
-                Diagnostics::Log("memory aim camera: player=%p fppCamera=%p", player.instance, camera);
-            ValidateCameraLayout(camera);
-            if (!g_hookObservedLogged)
             {
-                const std::uint64_t callbacks = g_state.hookCallbacks.load(std::memory_order_relaxed);
-                if (callbacks > 0)
-                {
-                    Diagnostics::Log("memory aim hook live: callbacks=%llu applied=%llu",
-                                     static_cast<unsigned long long>(callbacks),
-                                     static_cast<unsigned long long>(
-                                         g_state.appliedWrites.load(std::memory_order_relaxed)));
-                    g_hookObservedLogged = true;
-                }
+                Diagnostics::Log("memory aim camera: player=%p fppCamera=%p", player.instance, camera);
             }
             ReleaseReturnedHandle(player);
         }
@@ -402,9 +417,8 @@ namespace Game::AimAssist
     {
         if (!worldTarget || !g_state.hookCreated.load(std::memory_order_acquire))
             return false;
-
         ProbePlayerCamera();
-        if (!g_state.fppCamera.load(std::memory_order_acquire))
+        if (!g_state.fppCamera.load(std::memory_order_acquire) || !g_state.cameraSystem)
             return false;
 
         const bool hardLock = smoothing <= 0.001f;
@@ -425,6 +439,18 @@ namespace Game::AimAssist
         return true;
     }
 
+    DiagnosticsSnapshot GetDiagnostics()
+    {
+        return {
+            g_state.hookCallbacks.load(std::memory_order_relaxed),
+            g_state.appliedWrites.load(std::memory_order_relaxed),
+            g_state.calculationFailures.load(std::memory_order_relaxed),
+            g_state.fppCamera.load(std::memory_order_relaxed),
+            g_state.cameraSystem,
+            g_state.angularError.load(std::memory_order_relaxed),
+        };
+    }
+
     void ClearMemoryAim()
     {
         g_state.aimActive.store(false, std::memory_order_release);
@@ -435,16 +461,17 @@ namespace Game::AimAssist
         ClearMemoryAim();
         g_state.hookCreated.store(false, std::memory_order_release);
         g_state.fppCamera.store(nullptr, std::memory_order_release);
-        g_state.playerResolverAttempted = false;
+        g_state.resolverAttempted = false;
         g_state.playerSystem = nullptr;
+        g_state.cameraSystem = nullptr;
         g_state.getLocalPlayer = nullptr;
         g_state.lastPlayerResolveTick = 0;
-        g_originalReadAimOffsets = nullptr;
+        g_originalFppCameraInputUpdate = nullptr;
+        g_originalCameraControllerUpdate = nullptr;
+        g_currentCameraControllerOwner = nullptr;
         g_lastAimUpdateTick = 0;
         g_wasAimActive = false;
         g_hasLoggedAimMode = false;
         g_lastLoggedHardLock = false;
-        g_validatedCamera = nullptr;
-        g_hookObservedLogged = false;
     }
 }

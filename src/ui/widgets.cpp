@@ -326,7 +326,7 @@ namespace Widgets
         FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
         FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
-        ImGui::TextDisabled("Hold right mouse for direct camera offsets. Smoothing 0 has no easing.");
+        ImGui::TextDisabled("Hold right mouse for direct camera rotation. Smoothing 0 has no easing.");
         ImGui::Unindent(14.0f);
 
         ImGui::Separator();

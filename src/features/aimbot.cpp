@@ -185,11 +185,17 @@ namespace Aimbot
         static ULONGLONG lastLogTick = 0;
         if (now - lastLogTick >= 2000)
         {
+            const Game::AimAssist::DiagnosticsSnapshot diagnostics = Game::AimAssist::GetDiagnostics();
             Diagnostics::Log("memory aim active: target=%016llX mode=%s world=(%.2f,%.2f,%.2f) "
-                             "screenDelta=(%.1f,%.1f) depth=%.1f",
+                             "screenDelta=(%.1f,%.1f) depth=%.1f inputCallbacks=%llu writes=%llu "
+                             "calcFail=%llu fppCamera=%p cameraSystem=%p angularError=%.2f",
                              static_cast<unsigned long long>(bestEntityId), hardLock ? "hard" : "smooth",
                              bestWorld[0], bestWorld[1], bestWorld[2],
-                             bestPoint.x - center.x, bestPoint.y - center.y, bestPoint.depth);
+                             bestPoint.x - center.x, bestPoint.y - center.y, bestPoint.depth,
+                             static_cast<unsigned long long>(diagnostics.hookCallbacks),
+                             static_cast<unsigned long long>(diagnostics.appliedWrites),
+                             static_cast<unsigned long long>(diagnostics.calculationFailures),
+                             diagnostics.fppCamera, diagnostics.cameraSystem, diagnostics.angularError);
             lastLogTick = now;
         }
     }

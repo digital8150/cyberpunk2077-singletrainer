@@ -12,6 +12,7 @@ memtool.py를 import해서 프로세스/모듈 열거 로직을 재사용한다(
 사용법:
     python inject.py --pid 1234 --dll ..\\..\\build\\bin\\Release\\cp2077_trainer.dll
     python inject.py --name Cyberpunk2077.exe --dll ..\\..\\build\\bin\\Release\\cp2077_trainer.dll
+    python inject.py --auto
 """
 
 from __future__ import annotations
@@ -63,6 +64,10 @@ kernel32.SetEvent.restype = wintypes.BOOL
 kernel32.SetEvent.argtypes = [wintypes.HANDLE]
 
 EVENT_MODIFY_STATE = 0x0002
+DEFAULT_PROCESS_NAME = "Cyberpunk2077.exe"
+DEFAULT_AUTO_DLL = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "build", "bin", "Release", "cp2077_trainer.dll")
+)
 
 
 def resolve_pid(args) -> int:
@@ -169,19 +174,105 @@ def request_unload(pid: int, dll_basename: str, timeout_seconds: float = 10.0) -
     return False
 
 
+def find_processes_by_name(name: str) -> list[int]:
+    return sorted(pid for pid, process_name in memtool.iter_processes() if process_name.lower() == name.lower())
+
+
+def auto_inject(process_name: str, dll_path: str, interval_seconds: float, once: bool, dry_run: bool) -> int:
+    """Inject once per observed PID and follow game restarts until interrupted."""
+    dll_path = os.path.abspath(dll_path)
+    if not os.path.isfile(dll_path):
+        print(f"error: dll not found: {dll_path}", file=sys.stderr)
+        return 1
+
+    handled_pids: set[int] = set()
+    announced_wait = False
+    print(f"auto mode: watching for {process_name}")
+    print(f"auto mode: dll={dll_path}")
+    if dry_run:
+        print("auto mode: dry run; no injection will be performed")
+
+    try:
+        while True:
+            matches = find_processes_by_name(process_name)
+            live_pids = set(matches)
+            handled_pids.intersection_update(live_pids)
+            pending = [pid for pid in matches if pid not in handled_pids]
+
+            if not matches and not announced_wait:
+                print(f"auto mode: waiting for {process_name}...")
+                announced_wait = True
+            elif matches:
+                announced_wait = False
+
+            for pid in pending:
+                if dry_run:
+                    print(f"auto mode: detected pid={pid}; dry-run injection skipped")
+                    handled_pids.add(pid)
+                    if once:
+                        return 0
+                    continue
+                try:
+                    ok = inject(pid, dll_path)
+                except OSError as exc:
+                    print(f"auto mode: pid={pid} injection error: {exc}", file=sys.stderr)
+                    continue
+                if ok:
+                    print(f"auto mode: success: {os.path.basename(dll_path)} loaded into pid={pid}")
+                    handled_pids.add(pid)
+                    if once:
+                        return 0
+                else:
+                    print(
+                        f"auto mode: pid={pid} injection failed; module did not appear",
+                        file=sys.stderr,
+                    )
+
+            time.sleep(interval_seconds)
+    except KeyboardInterrupt:
+        print("auto mode: stopped")
+        return 0
+
+
 def main(argv=None) -> int:
     if sys.platform != "win32":
         print("this tool is Windows-only.", file=sys.stderr)
         return 1
 
     # Keep runtime/help output ASCII-only so this remains usable from cp949 and other legacy Windows consoles.
-    parser = argparse.ArgumentParser(description="Safely unload or inject the trainer DLL.")
-    target = parser.add_mutually_exclusive_group(required=True)
+    parser = argparse.ArgumentParser(description="Safely unload, inject, or auto-inject the trainer DLL.")
+    target = parser.add_mutually_exclusive_group()
     target.add_argument("--pid", type=int)
     target.add_argument("--name", help="process executable name, e.g. Cyberpunk2077.exe")
+    target.add_argument(
+        "--auto",
+        action="store_true",
+        help="watch Cyberpunk2077.exe and inject once into each new game process",
+    )
     parser.add_argument("--dll", help="path to the DLL to inject")
     parser.add_argument("--unload", action="store_true", help="request hook-safe unload instead of injection")
+    parser.add_argument("--once", action="store_true", help="with --auto, exit after the first detected process")
+    parser.add_argument("--dry-run", action="store_true", help="with --auto, detect only and do not inject")
+    parser.add_argument("--interval", type=float, default=1.0, help="auto-mode polling interval in seconds")
     args = parser.parse_args(argv)
+
+    if args.auto:
+        if args.unload:
+            parser.error("--auto and --unload cannot be used together")
+        if not 0.1 <= args.interval <= 60.0:
+            parser.error("--interval must be between 0.1 and 60 seconds")
+        return auto_inject(
+            DEFAULT_PROCESS_NAME,
+            args.dll or DEFAULT_AUTO_DLL,
+            args.interval,
+            args.once,
+            args.dry_run,
+        )
+
+    if args.once or args.dry_run:
+        parser.error("--once and --dry-run require --auto")
+    if not args.pid and not args.name:
+        parser.error("one of --pid, --name, or --auto is required")
 
     pid = resolve_pid(args)
     try:

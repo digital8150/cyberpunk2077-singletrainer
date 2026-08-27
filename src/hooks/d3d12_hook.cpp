@@ -249,7 +249,7 @@ namespace Hooks
         Game::EntityTracker::CreateHook();
         // Visibility is optional: its synchronous physics work is drained from the game-main-tick hook.
         Game::Visibility::CreateHook();
-        // Memory aim is optional and version-gated by a unique FPPCameraComponent 2.31 signature.
+        // Memory aim is optional and version-gated by unique controller/FPP camera-input signatures.
         Game::AimAssist::CreateHook();
         CursorHook::CreateHooks();
 

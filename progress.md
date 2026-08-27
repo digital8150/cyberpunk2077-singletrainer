@@ -384,3 +384,44 @@
   - Release 빌드와 `git diff --check`, 여러 차례 안전 언로드/재주입을 통과했다. 최종 주입 로그에서 AOB 1개,
     hook callback 유입(`callbacks=3`), 로컬 FPP camera 해석, 0도 layout 오차를 확인했고 게임은 계속 응답했다.
     현재 스트림에 enemy가 다시 잡혔지만 실제 우클릭 hard-lock의 시각적 체감 확인은 사용자 피드백을 기다린다.
+- **직접 메모리 에임 후속 조사 — derived projection cache 폐기 및 FPP 입력 ABI 복구**:
+  - `+0x4E2968` provider-read helper 뒤에서 `FPPCameraComponent+0x42C/+0x430`을 덮는 구현은 콜백/쓰기
+    카운터가 증가해도 실제 화면을 움직이지 않았다. 우클릭 유지 중 22:32:26 크래시도 발생했으므로 해당 필드는
+    최종 카메라 소스가 아닌 provider 상태 복사본으로 판정하고 훅을 제거했다.
+  - `gameICameraSystem+0x70` quaternion과 `+0xB0..+0x190` 회전 행렬을 post-main-tick에서 바꾸는 실험은 실제
+    화면은 그대로인데 ESP만 화면 중앙으로 이동시켰다. `ProjectPoint`가 이 행렬들을 읽는 것을 디스어셈블로
+    확인했으며, 이들은 렌더 카메라 원본이 아니라 CPU world-to-screen 투영 캐시이므로 해당 쓰기 경로도 폐기했다.
+  - `gameFPPCameraComponent::Update`(`Cyberpunk2077.exe+0x4E1638`)가 입력 객체
+    `component+0x360 -> +0x44/+0x60`에 yaw/pitch를 기록하는 것을 확인했다. 첫 임시 detour는 함수의 스택 인자
+    3개를 누락해 4인자 ABI로 원본을 호출했고, 그 결과 additive-input 값이 오염되어 카메라가 180도 회전하고
+    상하 입력이 잠겼다. 즉시 안전 언로드한 뒤 실제 7인자 ABI
+    `(camera, dt, yaw, pitch, additiveYaw, additivePitch, hasAdditiveInput)`로 수정했다.
+  - 오염 상태는 component pitch가 `NaN`, yaw 한계가 `+89/-89`, pitch 한계가 거의 `0/0`, pitch 보조값이
+    약 `1.54e11`인 것으로 실메모리에서 확인했다. 같은 세션 초기에 캡처한 정상값을 기준으로 component 원본
+    한계(yaw `+180/-180`, pitch `-80/+80`)와 내부 입력 객체, 현재/이전 pitch 값을 복원했다. 14초 뒤 재검사에도
+    정상값이 유지됐고 새 플레이어 인스턴스에서 body/FPP/render yaw가 모두 `-8.106`도로 일치했으며 게임은 응답했다.
+  - 수정된 7인자 detour의 진단 프로브에서는 상태 손상이나 지속 회전이 재현되지 않았다. 세 번째 yaw 입력 인자
+    자체는 작은 값에서 렌더 회전을 만들지 않아, 실제 소비되는 입력 경로와 배율은 추가 확인이 필요하다. 자동
+    프로브 코드는 소스에서 제거했고 검증 전 DLL도 안전 언로드했다. 이 중간 상태는 아직 커밋하지 않는다.
+- **카메라 컨트롤러의 실제 yaw 입력 필드 확보 및 Cyberpunk 자동 인젝터 추가**:
+  - 7인자 FPP 업데이트 입력을 한 인자씩 자동 격리했다. 네 번째 인자 `+0.1`은 pitch를 약 `+0.106`도
+    움직였지만 세 번째 인자는 지연 측정에서도 yaw를 만들지 않았다. 다섯/여섯 번째 인자도 pitch/additive
+    보정 계열이었다. 따라서 FPP 함수는 pitch를 소비하지만 수평 회전은 바깥 컨트롤러가 소유한다고 판정했다.
+  - FPP 호출부 `Cyberpunk2077.exe+0x3F32A4`를 디스어셈블해 호출 직전 `FPPCamera+0x4E4`, 내부 입력
+    `+0x4C`, 별도 컨트롤러 입력 객체 `+0x9C`에 같은 yaw 값을 쓰는 흐름을 확인했다. 앞의 두 캐시를 정확한
+    타이밍에 덮어도 카메라 변화는 `0.000031`도뿐이었지만 컨트롤러 `+0x9C`에 `0.1`을 6틱 넣은 자동
+    프로브는 실제 렌더 카메라를 `+0.601364`도 움직였다. 이 필드를 1:1 권위 yaw 입력으로 확정했다.
+  - 플레이어 루트 `IPlacedComponent::SetTransform`도 주소 해시 `1828854026`와 2.31 주소
+    `Cyberpunk2077.exe+0x574FC8`을 확인해 1도 왕복 시험했으나 카메라 변화가 `-0.006577`도에 그쳤다.
+    직접 quaternion 캐시 쓰기와 마찬가지로 컨트롤러에 덮이는 경로라 판정하고 최종 코드에서 전부 제거했다.
+  - 최종 메모리 에임은 카메라 컨트롤러 업데이트를 66바이트 고유 AOB로 후킹해 현재 호출의 입력 소유자를
+    thread-local로 전달하고, 중첩 FPP 업데이트에서 yaw는 `controllerInput+0x9C`, pitch는 검증된 네 번째
+    인자로 같은 각도 delta를 기록한다. smoothing 0은 두 축 모두 `alpha=1`이라 엔진 LookAt/AimRequest와
+    trainer 보간을 거치지 않는다. 진단용 자동 프로브와 실패한 SetTransform 코드는 모두 제거했다.
+  - `tools/scripts/inject.py --auto`를 추가했다. 기본적으로 `Cyberpunk2077.exe`를 감시하고 Release DLL을
+    PID당 한 번만 주입하며, 안전 언로드 후 같은 PID에는 재주입하지 않고 게임 재시작으로 PID가 바뀌면 다시
+    주입한다. `--once`, `--dry-run`, `--interval`, DLL 경로 override를 지원하고 더블클릭용
+    `tools/scripts/auto_inject_cp2077.cmd`도 추가했다. 문법 검사, help, 실행 중 PID dry-run 검사를 통과했다.
+  - 최종 Release 빌드에서 FPP 및 컨트롤러 AOB가 각각 정확히 1개 매치했고 로컬 player/FPP camera 해석과
+    게임 응답 상태를 확인했다. 실제 우클 타겟 추적 로그는 아직 발생하지 않았지만, yaw/pitch 각 입력 경로는
+    별도의 자동 실메모리 프로브로 화면 반응을 검증했다.
