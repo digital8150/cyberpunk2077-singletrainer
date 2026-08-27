@@ -21,6 +21,7 @@ namespace
     bool SameSettings(const Features::Settings& lhs, const Features::Settings& rhs)
     {
         return lhs.showFps == rhs.showFps &&
+               lhs.noRecoil == rhs.noRecoil &&
                lhs.esp.enabled == rhs.esp.enabled &&
                lhs.esp.boundingBoxes == rhs.esp.boundingBoxes &&
                lhs.esp.skeleton == rhs.esp.skeleton &&
@@ -86,6 +87,7 @@ namespace
         bool ok = true;
         ok &= WriteValue(L"trainer", L"version", L"1");
         ok &= WriteBool(L"trainer", L"show_fps", settings.showFps);
+        ok &= WriteBool(L"trainer", L"no_recoil", settings.noRecoil);
 
         ok &= WriteBool(L"esp", L"enabled", settings.esp.enabled);
         ok &= WriteBool(L"esp", L"bounding_boxes", settings.esp.boundingBoxes);
@@ -149,6 +151,7 @@ namespace Config
 
         Features::Settings& settings = Features::GetSettings();
         settings.showFps = ReadBool(L"trainer", L"show_fps", settings.showFps);
+        settings.noRecoil = ReadBool(L"trainer", L"no_recoil", settings.noRecoil);
 
         settings.esp.enabled = ReadBool(L"esp", L"enabled", settings.esp.enabled);
         settings.esp.boundingBoxes = ReadBool(L"esp", L"bounding_boxes", settings.esp.boundingBoxes);

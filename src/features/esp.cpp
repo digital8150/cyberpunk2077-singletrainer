@@ -196,6 +196,7 @@ namespace Esp
             settings.showPolice, settings.showUnclassified, settings.hideDead);
 
         static std::array<Game::EntityTracker::PuppetSnapshot, 128> puppets{};
+        const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
         const std::size_t count = Game::EntityTracker::GetPuppetSnapshots(puppets.data(), puppets.size());
         static ULONGLONG lastDiagnosticsTick = 0;
         static unsigned diagnosticsWindows = 0;
@@ -204,7 +205,14 @@ namespace Esp
             const ULONGLONG now = GetTickCount64();
             if ((settings.enabled || diagnosticsWindows < 3) && now - lastDiagnosticsTick >= 3000)
             {
-                Diagnostics::Log("ESP diagnostics: snapshots=0 (no registered NPCs are currently tracked)");
+                Diagnostics::Log("ESP diagnostics: snapshots=0 tracked=%llu pendingPosition=%llu "
+                                 "unregistered=%llu staleRemoved=%llu healthValid=%llu healthInvalid=%llu",
+                                 static_cast<unsigned long long>(entityStats.trackedPuppets),
+                                 static_cast<unsigned long long>(entityStats.pendingPosition),
+                                 static_cast<unsigned long long>(entityStats.unregistered),
+                                 static_cast<unsigned long long>(entityStats.staleRemoved),
+                                 static_cast<unsigned long long>(entityStats.healthValid),
+                                 static_cast<unsigned long long>(entityStats.healthInvalid));
                 lastDiagnosticsTick = now;
                 ++diagnosticsWindows;
             }
@@ -310,6 +318,26 @@ namespace Esp
                                   ImDrawFlags_None);
                 drawList->AddRect(minimum, maximum, color, 2.0f, 1.4f, ImDrawFlags_None);
             }
+
+            // Health is refreshed on the game main tick and copied into the snapshot. Keep the bar anchored to the
+            // projected box so it remains useful with or without the optional bounding-box outline.
+            if (settings.healthBars && puppet.healthValid && maximum.y > minimum.y)
+            {
+                const float barWidth = 5.0f;
+                const float barGap = 6.0f;
+                const float barLeft = minimum.x - barGap - barWidth;
+                const float ratio = std::clamp(puppet.healthRatio, 0.0f, 1.0f);
+                const ImU32 barBackground = Fade(IM_COL32(0, 0, 0, 220), fade);
+                const ImU32 barColor = ratio > 0.60f
+                                           ? Fade(IM_COL32(74, 222, 128, 245), fade)
+                                           : ratio > 0.30f ? Fade(IM_COL32(255, 196, 72, 245), fade)
+                                                          : Fade(IM_COL32(255, 82, 96, 245), fade);
+                drawList->AddRectFilled(ImVec2(barLeft, minimum.y), ImVec2(barLeft + barWidth, maximum.y),
+                                        barBackground, 1.5f);
+                const float fillTop = maximum.y - (maximum.y - minimum.y) * ratio;
+                drawList->AddRectFilled(ImVec2(barLeft + 1.0f, fillTop),
+                                        ImVec2(barLeft + barWidth - 1.0f, maximum.y - 1.0f), barColor, 1.0f);
+            }
             if (settings.skeleton && puppet.visual.skeletonSegmentCount > 0)
                 skeletonLineCount += DrawSkeleton(puppet.visual, io, drawList, color, shadow);
 
@@ -330,12 +358,20 @@ namespace Esp
                 "dead=%zu categorized=%zu categoryEnabled=%zu projected=%zu front=%zu poseBounds=%zu "
                 "skeletonLines=%zu depthRange=[%.2f,%.2f] maxDistance=%.1f distanceRejected=%zu "
                 "withinDistance=%zu drawn=%zu enabled=%d camera=%d "
+                "health[valid=%llu invalid=%llu bars=%d] "
+                "nativeHighlight[queued=%llu cleared=%llu failures=%llu] "
                 "visibility[on=%d available=%d occluded=%zu unknown=%zu casts=%llu clear=%llu blocked=%llu "
                 "dropped=%llu]",
                 count, civilianCount, enemyCount, policeCount, unclassifiedCount, deadCount, categorizedCount,
                 categoryEnabledCount, projectedCount, frontCount, realBoundsCount, skeletonLineCount, minimumDepth,
                 maximumForwardDepth, settings.maxDistanceMeters, distanceRejectedCount, withinDistanceCount,
-                drawnCount, settings.enabled ? 1 : 0, hasCamera ? 1 : 0, visibilityCheck ? 1 : 0,
+                drawnCount, settings.enabled ? 1 : 0, hasCamera ? 1 : 0,
+                static_cast<unsigned long long>(entityStats.healthValid),
+                static_cast<unsigned long long>(entityStats.healthInvalid), settings.healthBars ? 1 : 0,
+                static_cast<unsigned long long>(entityStats.nativeHighlightQueued),
+                static_cast<unsigned long long>(entityStats.nativeHighlightCleared),
+                static_cast<unsigned long long>(entityStats.nativeHighlightFailures),
+                visibilityCheck ? 1 : 0,
                 visibilityStats.available ? 1 : 0, occludedCount, unknownVisibilityCount,
                 static_cast<unsigned long long>(visibilityStats.casts),
                 static_cast<unsigned long long>(visibilityStats.visible),

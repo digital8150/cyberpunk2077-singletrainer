@@ -11,8 +11,7 @@ namespace Features
         bool nativeHighlight = false;
         bool hideDead = true;
         // 게임 physics 쿼리로 카메라→대상 시야를 검사한다. 가려진 대상은 흐리게 그리고,
-        // hideOccluded가 켜져 있으면 아예 그리지 않는다. 물리 쿼리는 전용 워커 스레드에서 도는데
-        // 게임 물리 스텝과 겹칠 수 있어 아직 장시간 검증 전이므로 기본값은 꺼짐이다.
+        // hideOccluded가 켜져 있으면 아예 그리지 않는다. 쿼리는 게임 메인 틱에서 처리한다.
         bool visibilityCheck = false;
         bool hideOccluded = false;
         bool showCivilians = true;
@@ -28,7 +27,7 @@ namespace Features
         bool drawFovCircle = true;
         bool targetEnemies = true;
         bool targetPolice = false;
-        // ESP의 visibilityCheck와 같은 물리 워커를 쓰므로 기본값도 같이 꺼둔다.
+        // ESP의 visibilityCheck와 같은 게임 메인 틱 쿼리를 사용하므로 기본값도 같이 꺼둔다.
         bool visibleOnly = false;
         float fovRadiusPixels = 180.0f;
         float smoothing = 8.0f;
@@ -38,6 +37,7 @@ namespace Features
     struct Settings
     {
         bool showFps = true;
+        bool noRecoil = false;
         EspSettings esp;
         AimbotSettings aimbot;
     };

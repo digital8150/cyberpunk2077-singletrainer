@@ -12,6 +12,7 @@
 #include "../framework.h"
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
+#include "../game/player_modifiers.h"
 #include "../game/visibility.h"
 #include "../features/aimbot.h"
 #include "../ui/overlay.h"
@@ -263,6 +264,15 @@ namespace Hooks
     bool Shutdown()
     {
         Diagnostics::Log("hook shutdown started");
+
+        // Native highlight events and StatsSystem modifiers are owned by the game main tick. Request their cleanup
+        // while the tick hook is still active; invoking engine code from this unload worker would race the engine.
+        if (!Game::EntityTracker::PrepareForShutdown(2500) ||
+            !Game::PlayerModifiers::PrepareForShutdown(2500))
+        {
+            Diagnostics::Log("hook shutdown aborted: main-tick feature cleanup did not acknowledge safely");
+            return false;
+        }
         HookLifecycle::BeginShutdown();
 
         if (g_hooksEnabled)
@@ -302,6 +312,7 @@ namespace Hooks
         Overlay::Shutdown();
         CursorHook::Shutdown();
         Aimbot::Shutdown();
+        Game::PlayerModifiers::Shutdown();
         Game::EntityTracker::Shutdown();
         if (g_minHookInitialized)
         {

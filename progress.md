@@ -328,3 +328,39 @@
   - 최종적으로 `inject.py --unload` 안전 종료도 통과했다. 로그에서 훅 비활성화 뒤 visibility 상태가
     `casts=25423 visible=4541 occluded=10279 dropped=95939`로 정리되고 `hook shutdown finished`,
     `safe unload checks passed` 순서가 기록됐으며, DLL 모듈이 빠진 뒤에도 게임 프로세스는 응답 상태였다.
+- **스트리밍 ESP, 네이티브 하이라이트, 체력/사망, hard aim, no-recoil 통합 구현 및 라이브 검증**:
+  - 기존 `RegisterEntity` 콜백은 transform이 아직 준비되지 않은 NPC를 추적 목록에 넣지 않았고,
+    snapshot 실패도 임시 transform 부재와 stale pointer를 구분하지 않고 삭제했다. 모든 NPC를 먼저
+    추적하고 snapshot 결과를 `Ready/PendingPosition/Stale`로 분리했다. 라이브 이동/스트리밍에서 추적 수가
+    `0 -> 1 -> 21 -> 26`으로 증가했고, transform 대기 항목은 보존되며 실제 stale 1개만 제거됐다.
+    `UnregisterEntity` 주소 해시는 확보했지만 네이티브 ABI를 검증하지 못했으므로 추정 시그니처 훅은 설치하지
+    않고 ID/type 재검증 경로를 authoritative cleanup으로 유지했다.
+  - RedHotTools commit `b4d341527bce19842d16a757028be901d4a2d6a8`의
+    `WorldInspector::SetEntityHighlightEffect`를 기준으로 `entRenderHighlightEvent`(0x58)를 만들고
+    `QueueEvent`로 전달하는 네이티브 ESP를 복구했다. 이벤트 생성, VisionModeSystem 전환, QueueEvent는 전부
+    기존 게임 `OnTick` 훅에서만 실행하고 Present는 atomic 설정만 게시한다. 과거의 추정 render-proxy
+    `0x1E0/0x1E8` 직접 호출 경로는 제거했다.
+  - 첫 라이브 검증에서 활성 대상 조건식이 매 틱 이벤트를 다시 보내 `queued=4096` 상한까지 차는 버그를
+    발견했다. unknown->enabled 또는 실제 상태 변경 때만 큐잉하도록 수정하고, 최대 256개 clear용 이벤트
+    headroom을 예약했다. 수정본은 NPC 8/9/10명에서 queued가 8/9/10으로 고정됐고, 1명 사망 시
+    `queued=11 cleared=1 failures=0`으로 정확히 한 번 clear됐다. 안전 종료 때 남은 활성 엔트리도 모두
+    clear한 뒤 Braindance mode를 0으로 내리고 다음 틱에서 acknowledgement한다.
+  - 게임 REDmod의 `StatPoolsSystem` API를 기준으로 Health pool(17)의 현재/최대/최솟값 도달 여부를 메인
+    틱에서 bounded round-robin으로 읽어 캐시했다. health bar는 이 비율을 box 왼쪽에 렌더하고, stat pool이
+    유효할 때 사망 판정도 같은 값으로 수행한다. 라이브에서 health resolver 3종이 성공하고 valid 값이 계속
+    증가했으며 invalid 0인 구간을 확인했다. 실제 처치 후 진단이 `dead=0 -> dead=1`로 바뀌고 hide-dead가
+    적용됐다.
+  - smoothing 0은 `duration/maxDuration/precision=0`, ease off, `processAsInput=false`, time limit off인
+    별도 hard request로 변경했다. 새로 스트리밍된 적에서 hard mode가 실행되고 마지막 screen delta가
+    `(0.1, 0.2)`까지 수렴하는 것을 확인했다.
+  - no-recoil은 Simple Menu의 장착 무기 StatsSystem multiplier 방식과 RED4ext SDK stat enum을 기준으로
+    RecoilAngle/Dir/KickMin/KickMax/AlternateDir의 hip/ADS 항목 및 ADS 분리 플래그 11개에 0 multiplier를
+    적용한다. 실제 게임에서 TransactionSystem이 장착 무기 ID를 찾고 modifier 11개 적용/무기 교체 시 11개
+    제거 후 새 무기에 재적용하는 로그를 확인했다. API가 정상인데 무기가 없는 경우 player ID에 잘못
+    fallback하던 초안은 제거하고 재장착까지 대기한다.
+  - 최종 Release 빌드와 `git diff --check`를 통과했다. PID 10908에서 네이티브 ESP와 no-recoil이 활성인
+    상태로 안전 종료했으며 `native highlight cleanup acknowledged: queued=22 cleared=11`,
+    `no-recoil modifiers removed: count=11`, `safe unload checks passed`가 순서대로 기록됐다. 게임은 계속
+    응답했고 `CrashInfo.json`은 이전 크래시 시각 19:23:29에서 변하지 않았다. 테스트용 사용자 설정
+    `no_recoil=1`은 종료 후 다시 0으로 복구했다. 이벤트 handle의 완전한 소멸 ABI는 추정하지 않고 4096개
+    bounded 보수적 수명 정책을 유지하며, 정상 전이 전용 큐잉으로 일반 세션에서는 매우 천천히 증가한다.

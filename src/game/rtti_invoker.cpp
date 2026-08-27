@@ -5,10 +5,14 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 
 namespace
 {
     constexpr std::uint32_t kInternalExecuteAddressHash = 0x1817231Du;
+    constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
+    constexpr std::uint32_t kCClassCreateInstanceAddressHash = 0x5A800F1Du;
+    constexpr std::uint32_t kHandleCtorAddressHash = 0xBA0C115Du;
     constexpr std::uint8_t kParamOpcode = 27;
     constexpr std::uint8_t kParamEndOpcode = 38;
 
@@ -45,7 +49,11 @@ namespace
         std::byte pad00[0x10];
         ClassLayout* parent;
         std::uint64_t nameHash;
+        std::byte pad20[0x68 - 0x20];
+        std::uint32_t size;
     };
+
+    static_assert(offsetof(ClassLayout, size) == 0x68);
 
     struct StackFrameLayout
     {
@@ -71,6 +79,34 @@ namespace
 
     using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
     using InternalExecuteFn = bool (*)(FunctionLayout*, void*, StackFrameLayout*, void*, void*);
+    using GetRttiSystemFn = void* (*)();
+    // CClass::CreateInstance is the RED4ext SDK three-argument relocation: (class, size, zeroMemory).
+    using CClassCreateInstanceFn = void* (*)(ClassLayout*, std::uint32_t, bool);
+    using HandleCtorFn = void (*)(Game::Rtti::Handle*, void*);
+
+    void* VirtualFunction(void* object, std::size_t index)
+    {
+        if (!object)
+            return nullptr;
+        void** table = *reinterpret_cast<void***>(object);
+        return table ? table[index] : nullptr;
+    }
+
+    ResolveAddressFn ResolveAddress()
+    {
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        return red4ext ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                       : nullptr;
+    }
+
+    void* GetRttiSystem()
+    {
+        ResolveAddressFn resolve = ResolveAddress();
+        const std::uintptr_t address = resolve ? resolve(kRttiSystemGetAddressHash) : 0;
+        if (!address)
+            return nullptr;
+        return reinterpret_cast<GetRttiSystemFn>(address)();
+    }
 
     InternalExecuteFn ResolveInternalExecute()
     {
@@ -129,6 +165,127 @@ namespace Game::Rtti
             }
         }
         return nullptr;
+    }
+
+    Class* GetClass(std::uint64_t nameHash)
+    {
+        __try
+        {
+            void* rttiSystem = GetRttiSystem();
+            const auto getClass = reinterpret_cast<Class* (*)(void*, std::uint64_t)>(
+                VirtualFunction(rttiSystem, 2));
+            return getClass ? getClass(rttiSystem, nameHash) : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    std::size_t ClassSize(const Class* opaqueType)
+    {
+        if (!opaqueType)
+            return 0;
+        __try
+        {
+            const auto* type = reinterpret_cast<const ClassLayout*>(opaqueType);
+            return type->size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    void* CreateInstance(Class* opaqueType)
+    {
+        if (!opaqueType)
+            return nullptr;
+        __try
+        {
+            ResolveAddressFn resolve = ResolveAddress();
+            const std::uintptr_t address = resolve ? resolve(kCClassCreateInstanceAddressHash) : 0;
+            const std::size_t size = ClassSize(opaqueType);
+            if (!address || size == 0 || size > (std::numeric_limits<std::uint32_t>::max)())
+                return nullptr;
+            return reinterpret_cast<CClassCreateInstanceFn>(address)(reinterpret_cast<ClassLayout*>(opaqueType),
+                                                                       static_cast<std::uint32_t>(size), false);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    bool ConstructHandle(Handle* handle, void* instance)
+    {
+        if (!handle || !instance)
+            return false;
+        *handle = {};
+        __try
+        {
+            ResolveAddressFn resolve = ResolveAddress();
+            const std::uintptr_t address = resolve ? resolve(kHandleCtorAddressHash) : 0;
+            if (!address)
+                return false;
+            reinterpret_cast<HandleCtorFn>(address)(handle, instance);
+            return handle->instance == instance && handle->refCount != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            *handle = {};
+            return false;
+        }
+    }
+
+    void ReleaseHandle(Handle* handle)
+    {
+        if (!handle || !handle->refCount)
+            return;
+        __try
+        {
+            // RED4ext::Handle::~Handle() calls RefCnt::DecRef(), then destroys the instance when that was the
+            // final strong reference and CanBeDestructed() allows it. We do not have a verified ABI for either
+            // CanBeDestructed() or Memory::Delete(), so never perform the final decrement here. Dropping a strong
+            // reference is safe only when another strong owner is demonstrably present; use a CAS loop so a racing
+            // owner cannot turn a >1 observation into an unsafe decrement-to-zero.
+            struct RefCountLayout
+            {
+                volatile LONG strong;
+                volatile LONG weak;
+            };
+            auto* refs = static_cast<RefCountLayout*>(handle->refCount);
+            LONG observed = InterlockedCompareExchange(&refs->strong, 0, 0);
+            while (observed > 1)
+            {
+                const LONG previous = InterlockedCompareExchange(&refs->strong, observed - 1, observed);
+                if (previous == observed)
+                    break;
+                observed = previous;
+            }
+            // A strong count of one is the SDK's last-owner case and is deliberately retained. A zero count is
+            // an expired/weak state, not a valid strong Handle destructor path; do not call DecWeakRef through a
+            // guessed storage type. The caller's handle is cleared below so it cannot be reused accidentally.
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        *handle = {};
+    }
+
+    bool HasReturnValue(const Function* opaqueFunction)
+    {
+        if (!opaqueFunction)
+            return false;
+        __try
+        {
+            const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
+            return function->returnType != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     std::size_t ParameterCount(const Function* opaqueFunction)

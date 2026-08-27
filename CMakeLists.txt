@@ -40,6 +40,7 @@ add_library(cp2077_trainer SHARED
     src/game/rtti_invoker.cpp
     src/game/signature_scanner.cpp
     src/game/entity_tracker.cpp
+    src/game/player_modifiers.cpp
     src/game/projection.cpp
     src/game/visibility.cpp
     src/hooks/cursor_hook.cpp

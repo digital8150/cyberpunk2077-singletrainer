@@ -2,6 +2,7 @@
 #include "../framework.h"  // GetFileAttributesW/INVALID_FILE_ATTRIBUTES
 #include "../features/features.h"
 #include "../game/entity_tracker.h"
+#include "../game/player_modifiers.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
@@ -222,6 +223,7 @@ namespace Widgets
 
         Features::Settings& settings = Features::GetSettings();
         const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
+        const Game::PlayerModifiers::Stats modifierStats = Game::PlayerModifiers::GetStats();
 
         ImGui::TextDisabled("Cyberpunk 2077 2.31  |  Insert: menu  |  End: unload");
         ImGui::Separator();
@@ -229,6 +231,9 @@ namespace Widgets
         ImGui::TextUnformatted("Show FPS");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##show_fps", &settings.showFps);
+        ImGui::TextUnformatted("No recoil");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##no_recoil", &settings.noRecoil);
         ImGui::Separator();
 
         ImGui::TextUnformatted("ESP");
@@ -245,7 +250,7 @@ namespace Widgets
         ImGui::TextUnformatted("Health bars");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_health", &settings.esp.healthBars);
-        ImGui::TextDisabled("Native highlight (disabled - crashes)");
+        ImGui::TextUnformatted("Native highlight");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_native", &settings.esp.nativeHighlight);
         ImGui::TextUnformatted("Hide dead NPCs");
@@ -283,6 +288,21 @@ namespace Widgets
                             static_cast<unsigned long long>(entityStats.trackedCivilians),
                             static_cast<unsigned long long>(entityStats.trackedEnemies),
                             static_cast<unsigned long long>(entityStats.trackedPolice));
+        ImGui::TextDisabled("Health feed: valid %llu | fallback/invalid %llu | pending position %llu",
+                            static_cast<unsigned long long>(entityStats.healthValid),
+                            static_cast<unsigned long long>(entityStats.healthInvalid),
+                            static_cast<unsigned long long>(entityStats.pendingPosition));
+        ImGui::TextDisabled("Native highlight: queued %llu | cleared %llu | failures %llu",
+                            static_cast<unsigned long long>(entityStats.nativeHighlightQueued),
+                            static_cast<unsigned long long>(entityStats.nativeHighlightCleared),
+                            static_cast<unsigned long long>(entityStats.nativeHighlightFailures));
+        ImGui::TextDisabled("No recoil: %s (%s) | target 0x%llX | applied %llu | removed %llu | failures %llu",
+                            modifierStats.active ? "active" : (modifierStats.available ? "ready" : "unavailable"),
+                            modifierStats.usingWeaponTarget ? "weapon" : "player fallback",
+                            static_cast<unsigned long long>(modifierStats.targetId),
+                            static_cast<unsigned long long>(modifierStats.applied),
+                            static_cast<unsigned long long>(modifierStats.removed),
+                            static_cast<unsigned long long>(modifierStats.failures));
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -314,9 +334,9 @@ namespace Widgets
             "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
             "Distance uses camera-forward depth. Boxes are built from live SlotComponent pose points and face "
             "the camera; the animation-system AABB is only a fallback. Visibility check raycasts the game's own "
-            "'Sight Blocker' preset from the camera on a worker thread and dims occluded targets - it is off by "
+            "'Sight Blocker' preset from the camera on the game main tick and dims occluded targets - it is off by "
             "default because those physics queries share locks with the game's own physics step. Health values "
-            "and dynamic hostility are still pending.");
+            "come from the cached stat-pool feed and fall back to the corpse component only when unavailable.");
 
         ImGui::End();
     }

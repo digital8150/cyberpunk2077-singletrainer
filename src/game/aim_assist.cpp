@@ -81,6 +81,8 @@ namespace
     };
 
     State g_state;
+    bool g_lastLoggedHardLock = false;
+    bool g_hasLoggedAimMode = false;
 
     void* VirtualFunction(void* object, std::size_t index)
     {
@@ -165,22 +167,32 @@ namespace Game::AimAssist
 
             const bool hardLock = smoothing <= 0.001f;
             AimRequest request{};
-            request.duration = hardLock ? 0.001f : std::clamp(smoothing * 0.015f, 0.02f, 0.45f);
+            // A hard lock is a distinct native request. A tiny non-zero duration still lets the engine's
+            // input/easing path run for one millisecond, which leaves a visible lag and can fight the current
+            // camera. The zero-duration form asks TargetingSystem to apply the current target directly.
+            request.duration = hardLock ? 0.0f : std::clamp(smoothing * 0.015f, 0.02f, 0.45f);
             request.adjustPitch = true;
             request.adjustYaw = true;
             request.endOnTargetReached = false;
             request.endOnCameraInputApplied = false;
-            request.endOnTimeExceeded = true;
+            request.endOnTimeExceeded = !hardLock;
             request.endOnAimingStopped = false;
             request.cameraInputMagToBreak = 1000.0f;
             request.cameraMouseInputMagToBreak = 1000.0f;
-            request.precision = 0.001f;
-            request.maxDuration = request.duration;
+            request.precision = hardLock ? 0.0f : 0.001f;
+            request.maxDuration = hardLock ? 0.0f : request.duration;
             request.easeIn = !hardLock;
             request.easeOut = false;
             request.checkRange = false;
             request.lookAtTarget = {worldTarget[0], worldTarget[1], worldTarget[2], 0.0f};
-            request.processAsInput = true;
+            request.processAsInput = !hardLock;
+
+            if (!g_hasLoggedAimMode || g_lastLoggedHardLock != hardLock)
+            {
+                Diagnostics::Log("native aim mode: %s", hardLock ? "hard" : "smooth");
+                g_lastLoggedHardLock = hardLock;
+                g_hasLoggedAimMode = true;
+            }
 
             Game::Rtti::Argument arguments[] = {{&player}, {&request}};
             const bool invoked = Game::Rtti::Invoke(g_state.lookAt, g_state.targetingSystem, arguments, 2);
@@ -223,5 +235,7 @@ namespace Game::AimAssist
     {
         BreakLookAt();
         g_state = {};
+        g_lastLoggedHardLock = false;
+        g_hasLoggedAimMode = false;
     }
 }

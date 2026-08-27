@@ -1,4 +1,6 @@
 #include "visibility.h"
+#include "entity_tracker.h"
+#include "player_modifiers.h"
 #include "rtti_invoker.h"
 #include "../diagnostics.h"
 #include "../framework.h"
@@ -328,7 +330,11 @@ namespace
     {
         HookLifecycle::CallbackGuard callback;
         if (!HookLifecycle::IsShuttingDown())
+        {
+            Game::EntityTracker::OnGameMainTick();
+            Game::PlayerModifiers::OnGameMainTick();
             ProcessPendingOnMainTick();
+        }
 
         if (g_originalOnTick)
             return g_originalOnTick(gameState, gameApplication);

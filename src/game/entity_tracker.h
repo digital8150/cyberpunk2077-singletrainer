@@ -25,6 +25,16 @@ namespace Game::EntityTracker
         std::uint64_t trackedCivilians = 0;
         std::uint64_t trackedEnemies = 0;
         std::uint64_t trackedPolice = 0;
+        std::uint64_t pendingPosition = 0;
+        // Compatibility diagnostic only. UnregisterEntity is not hooked because its ABI is unverified, so this
+        // counter is intentionally always zero; stale identity/transform validation is reported separately.
+        std::uint64_t unregistered = 0;
+        std::uint64_t staleRemoved = 0;
+        std::uint64_t healthValid = 0;
+        std::uint64_t healthInvalid = 0;
+        std::uint64_t nativeHighlightQueued = 0;
+        std::uint64_t nativeHighlightCleared = 0;
+        std::uint64_t nativeHighlightFailures = 0;
         std::uint64_t lastEntityId = 0;
         float lastPosition[3]{};
         bool hasLastPuppet = false;
@@ -39,18 +49,29 @@ namespace Game::EntityTracker
         float orientation[4]{0.0f, 0.0f, 0.0f, 1.0f};
         NpcCategory category = NpcCategory::Other;
         bool isDead = false;
+        bool healthValid = false;
+        float healthCurrent = 0.0f;
+        float healthMax = 0.0f;
+        float healthRatio = 0.0f;
         AnimationData::VisualData visual;
     };
 
     // MinHook 초기화 후, MH_EnableHook(MH_ALL_HOOKS) 전에 호출한다.
     bool CreateHook();
     void Shutdown();
+    // Executes tracker health refreshes and native highlight events on the game main tick. Never call from Present.
+    void OnGameMainTick();
+
+    // Requests a main-tick clear and waits for a clear event plus a following tick before unload. The request itself
+    // is atomic, so this function never calls into the engine from the unload worker.
+    bool PrepareForShutdown(std::uint32_t timeoutMilliseconds);
     Stats GetStats();
 
     // Refreshes registered NPC pointers defensively and copies only validated ID/position snapshots to the caller.
     std::size_t GetPuppetSnapshots(PuppetSnapshot* output, std::size_t capacity);
 
-    // Applies or clears the engine's own through-wall render highlight on currently tracked NPC mesh proxies.
+    // Publishes the desired native highlight settings. Event allocation and QueueEvent execution happen only from
+    // OnGameMainTick.
     void UpdateNativeHighlights(bool enabled, bool showCivilians, bool showEnemies, bool showPolice,
                                 bool showUnclassified, bool hideDead);
 }

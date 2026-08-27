@@ -10,17 +10,23 @@
 
 #include <atomic>
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 
 namespace
 {
-    // RED4ext/CET 공식 주소 해시: world::RuntimeEntityRegistry::RegisterEntity.
+    // RED4ext/CET verified address hash for world::RuntimeEntityRegistry::RegisterEntity.
+    // The UnregisterEntity hash is intentionally not hooked: its native ABI is not verified.
     constexpr std::uint32_t kRegisterEntityAddressHash = 2840271332u;
     constexpr std::uint32_t kCClassGetPropertyAddressHash = 0x8F031512u;
-    constexpr std::uint32_t kRenderProxySetHighlightParamsAddressHash = 1093803822u;
-    constexpr std::uint32_t kRenderProxySetScanningStateAddressHash = 2838044016u;
+    constexpr std::uint32_t kVisionModeSetBraindanceModeAddressHash = 1070077985u;
+
+    constexpr std::uint32_t kGameEngineAddressHash = 0x97F209D6u;
+    constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
+    constexpr std::size_t kEntRenderHighlightEventSize = 0x58;
+    constexpr std::size_t kMaxLeakedHighlightEvents = 4096;
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
@@ -141,20 +147,6 @@ namespace
     static_assert(offsetof(EntityLayout, components) == 0xA0);
     static_assert(offsetof(EntityLayout, transformComponent) == 0xB0);
 
-    struct HighlightParams
-    {
-        bool seeThroughWalls;
-        std::uint8_t patternType;
-        std::uint8_t fillIndex;
-        std::uint8_t outlineIndex;
-        float opacity;
-        bool forced;
-    };
-    static_assert(offsetof(HighlightParams, opacity) == 0x4);
-
-    using SetHighlightParamsFn = std::uint8_t (*)(void*, const HighlightParams&);
-    using SetScanningStateFn = std::uint8_t (*)(void*, std::int8_t);
-
     enum class PuppetKind
     {
         None,
@@ -169,9 +161,22 @@ namespace
         std::uint64_t sequence = 0;
         Game::AnimationData::VisualData visual;
         ULONGLONG visualUpdatedAt = 0;
+        Game::EntityTracker::NpcCategory category = Game::EntityTracker::NpcCategory::Other;
+        bool isDead = false;
+        bool healthValid = false;
+        float healthCurrent = 0.0f;
+        float healthMax = 0.0f;
+        float healthRatio = 0.0f;
+        bool healthReachedMin = false;
+        bool highlightKnown = false;
+        bool highlightDesired = false;
     };
 
     constexpr std::size_t kMaxTrackedPuppets = 256;
+    // Reserve one clear-event slot per tracked entity. Enable transitions stop before this headroom is consumed,
+    // so cleanup can still clear every known-enabled entry even after a long sequence of setting changes.
+    constexpr std::size_t kReservedHighlightClearEvents = kMaxTrackedPuppets;
+    static_assert(kReservedHighlightClearEvents < kMaxLeakedHighlightEvents);
 
     using RegisterEntityFn = void (*)(void* registry, EntityLayout* entity);
     using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
@@ -186,6 +191,13 @@ namespace
     std::atomic_uint64_t g_trackedCivilians{0};
     std::atomic_uint64_t g_trackedEnemies{0};
     std::atomic_uint64_t g_trackedPolice{0};
+    std::atomic_uint64_t g_pendingPosition{0};
+    std::atomic_uint64_t g_staleRemoved{0};
+    std::atomic_uint64_t g_healthValid{0};
+    std::atomic_uint64_t g_healthInvalid{0};
+    std::atomic_uint64_t g_nativeHighlightQueued{0};
+    std::atomic_uint64_t g_nativeHighlightCleared{0};
+    std::atomic_uint64_t g_nativeHighlightFailures{0};
     SRWLOCK g_lastEntityLock = SRWLOCK_INIT;
     std::uint64_t g_lastEntityId = 0;
     float g_lastPosition[3]{};
@@ -199,11 +211,38 @@ namespace
     using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
     GetPropertyFn g_getProperty = nullptr;
     bool g_getPropertyAttempted = false;
-    SetHighlightParamsFn g_setHighlightParams = nullptr;
-    SetScanningStateFn g_setScanningState = nullptr;
-    bool g_highlightResolveAttempted = false;
-    bool g_nativeHighlightActive = false;
-    ULONGLONG g_lastNativeHighlightTick = 0;
+    std::atomic_uint32_t g_nativeHighlightRequest{0};
+    std::atomic_uint64_t g_nativeHighlightGeneration{0};
+    std::atomic_bool g_nativeHighlightModeActive{false};
+    std::atomic_bool g_cleanupRequested{false};
+    std::atomic_bool g_cleanupClearQueued{false};
+    std::atomic_bool g_cleanupAcknowledged{false};
+    std::atomic_uint64_t g_cleanupGeneration{0};
+    std::uint64_t g_healthRoundRobin = 0;
+
+    struct NativeHighlightRuntime
+    {
+        bool attempted = false;
+        ULONGLONG lastResolveAttempt = 0;
+        Game::Rtti::Class* eventClass = nullptr;
+        std::size_t eventSize = 0;
+        void* visionModeSystem = nullptr;
+        using SetBraindanceModeFn = void (*)(void*, std::uint32_t);
+        SetBraindanceModeFn setBraindanceMode = nullptr;
+        std::size_t leakedEvents = 0;
+    };
+    NativeHighlightRuntime g_highlightRuntime;
+
+    struct HealthRuntime
+    {
+        bool attempted = false;
+        ULONGLONG lastResolveAttempt = 0;
+        void* statPoolsSystem = nullptr;
+        Game::Rtti::Function* getValue = nullptr;
+        Game::Rtti::Function* getMaxValue = nullptr;
+        Game::Rtti::Function* reachedMin = nullptr;
+    };
+    HealthRuntime g_healthRuntime;
 
     GetPropertyFn ResolveGetProperty()
     {
@@ -220,6 +259,47 @@ namespace
             g_getProperty = reinterpret_cast<GetPropertyFn>(resolve(kCClassGetPropertyAddressHash));
         Diagnostics::Log("CClass::GetProperty resolver: address=%p", reinterpret_cast<void*>(g_getProperty));
         return g_getProperty;
+    }
+
+    void* ResolveGameInstanceOnMainTick()
+    {
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        if (!resolve)
+            return nullptr;
+
+        const std::uintptr_t enginePointerAddress = resolve(kGameEngineAddressHash);
+        void* engine = enginePointerAddress ? *reinterpret_cast<void**>(enginePointerAddress) : nullptr;
+        void* framework = engine ? *reinterpret_cast<void**>(static_cast<std::byte*>(engine) + 0x308) : nullptr;
+        return framework ? *reinterpret_cast<void**>(static_cast<std::byte*>(framework) + 0x10) : nullptr;
+    }
+
+    void* VirtualFunction(void* object, std::size_t index)
+    {
+        if (!object)
+            return nullptr;
+        void** table = *reinterpret_cast<void***>(object);
+        return table ? table[index] : nullptr;
+    }
+
+    void* GetSystemOnMainTick(void* gameInstance, std::uint64_t typeHash)
+    {
+        if (!gameInstance)
+            return nullptr;
+        void* rttiSystem = nullptr;
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        const std::uintptr_t rttiGetAddress = resolve ? resolve(kRttiSystemGetAddressHash) : 0;
+        if (rttiGetAddress)
+            rttiSystem = reinterpret_cast<void* (*)()>(rttiGetAddress)();
+        const auto getClass = reinterpret_cast<void* (*)(void*, std::uint64_t)>(VirtualFunction(rttiSystem, 2));
+        void* type = getClass ? getClass(rttiSystem, typeHash) : nullptr;
+        const auto getSystem = reinterpret_cast<void* (*)(void*, void*)>(VirtualFunction(gameInstance, 1));
+        return getSystem && type ? getSystem(gameInstance, type) : nullptr;
     }
 
     bool FindBoolProperty(const ClassLayout* type, std::uint64_t propertyName, BoolPropertyLocation& result)
@@ -506,7 +586,7 @@ namespace
             AddSkeletonSegment(visual, hips.position, rightLeg.position);
     }
 
-    bool IsDead(const EntityLayout* entity)
+    bool IsCorpseDead(const EntityLayout* entity)
     {
         constexpr std::uint64_t corpseComponentNames[] = {
             Fnv1a64("entCorpseComponent"),
@@ -561,11 +641,15 @@ namespace
 
         if (!target)
             target = oldest;
-        if (target->entityId != entity->entityId)
+        // A streamed-out object can be replaced at the same slot/ID. Do not carry health/highlight state from the
+        // old pointer into the replacement; it must earn a fresh snapshot and highlight transition.
+        if (target->entity != entity || target->entityId != entity->entityId)
             *target = {};
         target->entity = entity;
         target->entityId = entity->entityId;
         target->sequence = ++g_puppetSequence;
+        target->category = ClassifyNpc(entity);
+        target->isDead = false;
 
         std::uint64_t count = 0;
         for (const TrackedPuppet& tracked : g_puppetList)
@@ -574,23 +658,34 @@ namespace
         ReleaseSRWLockExclusive(&g_puppetListLock);
     }
 
-    bool TrySnapshot(TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
+    enum class SnapshotResult : std::uint8_t
+    {
+        Ready,
+        PendingPosition,
+        Stale,
+    };
+
+    SnapshotResult TrySnapshot(TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
     {
         // Game streaming can free/reuse an entity independently of our list. Validate all identity data at the
         // point of use and contain a stale-pointer access; no raw pointer leaves this function.
         __try
         {
             EntityLayout* entity = tracked.entity;
-            if (!entity || entity->entityId != tracked.entityId ||
-                ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
+            if (!entity)
+                return SnapshotResult::Stale;
+            if (entity->entityId != tracked.entityId || ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
             {
-                return false;
+                return SnapshotResult::Stale;
             }
 
             float position[3]{};
             float orientation[4]{};
             if (!ReadTransform(entity, position, orientation))
-                return false;
+            {
+                g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
+                return SnapshotResult::PendingPosition;
+            }
 
             snapshot.entityId = tracked.entityId;
             snapshot.position[0] = position[0];
@@ -598,7 +693,16 @@ namespace
             snapshot.position[2] = position[2];
             memcpy(snapshot.orientation, orientation, sizeof(orientation));
             snapshot.category = ClassifyNpc(entity);
-            snapshot.isDead = IsDead(entity);
+            tracked.category = snapshot.category;
+            if (tracked.healthValid)
+                tracked.isDead = tracked.healthReachedMin || tracked.healthCurrent <= 0.001f;
+            else
+                tracked.isDead = IsCorpseDead(entity);
+            snapshot.isDead = tracked.isDead;
+            snapshot.healthValid = tracked.healthValid;
+            snapshot.healthCurrent = tracked.healthCurrent;
+            snapshot.healthMax = tracked.healthMax;
+            snapshot.healthRatio = tracked.healthRatio;
             const ULONGLONG now = GetTickCount64();
             if (tracked.visualUpdatedAt == 0 || now - tracked.visualUpdatedAt >= 33)
             {
@@ -609,11 +713,11 @@ namespace
                 tracked.visualUpdatedAt = now;
             }
             snapshot.visual = tracked.visual;
-            return true;
+            return SnapshotResult::Ready;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return false;
+            return SnapshotResult::Stale;
         }
     }
 
@@ -638,8 +742,12 @@ namespace
             hasPosition = true;
             g_positioned.fetch_add(1, std::memory_order_relaxed);
         }
+        else if (puppet)
+        {
+            g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
+        }
 
-        if (puppet && hasPosition)
+        if (puppet)
             TrackPuppet(entity);
 
         AcquireSRWLockExclusive(&g_lastEntityLock);
@@ -647,7 +755,7 @@ namespace
         g_lastPosition[0] = position[0];
         g_lastPosition[1] = position[1];
         g_lastPosition[2] = position[2];
-        if (puppet && hasPosition)
+        if (puppet)
         {
             g_hasLastPuppet = true;
             g_lastPuppetId = entity->entityId;
@@ -668,51 +776,421 @@ namespace
         }
     }
 
-    bool ResolveHighlightFunctions()
-    {
-        if (g_highlightResolveAttempted)
-            return g_setHighlightParams && g_setScanningState;
-        g_highlightResolveAttempted = true;
+    constexpr std::uint32_t kHighlightEnabledBit = 1u << 0;
+    constexpr std::uint32_t kHighlightCivilianBit = 1u << 1;
+    constexpr std::uint32_t kHighlightEnemyBit = 1u << 2;
+    constexpr std::uint32_t kHighlightPoliceBit = 1u << 3;
+    constexpr std::uint32_t kHighlightOtherBit = 1u << 4;
+    constexpr std::uint32_t kHighlightHideDeadBit = 1u << 5;
 
-        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
-        const auto resolve = red4ext
-                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
-                                 : nullptr;
-        if (resolve)
+    struct HighlightWork
+    {
+        EntityLayout* entity = nullptr;
+        std::uint64_t entityId = 0;
+        bool desired = false;
+    };
+
+    bool IsCategoryEnabled(Game::EntityTracker::NpcCategory category, std::uint32_t settings)
+    {
+        switch (category)
         {
-            g_setHighlightParams = reinterpret_cast<SetHighlightParamsFn>(
-                resolve(kRenderProxySetHighlightParamsAddressHash));
-            g_setScanningState = reinterpret_cast<SetScanningStateFn>(
-                resolve(kRenderProxySetScanningStateAddressHash));
+        case Game::EntityTracker::NpcCategory::Civilian:
+            return (settings & kHighlightCivilianBit) != 0;
+        case Game::EntityTracker::NpcCategory::Enemy:
+            return (settings & kHighlightEnemyBit) != 0;
+        case Game::EntityTracker::NpcCategory::Police:
+            return (settings & kHighlightPoliceBit) != 0;
+        default:
+            return (settings & kHighlightOtherBit) != 0;
         }
-        Diagnostics::Log("native highlight resolver: params=%p scanning=%p",
-                         reinterpret_cast<void*>(g_setHighlightParams),
-                         reinterpret_cast<void*>(g_setScanningState));
-        return g_setHighlightParams && g_setScanningState;
     }
 
-    void SetEntityNativeHighlight(EntityLayout* entity, bool enabled)
+    bool ResolveNativeHighlightOnMainTick()
     {
-        constexpr std::uint64_t skinnedMeshName = Fnv1a64("entSkinnedMeshComponent");
-        constexpr std::uint64_t morphMeshName = Fnv1a64("entMorphTargetSkinnedMeshComponent");
-        const HighlightParams params = enabled ? HighlightParams{true, 0, 0, 1, 1.0f, true}
-                                               : HighlightParams{false, 0, 0, 0, 0.0f, false};
-        ForEachComponent(entity, [&](std::byte* component) {
-            const auto* type = *reinterpret_cast<ClassLayout**>(component + 0x30);
-            std::size_t proxyOffset = 0;
-            if (IsClassOrDerived(type, morphMeshName))
-                proxyOffset = 0x1E8;
-            else if (IsClassOrDerived(type, skinnedMeshName))
-                proxyOffset = 0x1E0;
-            if (proxyOffset == 0)
-                return;
+        const ULONGLONG now = GetTickCount64();
+        if (g_highlightRuntime.attempted && g_highlightRuntime.eventClass != nullptr &&
+            g_highlightRuntime.eventSize == kEntRenderHighlightEventSize &&
+            g_highlightRuntime.visionModeSystem != nullptr && g_highlightRuntime.setBraindanceMode != nullptr)
+            return true;
+        if (g_highlightRuntime.attempted && now - g_highlightRuntime.lastResolveAttempt < 1000)
+        {
+            return false;
+        }
 
-            void* proxy = *reinterpret_cast<void**>(component + proxyOffset);
-            if (!proxy)
-                return;
-            g_setHighlightParams(proxy, params);
-            g_setScanningState(proxy, enabled ? 4 : 0); // rendPostFx_ScanningState::Complete / Off
-        });
+        g_highlightRuntime.attempted = true;
+        g_highlightRuntime.lastResolveAttempt = now;
+        __try
+        {
+            g_highlightRuntime.eventClass = Game::Rtti::GetClass(Game::Rtti::Hash("entRenderHighlightEvent"));
+            g_highlightRuntime.eventSize = Game::Rtti::ClassSize(g_highlightRuntime.eventClass);
+            void* gameInstance = ResolveGameInstanceOnMainTick();
+            g_highlightRuntime.visionModeSystem = GetSystemOnMainTick(
+                gameInstance, Game::Rtti::Hash("gameIVisionModeSystem"));
+
+            HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+            const auto resolve = red4ext
+                                     ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                     : nullptr;
+            const std::uintptr_t modeAddress = resolve ? resolve(kVisionModeSetBraindanceModeAddressHash) : 0;
+            g_highlightRuntime.setBraindanceMode = modeAddress
+                                                       ? reinterpret_cast<NativeHighlightRuntime::SetBraindanceModeFn>(
+                                                             modeAddress)
+                                                       : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_highlightRuntime.eventClass = nullptr;
+            g_highlightRuntime.eventSize = 0;
+            g_highlightRuntime.visionModeSystem = nullptr;
+            g_highlightRuntime.setBraindanceMode = nullptr;
+        }
+
+        const bool resolved = g_highlightRuntime.eventClass != nullptr &&
+                              g_highlightRuntime.eventSize == kEntRenderHighlightEventSize &&
+                              g_highlightRuntime.visionModeSystem != nullptr &&
+                              g_highlightRuntime.setBraindanceMode != nullptr;
+        Diagnostics::Log("native highlight resolver: eventClass=%p eventSize=0x%zX visionModeSystem=%p "
+                         "setBraindanceMode=%p resolved=%d",
+                         g_highlightRuntime.eventClass, g_highlightRuntime.eventSize,
+                         g_highlightRuntime.visionModeSystem,
+                         reinterpret_cast<void*>(g_highlightRuntime.setBraindanceMode), resolved ? 1 : 0);
+        if (!resolved)
+            g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
+        return resolved;
+    }
+
+    bool QueueHighlightEvent(const HighlightWork& work)
+    {
+        if (!work.entity || work.entityId == 0)
+            return false;
+        const std::size_t eventLimit = work.desired
+                                           ? kMaxLeakedHighlightEvents - kReservedHighlightClearEvents
+                                           : kMaxLeakedHighlightEvents;
+        if (g_highlightRuntime.leakedEvents >= eventLimit)
+            return false;
+
+        bool queued = false;
+        __try
+        {
+            if (work.entity->entityId != work.entityId || ClassifyPuppet(work.entity->nativeType) != PuppetKind::Npc)
+                return false;
+
+            void* event = Game::Rtti::CreateInstance(g_highlightRuntime.eventClass);
+            if (!event)
+                return false;
+            ++g_highlightRuntime.leakedEvents;
+
+            // entRenderHighlightEvent is 0x58 bytes on Cyberpunk 2.31. CClass::CreateInstance has already installed
+            // the native object header; only write the documented event fields. QueueEvent is void, so a successful
+            // reflected call does not prove that it copied the handle before returning. We therefore retain this
+            // local strong reference rather than risking a premature final Handle destructor while the event loop
+            // may still own the object. The bounded allocation cap favors a safe leak over a UAF.
+            auto* bytes = static_cast<std::byte*>(event);
+            *reinterpret_cast<std::uint8_t*>(bytes + 0x40) = work.desired ? 0u : 0u; // fillIndex
+            *reinterpret_cast<std::uint8_t*>(bytes + 0x41) = work.desired ? 1u : 0u; // outlineIndex
+            *reinterpret_cast<std::uint8_t*>(bytes + 0x42) = work.desired ? 1u : 0u; // seeThroughWalls
+            *reinterpret_cast<std::uint64_t*>(bytes + 0x48) = 0u;                     // componentName (all components)
+            *reinterpret_cast<float*>(bytes + 0x50) = work.desired ? 1.0f : 0.0f;     // opacity
+            *reinterpret_cast<std::uint8_t*>(bytes + 0x54) = 1u;                      // forced
+            *reinterpret_cast<std::uint8_t*>(bytes + 0x55) = 0u;                      // pattern
+
+            Game::Rtti::Handle handle;
+            if (!Game::Rtti::ConstructHandle(&handle, event))
+                return false;
+
+            Game::Rtti::Function* queueEvent = Game::Rtti::FindFunction(
+                Game::Rtti::NativeType(work.entity), Game::Rtti::Hash("QueueEvent"));
+            if (!queueEvent || Game::Rtti::ParameterCount(queueEvent) != 1)
+                return false;
+            Game::Rtti::Argument argument{&handle};
+            // QueueEvent is a reflected Void method. Invoke() returning true means the call reached the VM; it does
+            // not demonstrate ownership transfer, hence the conservative local-handle lifetime above.
+            queued = Game::Rtti::Invoke(queueEvent, work.entity, &argument, 1);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            queued = false;
+        }
+
+        if (queued)
+        {
+            g_nativeHighlightQueued.fetch_add(1, std::memory_order_relaxed);
+            if (!work.desired)
+                g_nativeHighlightCleared.fetch_add(1, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
+        }
+        return queued;
+    }
+
+    bool SetBraindanceModeOnMainTick(bool enabled)
+    {
+        const bool active = g_nativeHighlightModeActive.load(std::memory_order_acquire);
+        if (active == enabled)
+            return true;
+        if (!g_highlightRuntime.setBraindanceMode || !g_highlightRuntime.visionModeSystem)
+            return false;
+        __try
+        {
+            g_highlightRuntime.setBraindanceMode(g_highlightRuntime.visionModeSystem, enabled ? 1u : 0u);
+            g_nativeHighlightModeActive.store(enabled, std::memory_order_release);
+            Diagnostics::Log("native highlight braindance mode: %s", enabled ? "1" : "0");
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    void PublishHighlightResult(const HighlightWork& work, bool queued)
+    {
+        if (!queued)
+            return;
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (tracked.entity == work.entity && tracked.entityId == work.entityId)
+            {
+                tracked.highlightKnown = true;
+                tracked.highlightDesired = work.desired;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+    }
+
+    bool HasDesiredHighlightState()
+    {
+        bool active = false;
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (const TrackedPuppet& tracked : g_puppetList)
+        {
+            if (tracked.entity && tracked.highlightKnown && tracked.highlightDesired)
+            {
+                active = true;
+                break;
+            }
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+        return active;
+    }
+
+    void ProcessNativeHighlightsOnMainTick()
+    {
+        const std::uint32_t published = g_nativeHighlightRequest.load(std::memory_order_acquire);
+        const std::uint32_t settings = g_cleanupRequested.load(std::memory_order_acquire) ? 0u : published;
+        const bool enabled = (settings & kHighlightEnabledBit) != 0;
+        std::array<HighlightWork, kMaxTrackedPuppets> workItems{};
+        std::size_t workCount = 0;
+        bool anyDesired = false;
+
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (const TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+            const bool desired = enabled && IsCategoryEnabled(tracked.category, settings) &&
+                                 !((settings & kHighlightHideDeadBit) != 0 && tracked.isDead);
+            anyDesired = anyDesired || desired;
+            // Queue only a state transition: unknown+desired=true is the first enable, while known entries queue
+            // only when the cached state differs. Unknown+desired=false has nothing to clear. The cache is updated
+            // only after QueueEvent succeeds below.
+            const bool transitionNeeded = tracked.highlightKnown ? tracked.highlightDesired != desired : desired;
+            if (transitionNeeded && workCount < workItems.size())
+                workItems[workCount++] = {tracked.entity, tracked.entityId, desired};
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+
+        // Keep mode enabled while a clear transition is pending. This prevents a failed clear from being hidden by
+        // an eager mode=0 call and lets the next main tick retry the same transition.
+        const bool cachedDesired = HasDesiredHighlightState();
+        const bool modeDesired = anyDesired || cachedDesired;
+        if (workCount > 0 || g_nativeHighlightModeActive.load(std::memory_order_acquire) != modeDesired)
+        {
+            if (ResolveNativeHighlightOnMainTick())
+            {
+                // RedHotTools enables braindance mode before placing the first render event. Clear events are sent
+                // before returning to mode 0 so the engine sees a consistent transition.
+                bool modeReady = true;
+                if (modeDesired && !g_nativeHighlightModeActive.load(std::memory_order_acquire))
+                    modeReady = SetBraindanceModeOnMainTick(true);
+
+                // If the mode transition failed, do not enqueue events into a half-initialized render path. The
+                // transition remains pending and will be retried on a later main tick.
+                if (modeReady)
+                {
+                    for (std::size_t i = 0; i < workCount; ++i)
+                        PublishHighlightResult(workItems[i], QueueHighlightEvent(workItems[i]));
+
+                    // A clear is complete only after every known-enabled entry has published a successful clear.
+                    // If any QueueEvent failed (including a cap guard), retain mode=1 and retry on a later tick.
+                    if (!anyDesired && !HasDesiredHighlightState())
+                        SetBraindanceModeOnMainTick(false);
+                }
+            }
+        }
+
+        if (g_cleanupRequested.load(std::memory_order_acquire))
+        {
+            const bool clearComplete = !HasDesiredHighlightState() &&
+                                       !g_nativeHighlightModeActive.load(std::memory_order_acquire);
+            if (clearComplete)
+            {
+                if (g_cleanupClearQueued.exchange(true, std::memory_order_acq_rel))
+                    g_cleanupAcknowledged.store(true, std::memory_order_release);
+            }
+            else
+            {
+                g_cleanupClearQueued.store(false, std::memory_order_release);
+            }
+        }
+    }
+
+    bool ResolveHealthOnMainTick()
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (g_healthRuntime.attempted && g_healthRuntime.statPoolsSystem && g_healthRuntime.getValue &&
+            g_healthRuntime.getMaxValue && g_healthRuntime.reachedMin)
+            return true;
+        if (g_healthRuntime.attempted && now - g_healthRuntime.lastResolveAttempt < 1000)
+            return false;
+        g_healthRuntime.attempted = true;
+        g_healthRuntime.lastResolveAttempt = now;
+
+        __try
+        {
+            void* gameInstance = ResolveGameInstanceOnMainTick();
+            g_healthRuntime.statPoolsSystem = GetSystemOnMainTick(
+                gameInstance, Game::Rtti::Hash("gameStatPoolsSystem"));
+            if (!g_healthRuntime.statPoolsSystem)
+                g_healthRuntime.statPoolsSystem = GetSystemOnMainTick(
+                    gameInstance, Game::Rtti::Hash("gameIStatPoolsSystem"));
+            const Game::Rtti::Class* type = Game::Rtti::NativeType(g_healthRuntime.statPoolsSystem);
+            g_healthRuntime.getValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolValue"));
+            g_healthRuntime.getMaxValue = Game::Rtti::FindFunction(
+                type, Game::Rtti::Hash("GetStatPoolMaxPointValue"));
+            g_healthRuntime.reachedMin = Game::Rtti::FindFunction(
+                type, Game::Rtti::Hash("HasStatPoolValueReachedMin"));
+            if (Game::Rtti::ParameterCount(g_healthRuntime.getValue) != 3 ||
+                Game::Rtti::ParameterCount(g_healthRuntime.getMaxValue) != 2 ||
+                Game::Rtti::ParameterCount(g_healthRuntime.reachedMin) != 2)
+            {
+                g_healthRuntime.statPoolsSystem = nullptr;
+                g_healthRuntime.getValue = nullptr;
+                g_healthRuntime.getMaxValue = nullptr;
+                g_healthRuntime.reachedMin = nullptr;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_healthRuntime.statPoolsSystem = nullptr;
+            g_healthRuntime.getValue = nullptr;
+            g_healthRuntime.getMaxValue = nullptr;
+            g_healthRuntime.reachedMin = nullptr;
+        }
+
+        const bool resolved = g_healthRuntime.statPoolsSystem && g_healthRuntime.getValue &&
+                              g_healthRuntime.getMaxValue && g_healthRuntime.reachedMin;
+        Diagnostics::Log("health stat-pool resolver: system=%p value=%p max=%p reachedMin=%p resolved=%d",
+                         g_healthRuntime.statPoolsSystem, g_healthRuntime.getValue, g_healthRuntime.getMaxValue,
+                         g_healthRuntime.reachedMin, resolved ? 1 : 0);
+        return resolved;
+    }
+
+    struct HealthWork
+    {
+        EntityLayout* entity = nullptr;
+        std::uint64_t entityId = 0;
+    };
+
+    void PublishHealth(const HealthWork& work, bool valid, float current, float maximum, float ratio,
+                       bool reachedMin)
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (tracked.entity != work.entity || tracked.entityId != work.entityId)
+                continue;
+            tracked.healthValid = valid;
+            tracked.healthCurrent = valid ? current : 0.0f;
+            tracked.healthMax = valid ? maximum : 0.0f;
+            tracked.healthRatio = valid ? ratio : 0.0f;
+            tracked.healthReachedMin = valid && reachedMin;
+            if (valid)
+                tracked.isDead = reachedMin || current <= 0.001f;
+            break;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        if (valid)
+            g_healthValid.fetch_add(1, std::memory_order_relaxed);
+        else
+            g_healthInvalid.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void ProcessHealthOnMainTick()
+    {
+        constexpr std::size_t kHealthPerTick = 8;
+        std::array<HealthWork, kHealthPerTick> workItems{};
+        std::size_t workCount = 0;
+        const std::size_t start = static_cast<std::size_t>(g_healthRoundRobin % kMaxTrackedPuppets);
+        std::size_t scanned = 0;
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
+        {
+            const TrackedPuppet& tracked = g_puppetList[(start + scanned) % kMaxTrackedPuppets];
+            if (tracked.entity && tracked.entityId != 0)
+                workItems[workCount++] = {tracked.entity, tracked.entityId};
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+        g_healthRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
+        if (workCount == 0)
+            return;
+
+        const bool resolved = ResolveHealthOnMainTick();
+        for (std::size_t i = 0; i < workCount; ++i)
+        {
+            bool valid = false;
+            float current = 0.0f;
+            float maximum = 0.0f;
+            float ratio = 0.0f;
+            bool reachedMin = false;
+            if (resolved)
+            {
+                __try
+                {
+                    std::int32_t pool = 17; // gamedataStatPoolType::Health
+                    bool asPercentage = false;
+                    Game::Rtti::Argument valueArguments[] = {{&workItems[i].entityId}, {&pool}, {&asPercentage}};
+                    Game::Rtti::Argument maxArguments[] = {{&workItems[i].entityId}, {&pool}};
+                    valid = Game::Rtti::Invoke(g_healthRuntime.getValue, g_healthRuntime.statPoolsSystem,
+                                               valueArguments, 3, &current) &&
+                            Game::Rtti::Invoke(g_healthRuntime.getMaxValue, g_healthRuntime.statPoolsSystem,
+                                               maxArguments, 2, &maximum);
+                    bool reachedResult = false;
+                    if (valid)
+                    {
+                        valid = Game::Rtti::Invoke(g_healthRuntime.reachedMin, g_healthRuntime.statPoolsSystem,
+                                                   maxArguments, 2, &reachedResult);
+                        reachedMin = reachedResult;
+                    }
+                    valid = valid && std::isfinite(current) && std::isfinite(maximum) && maximum > 0.001f;
+                    if (valid)
+                    {
+                        ratio = std::clamp(current / maximum, 0.0f, 1.0f);
+                        valid = std::isfinite(ratio);
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER)
+                {
+                    valid = false;
+                }
+            }
+            PublishHealth(workItems[i], valid, current, maximum, ratio, reachedMin);
+        }
     }
 
     void HookRegisterEntity(void* registry, EntityLayout* entity)
@@ -752,6 +1230,7 @@ namespace
         Diagnostics::Log("RegisterEntity signature scan: matches=%zu address=%p", scan.matches, scan.address);
         return scan.matches == 1 ? scan.address : nullptr;
     }
+
 }
 
 namespace Game::EntityTracker
@@ -773,6 +1252,11 @@ namespace Game::EntityTracker
             return false;
         }
 
+        // The UnregisterEntity address hash is known, but its native ABI is not verified. Do not install a hook
+        // based on an inferred signature. Snapshot identity/transform validation remains the authoritative removal
+        // path; a temporarily unavailable transform stays pending and a stale/mismatched object is removed.
+        Diagnostics::Log("UnregisterEntity hook disabled: ABI is unverified; stale snapshot validation remains active");
+
         g_hookCreated.store(true, std::memory_order_release);
         Diagnostics::Log("entity tracker hook created: target=%p", target);
         return true;
@@ -780,11 +1264,14 @@ namespace Game::EntityTracker
 
     void Shutdown()
     {
-        if (g_nativeHighlightActive)
-            UpdateNativeHighlights(false, false, false, false, false, false);
         g_hookCreated.store(false, std::memory_order_release);
         g_registry.store(nullptr, std::memory_order_release);
         g_originalRegisterEntity = nullptr;
+        g_nativeHighlightModeActive.store(false, std::memory_order_release);
+        g_cleanupRequested.store(false, std::memory_order_release);
+        g_cleanupClearQueued.store(false, std::memory_order_release);
+        g_cleanupAcknowledged.store(false, std::memory_order_release);
+        g_cleanupGeneration.store(0, std::memory_order_release);
     }
 
     Stats GetStats()
@@ -798,6 +1285,13 @@ namespace Game::EntityTracker
         result.trackedCivilians = g_trackedCivilians.load(std::memory_order_acquire);
         result.trackedEnemies = g_trackedEnemies.load(std::memory_order_acquire);
         result.trackedPolice = g_trackedPolice.load(std::memory_order_acquire);
+        result.pendingPosition = g_pendingPosition.load(std::memory_order_relaxed);
+        result.staleRemoved = g_staleRemoved.load(std::memory_order_relaxed);
+        result.healthValid = g_healthValid.load(std::memory_order_relaxed);
+        result.healthInvalid = g_healthInvalid.load(std::memory_order_relaxed);
+        result.nativeHighlightQueued = g_nativeHighlightQueued.load(std::memory_order_relaxed);
+        result.nativeHighlightCleared = g_nativeHighlightCleared.load(std::memory_order_relaxed);
+        result.nativeHighlightFailures = g_nativeHighlightFailures.load(std::memory_order_relaxed);
 
         AcquireSRWLockShared(&g_lastEntityLock);
         result.lastEntityId = g_lastEntityId;
@@ -830,13 +1324,17 @@ namespace Game::EntityTracker
                 continue;
 
             PuppetSnapshot snapshot;
-            if (!TrySnapshot(tracked, snapshot))
+            const SnapshotResult result = TrySnapshot(tracked, snapshot);
+            if (result == SnapshotResult::Stale)
             {
                 tracked = {};
+                g_staleRemoved.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
             ++trackedCount;
+            if (result == SnapshotResult::PendingPosition)
+                continue;
             civilians += snapshot.category == NpcCategory::Civilian ? 1u : 0u;
             enemies += snapshot.category == NpcCategory::Enemy ? 1u : 0u;
             police += snapshot.category == NpcCategory::Police ? 1u : 0u;
@@ -851,90 +1349,73 @@ namespace Game::EntityTracker
         return count;
     }
 
+    void OnGameMainTick()
+    {
+        // Both operations below are intentionally called only from visibility's single game-main-tick detour.
+        // Present publishes requests but never enters these RTTI/engine paths.
+        ProcessHealthOnMainTick();
+        ProcessNativeHighlightsOnMainTick();
+    }
+
+    bool PrepareForShutdown(std::uint32_t timeoutMilliseconds)
+    {
+        g_nativeHighlightRequest.store(0, std::memory_order_release);
+        // A Present-side request may have been published before the first main tick, but that is not engine state yet.
+        // Only wait when a mode transition or an actual per-entity enable event has been acknowledged.
+        const bool wasActive = g_nativeHighlightModeActive.load(std::memory_order_acquire) ||
+                               HasDesiredHighlightState();
+        if (!wasActive)
+            return true;
+
+        g_cleanupRequested.store(true, std::memory_order_release);
+        g_cleanupClearQueued.store(false, std::memory_order_release);
+        g_cleanupAcknowledged.store(false, std::memory_order_release);
+        const std::uint64_t generation = g_nativeHighlightGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+        g_cleanupGeneration.store(generation, std::memory_order_release);
+
+        const ULONGLONG deadline = GetTickCount64() + timeoutMilliseconds;
+        while (!g_cleanupAcknowledged.load(std::memory_order_acquire))
+        {
+            if (GetTickCount64() >= deadline)
+            {
+                Diagnostics::Log("native highlight cleanup timed out: generation=%llu mode=%d",
+                                 static_cast<unsigned long long>(generation),
+                                 g_nativeHighlightModeActive.load(std::memory_order_acquire) ? 1 : 0);
+                return false;
+            }
+            Sleep(1);
+        }
+        Diagnostics::Log("native highlight cleanup acknowledged: generation=%llu queued=%llu cleared=%llu",
+                         static_cast<unsigned long long>(generation),
+                         static_cast<unsigned long long>(g_nativeHighlightQueued.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_nativeHighlightCleared.load(std::memory_order_relaxed)));
+        return true;
+    }
+
     void UpdateNativeHighlights(bool enabled, bool showCivilians, bool showEnemies, bool showPolice,
                                 bool showUnclassified, bool hideDead)
     {
-        // 2026-08-27 실측: 카테고리를 켜서 shouldHighlight가 처음 true가 되는 순간 게임이 크래시했다.
-        // 이 경로는 추정 오프셋(0x1E0/0x1E8)으로 얻은 render proxy를 Present(렌더) 스레드에서 직접
-        // 조작한다. off 파라미터로는 20초 넘게 무사했고 on 파라미터에서 죽었으며, per-entity SEH로도
-        // 잡히지 않았으므로 렌더 상태를 망가뜨리는 지연 크래시로 보인다.
-        //
-        // 올바른 방법은 RedHotTools가 엔티티에 대해 쓰는 방식 - `entRenderHighlightEvent`를 만들어
-        // 엔티티의 `QueueEvent`에 넣고 게임 스레드가 처리하게 하는 것 - 이다. 그 재구현 전까지는
-        // 이 경로를 실행하지 않는다.
-        static bool loggedDisabled = false;
-        if (!loggedDisabled)
+        std::uint32_t settings = 0;
+        settings |= enabled ? kHighlightEnabledBit : 0u;
+        settings |= showCivilians ? kHighlightCivilianBit : 0u;
+        settings |= showEnemies ? kHighlightEnemyBit : 0u;
+        settings |= showPolice ? kHighlightPoliceBit : 0u;
+        settings |= showUnclassified ? kHighlightOtherBit : 0u;
+        settings |= hideDead ? kHighlightHideDeadBit : 0u;
+
+        std::uint32_t previous = g_nativeHighlightRequest.load(std::memory_order_acquire);
+        while (previous != settings &&
+               !g_nativeHighlightRequest.compare_exchange_weak(previous, settings, std::memory_order_acq_rel,
+                                                               std::memory_order_acquire))
         {
-            Diagnostics::Log("native highlight disabled: render-proxy path crashed when first enabled; "
-                             "needs the entRenderHighlightEvent/QueueEvent rework");
-            loggedDisabled = true;
         }
-        (void)enabled;
-        (void)showCivilians;
-        (void)showEnemies;
-        (void)showPolice;
-        (void)showUnclassified;
-        (void)hideDead;
-        return;
-
-#if 0
-        if (!enabled && !g_nativeHighlightActive)
-            return;
-        if (!ResolveHighlightFunctions())
-            return;
-
-        const ULONGLONG now = GetTickCount64();
-        if (enabled == g_nativeHighlightActive && now - g_lastNativeHighlightTick < 250)
-            return;
-        g_lastNativeHighlightTick = now;
-
-        std::size_t touched = 0;
-        AcquireSRWLockShared(&g_puppetListLock);
-        for (const TrackedPuppet& tracked : g_puppetList)
+        if (previous != settings)
         {
-            if (!tracked.entity)
-                continue;
-            __try
-            {
-                EntityLayout* entity = tracked.entity;
-                if (!entity || entity->entityId != tracked.entityId ||
-                    ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
-                {
-                    continue;
-                }
-
-                const NpcCategory category = ClassifyNpc(entity);
-                bool categoryEnabled = false;
-                switch (category)
-                {
-                case NpcCategory::Civilian:
-                    categoryEnabled = showCivilians;
-                    break;
-                case NpcCategory::Enemy:
-                    categoryEnabled = showEnemies;
-                    break;
-                case NpcCategory::Police:
-                    categoryEnabled = showPolice;
-                    break;
-                default:
-                    categoryEnabled = showUnclassified;
-                    break;
-                }
-                const bool shouldHighlight = enabled && categoryEnabled && !(hideDead && IsDead(entity));
-                SetEntityNativeHighlight(entity, shouldHighlight);
-                ++touched;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
+            g_nativeHighlightGeneration.fetch_add(1, std::memory_order_acq_rel);
+            Diagnostics::Log("native highlight desired settings published: enabled=%d civilians=%d enemies=%d "
+                             "police=%d other=%d hideDead=%d",
+                             enabled ? 1 : 0, showCivilians ? 1 : 0, showEnemies ? 1 : 0,
+                             showPolice ? 1 : 0, showUnclassified ? 1 : 0, hideDead ? 1 : 0);
         }
-        ReleaseSRWLockShared(&g_puppetListLock);
-
-        if (enabled != g_nativeHighlightActive)
-        {
-            Diagnostics::Log("native highlight %s: entities=%zu", enabled ? "enabled" : "disabled", touched);
-            g_nativeHighlightActive = enabled;
-        }
-#endif
     }
 }
