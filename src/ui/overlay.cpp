@@ -24,6 +24,7 @@ namespace
         ComPtr<ID3D12CommandAllocator> commandAllocator;
         ComPtr<ID3D12Resource> backBuffer;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle{};
+        UINT64 fenceValue = 0;  // 이 얼로케이터를 쓴 마지막 커맨드리스트가 GPU에서 끝났음을 보장하는 값
     };
 
     // 최신 ImGui DX12 백엔드(1.92+)는 SRV 디스크립터를 필요할 때마다(폰트 외 텍스처가 생길 때) 동적으로
@@ -44,6 +45,21 @@ namespace
     UINT g_rtvDescriptorSize = 0;
     UINT g_srvDescriptorSize = 0;
     bool g_srvSlotUsed[kSrvHeapCapacity] = {};
+
+    // 프레임 동기화용 펜스. D3D12는 커맨드 얼로케이터를 "GPU가 그걸로 만든 커맨드리스트 실행을 다 끝낸
+    // 뒤"에만 Reset해도 된다 — 이걸 안 지키면 정의되지 않은 동작이고, 실제로 드라이버 TDR/행을 유발할 수
+    // 있다(첫 인젝션 테스트에서 겪은 크래시의 유력한 원인 — 원래 코드엔 이 동기화가 아예 없었음).
+    ComPtr<ID3D12Fence> g_fence;
+    UINT64 g_fenceLastSignaled = 0;
+    HANDLE g_fenceEvent = nullptr;
+
+    void WaitForFrame(FrameContext& frame)
+    {
+        if (frame.fenceValue == 0 || g_fence->GetCompletedValue() >= frame.fenceValue)
+            return;
+        g_fence->SetEventOnCompletion(frame.fenceValue, g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, INFINITE);
+    }
 
     void SrvDescriptorAlloc(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
                              D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
@@ -72,14 +88,35 @@ namespace
             g_srvSlotUsed[index] = false;
     }
 
+    // 메뉴가 떠 있는 동안 게임으로 넘기면 안 되는 입력 메시지들 — 안 막으면 메뉴를 클릭/타이핑하는 동안
+    // 카메라가 같이 돌아가거나 총이 나가는 등 게임이 입력을 동시에 받는다. WM_INPUT은 FPS류 게임이 raw
+    // mouse look에 흔히 쓰는 메시지라 이것도 같이 막아야 마우스가 실제로 메뉴 조작에만 쓰인다.
+    bool IsInputMessage(UINT msg)
+    {
+        return (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) || (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
+               msg == WM_INPUT || msg == WM_CHAR || msg == WM_SETCURSOR;
+    }
+
     LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         if (msg == WM_KEYDOWN && wParam == VK_INSERT)
+        {
             g_visible = !g_visible;
+            ImGui::GetIO().MouseDrawCursor = g_visible;
+            // 게임이 매 프레임 마우스를 창 중앙에 클립/고정해서 커서가 안 보이는 경우가 많다 (raw input
+            // 카메라 조작) — 메뉴를 열 때 클립을 풀어서 커서가 창 안에서 자유롭게 움직이게 한다.
+            if (g_visible)
+                ClipCursor(nullptr);
+        }
 
         // 메뉴가 떠 있을 때만 ImGui가 입력을 가로챈다 — 숨겨져 있으면 게임이 입력을 그대로 받는다.
+        // Insert는 게임이 원래 안 쓰는 키라 별도 예외 없이 그냥 메뉴가 열린 동안엔 모든 입력을 막는다.
         if (g_visible)
+        {
             ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+            if (IsInputMessage(msg))
+                return true;
+        }
 
         return CallWindowProcW(g_originalWndProc, hwnd, msg, wParam, lParam);
     }
@@ -141,11 +178,19 @@ namespace
             return false;
         g_commandList->Close();
 
+        if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
+            return false;
+        g_fenceLastSignaled = 0;
+        g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_fenceEvent)
+            return false;
+
         CreateRenderTargets(swapChain);
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::GetIO().MouseDrawCursor = g_visible;  // 게임이 OS 커서를 숨기는 경우가 많아 ImGui가 직접 그림
         Widgets::ApplyStyle();
 
         if (!ImGui_ImplWin32_Init(g_hwnd))
@@ -199,6 +244,10 @@ namespace Overlay
         const UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
         FrameContext& frame = g_frameContexts[backBufferIndex];
 
+        // 이 얼로케이터를 마지막으로 썼던 커맨드리스트가 GPU에서 완전히 끝났는지 확인하고 나서 Reset한다
+        // (동기화 없이 Reset하는 건 D3D12 스펙 위반 — 드라이버 타임아웃/hang의 원인이 될 수 있다).
+        WaitForFrame(frame);
+
         frame.commandAllocator->Reset();
         g_commandList->Reset(frame.commandAllocator.Get(), nullptr);
 
@@ -224,6 +273,11 @@ namespace Overlay
         // 주의: commandQueue의 vtable도 훅되어 있으므로 이 호출은 hkExecuteCommandLists를 한 번 더
         // 거쳐간다 (g_commandQueue가 이미 캡처돼 있어 별다른 부작용 없이 원본으로 패스스루된다).
         commandQueue->ExecuteCommandLists(1, lists);
+
+        // 이 프레임에서 이 얼로케이터를 다시 Reset해도 되는 시점을 펜스 값으로 남겨둔다.
+        ++g_fenceLastSignaled;
+        commandQueue->Signal(g_fence.Get(), g_fenceLastSignaled);
+        frame.fenceValue = g_fenceLastSignaled;
     }
 
     void OnResizeBuffers()
@@ -243,6 +297,22 @@ namespace Overlay
 
         if (g_hwnd && g_originalWndProc)
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
+
+        // 리소스를 놓기 전에 GPU가 지금까지 제출된 작업을 다 끝냈는지 기다린다 (아직 실행 중인 커맨드
+        // 리스트가 참조하는 RTV/커맨드 얼로케이터 등을 destructor가 먼저 해제해버리는 걸 막기 위함).
+        if (g_fence && g_fenceEvent && g_fenceLastSignaled > 0 &&
+            g_fence->GetCompletedValue() < g_fenceLastSignaled)
+        {
+            g_fence->SetEventOnCompletion(g_fenceLastSignaled, g_fenceEvent);
+            WaitForSingleObject(g_fenceEvent, INFINITE);
+        }
+        if (g_fenceEvent)
+        {
+            CloseHandle(g_fenceEvent);
+            g_fenceEvent = nullptr;
+        }
+        g_fence.Reset();
+        g_fenceLastSignaled = 0;
 
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();

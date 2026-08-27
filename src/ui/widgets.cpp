@@ -1,4 +1,5 @@
 #include "widgets.h"
+#include "../framework.h"  // GetFileAttributesW/INVALID_FILE_ATTRIBUTES
 
 #include <imgui.h>
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
@@ -7,6 +8,21 @@ namespace Widgets
 {
     void ApplyStyle()
     {
+        // 기본 ImGui 폰트엔 한글 글리프가 없어서 한글 텍스트가 "??"로 깨진다 (실사용 확인됨). Windows에
+        // 기본 내장된 맑은 고딕을 얹는다 — 파일이 없는 환경이면 조용히 기본 폰트로만 폴백한다. 이
+        // ImGui 버전(1.92+)은 DX12 백엔드가 ImGuiBackendFlags_RendererHasTextures를 지원해서 글리프를
+        // 필요할 때마다 동적으로 래스터화하므로, 예전처럼 GetGlyphRangesKorean()으로 범위를 미리 지정할
+        // 필요가 없다(그 함수 자체가 IMGUI_DISABLE_OBSOLETE_FUNCTIONS 하에서 더 이상 안 보이기도 함).
+        // 진짜 커스텀 폰트(Inter/Pretendard 등)로 바꾸는 건 아래 TODO 그대로 남겨둠.
+        ImGuiIO& io = ImGui::GetIO();
+        if (GetFileAttributesW(L"C:\\Windows\\Fonts\\malgun.ttf") != INVALID_FILE_ATTRIBUTES)
+        {
+            ImFontConfig config;
+            config.OversampleH = 2;
+            config.OversampleV = 2;
+            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\malgun.ttf", 17.0f, &config);
+        }
+
         ImGuiStyle& style = ImGui::GetStyle();
         style.WindowRounding = 10.0f;
         style.FrameRounding = 6.0f;
@@ -24,8 +40,8 @@ namespace Widgets
         colors[ImGuiCol_Text] = ImVec4(0.92f, 0.92f, 0.94f, 1.00f);
         colors[ImGuiCol_TextDisabled] = ImVec4(0.55f, 0.55f, 0.58f, 1.00f);
 
-        // TODO: 기본 Proggy 폰트 대신 Inter/Pretendard 등 TTF를 io.Fonts->AddFontFromFileTTF(...)로 로드.
-        // ImGui_ImplWin32_Init/ImGui_ImplDX12_Init 이전, 폰트 아틀라스가 아직 안 구워졌을 때 호출해야 함.
+        // TODO: 지금은 한글 깨짐만 막으려고 맑은 고딕(위)을 얹은 상태 — 디자인용 커스텀 폰트
+        // (Inter/Pretendard 등)로 바꾸는 건 아직. 바꿀 땐 위 AddFontFromFileTTF를 그 폰트로 교체.
         // ImGui가 "투박해" 보이는 원인의 8할이 폰트다 (AGENTS.md 기술 스택 절 참고).
     }
 
