@@ -648,7 +648,7 @@
   못 한다. 실측 데이터를 먼저 확보한다.
 - **시스템 DRED를 Cyberpunk2077.exe 범위로 강제 활성화.** `d3dconfig.exe`가 이미
   `C:\Windows\System32`에 있고 관리자 권한 없이 설정이 적용됐다.
-  - `d3dconfig apps --add "G:\SteamLibrary\steamapps\common\Cyberpunk 2077ind\Cyberpunk2077.exe"`
+  - `d3dconfig apps --add "G:\SteamLibrary\steamapps\common\Cyberpunk 2077\bin\x64\Cyberpunk2077.exe"`
     로 적용 범위를 게임 하나로 한정했다 (다른 D3D12 앱에 breadcrumb 오버헤드를 주지 않기 위해).
   - `d3dconfig dred --force-on-all` → `auto-breadcrumbs`, `breadcrumb-contexts`, `page-faults`,
     `watson-dumps`가 모두 `force-on`. **설정은 디바이스 생성 시점에 읽히므로 게임을 재시작해야 적용된다.**
