@@ -113,6 +113,13 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
   read/write/scan/aobscan CLI (Cheat Engine 미설치 상태에서도 사용 가능). `python
   tools/scripts/memtool.py --help` 또는 파일 상단 docstring 참고. 새 출력 메시지를 추가할 때는 콘솔
   코드페이지(cp949 등) 문제 때문에 **영어로 쓸 것**.
+- **`tools/scripts/inject.py`**: `LoadLibraryW` + `CreateRemoteThread` 방식 DLL 인젝터. `python
+  tools/scripts/inject.py --name Cyberpunk2077.exe --dll build/bin/Release/cp2077_trainer.dll`. 트레이너
+  DLL을 다시 빌드할 때마다 이걸로 테스트 인젝션할 것.
+  - ctypes 함정 주의: `VirtualAllocEx`처럼 **포인터/HANDLE을 반환하는 WinAPI 함수는 반드시
+    `.restype`을 명시할 것** — 안 하면 ctypes가 기본으로 32비트 `c_int`를 가정해서 x64 주소의 상위
+    비트가 잘려나간다 (`WriteProcessMemory`가 `ERROR_NOACCESS(998)`로 실패하는 형태로 나타났음).
+    `inject.py`/`memtool.py` 상단의 restype 선언부를 새 WinAPI 호출 추가할 때 참고할 것.
 - **`tools/cheat-engine-mcp-server/`**: git submodule (`bethington/cheat-engine-server-python`,
   read-only 모드로 `.mcp.json`에 `cheat-engine` 서버로 등록됨). 실행하려면
   `tools/cheat-engine-mcp-server/.venv`가 필요하고, 설치 시 **반드시 `pip install "mcp<2"`로 버전을
