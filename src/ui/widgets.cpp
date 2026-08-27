@@ -190,8 +190,8 @@ namespace Widgets
 
         ImGui::Separator();
         ImGui::TextWrapped(
-            "FOV circle rendering is active. Entity registration is captured from REDengine; "
-            "projection, target filtering, boxes, bones and health are the next integration stage.");
+            "ESP currently projects the latest registered NPC position as a green diagnostic marker. "
+            "Persistent target filtering, boxes, bones and health are the next integration stage.");
 
         ImGui::End();
     }

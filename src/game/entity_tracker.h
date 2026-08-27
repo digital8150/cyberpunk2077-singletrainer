@@ -12,6 +12,9 @@ namespace Game::EntityTracker
         std::uint64_t puppets = 0;
         std::uint64_t lastEntityId = 0;
         float lastPosition[3]{};
+        bool hasLastPuppet = false;
+        std::uint64_t lastPuppetId = 0;
+        float lastPuppetPosition[3]{};
     };
 
     // MinHook 초기화 후, MH_EnableHook(MH_ALL_HOOKS) 전에 호출한다.

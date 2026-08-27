@@ -1,5 +1,6 @@
 #include "features.h"
 #include "aimbot.h"
+#include "esp.h"
 
 namespace
 {
@@ -15,6 +16,7 @@ namespace Features
 
     void DrawOverlay()
     {
+        Esp::DrawOverlay(g_settings.esp);
         Aimbot::DrawOverlay(g_settings.aimbot);
     }
 }

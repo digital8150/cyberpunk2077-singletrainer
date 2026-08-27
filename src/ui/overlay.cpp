@@ -45,6 +45,7 @@ namespace
     bool g_win32BackendInitialized = false;
     bool g_dx12BackendInitialized = false;
     bool g_loggedFirstRenderedFrame = false;
+    bool g_loggedDeferredFrame = false;
 
     ComPtr<ID3D12Device> g_device;
     ComPtr<ID3D12DescriptorHeap> g_rtvHeap;
@@ -72,38 +73,35 @@ namespace
             ImGui::GetIO().MouseDrawCursor = false;
     }
 
-    // 반환값 false면 오버레이 렌더를 비활성화해야 한다는 뜻. Present 안에서 긴 대기를 반복하면 게임이
-    // 사실상 멈추므로 한 번만 짧게 기다린 뒤 fail-closed한다.
-    bool WaitForFrame(FrameContext& frame)
+    enum class FrameFenceStatus
+    {
+        Ready,
+        Deferred,
+        Failed,
+    };
+
+    // The game is allowed to have more CPU frames in flight than our swap-chain buffer count. Never reset an
+    // allocator that the GPU still owns, but do not stall Present either: skip only this overlay frame and retry.
+    FrameFenceStatus GetFrameFenceStatus(FrameContext& frame)
     {
         const UINT64 completed = g_fence->GetCompletedValue();
         if (completed == UINT64_MAX)
         {
             Diagnostics::Log("overlay fence reports device removal");
             Diagnostics::LogDeviceRemovedData(g_device.Get(), "fence GetCompletedValue");
-            return false;
+            return FrameFenceStatus::Failed;
         }
         if (frame.fenceValue == 0 || completed >= frame.fenceValue)
-            return true;
+            return FrameFenceStatus::Ready;
 
-        const HRESULT hr = g_fence->SetEventOnCompletion(frame.fenceValue, g_fenceEvent);
-        if (FAILED(hr))
+        if (!g_loggedDeferredFrame)
         {
-            Diagnostics::LogHr("ID3D12Fence::SetEventOnCompletion", hr);
-            Diagnostics::LogDeviceRemovedData(g_device.Get(), "SetEventOnCompletion");
-            return false;
-        }
-
-        const DWORD waitResult = WaitForSingleObject(g_fenceEvent, 100);
-        if (waitResult != WAIT_OBJECT_0)
-        {
-            Diagnostics::Log("overlay fence wait failed/timed out: result=0x%08lX wanted=%llu completed=%llu",
-                             waitResult, static_cast<unsigned long long>(frame.fenceValue),
+            Diagnostics::Log("overlay frame deferred without allocator reset: wanted=%llu completed=%llu",
+                             static_cast<unsigned long long>(frame.fenceValue),
                              static_cast<unsigned long long>(g_fence->GetCompletedValue()));
-            Diagnostics::LogDeviceRemovedData(g_device.Get(), "fence wait");
-            return false;
+            g_loggedDeferredFrame = true;
         }
-        return true;
+        return FrameFenceStatus::Deferred;
     }
 
     void SrvDescriptorAlloc(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
@@ -259,6 +257,7 @@ namespace
         g_swapChain = nullptr;
         g_initialized = false;
         g_loggedFirstRenderedFrame = false;
+        g_loggedDeferredFrame = false;
         for (bool& used : g_srvSlotUsed)
             used = false;
     }
@@ -473,9 +472,12 @@ namespace Overlay
 
         // 이 얼로케이터를 마지막으로 썼던 커맨드리스트가 GPU에서 완전히 끝났는지 확인하고 나서 Reset한다
         // (동기화 없이 Reset하는 건 D3D12 스펙 위반 — 드라이버 타임아웃/hang의 원인이 될 수 있다).
-        if (!WaitForFrame(frame))
+        const FrameFenceStatus fenceStatus = GetFrameFenceStatus(frame);
+        if (fenceStatus == FrameFenceStatus::Deferred)
+            return;
+        if (fenceStatus == FrameFenceStatus::Failed)
         {
-            Diagnostics::Log("overlay rendering disabled after fence synchronization failure");
+            Diagnostics::Log("overlay rendering disabled after fence/device failure");
             DisableOverlayRendering();
             return;
         }

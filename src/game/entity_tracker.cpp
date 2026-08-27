@@ -85,6 +85,9 @@ namespace
     SRWLOCK g_lastEntityLock = SRWLOCK_INIT;
     std::uint64_t g_lastEntityId = 0;
     float g_lastPosition[3]{};
+    bool g_hasLastPuppet = false;
+    std::uint64_t g_lastPuppetId = 0;
+    float g_lastPuppetPosition[3]{};
 
     bool IsPuppetClass(const ClassLayout* type)
     {
@@ -138,6 +141,14 @@ namespace
         g_lastPosition[0] = position[0];
         g_lastPosition[1] = position[1];
         g_lastPosition[2] = position[2];
+        if (puppet && hasPosition)
+        {
+            g_hasLastPuppet = true;
+            g_lastPuppetId = entity->entityId;
+            g_lastPuppetPosition[0] = position[0];
+            g_lastPuppetPosition[1] = position[1];
+            g_lastPuppetPosition[2] = position[2];
+        }
         ReleaseSRWLockExclusive(&g_lastEntityLock);
 
         if (total <= 5 || (total & (total - 1)) == 0)
@@ -225,6 +236,11 @@ namespace Game::EntityTracker
         result.lastPosition[0] = g_lastPosition[0];
         result.lastPosition[1] = g_lastPosition[1];
         result.lastPosition[2] = g_lastPosition[2];
+        result.hasLastPuppet = g_hasLastPuppet;
+        result.lastPuppetId = g_lastPuppetId;
+        result.lastPuppetPosition[0] = g_lastPuppetPosition[0];
+        result.lastPuppetPosition[1] = g_lastPuppetPosition[1];
+        result.lastPuppetPosition[2] = g_lastPuppetPosition[2];
         ReleaseSRWLockShared(&g_lastEntityLock);
         return result;
     }
