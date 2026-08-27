@@ -131,6 +131,7 @@ namespace Game::Projection
             return false;
 
         result.behind = projected.w <= 0.0f;
+        result.depth = projected.w;
         if (!result.behind)
         {
             const float normalizedX = projected.x / projected.w;

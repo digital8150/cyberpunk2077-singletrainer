@@ -6,6 +6,7 @@ namespace Game::Projection
     {
         float x = 0.0f;
         float y = 0.0f;
+        float depth = 0.0f;
         bool visible = false;
         bool behind = true;
     };

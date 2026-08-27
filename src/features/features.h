@@ -8,6 +8,11 @@ namespace Features
         bool boundingBoxes = true;
         bool skeleton = false;
         bool healthBars = true;
+        bool showCivilians = true;
+        bool showEnemies = true;
+        bool showPolice = true;
+        bool showUnclassified = true;
+        float maxDistanceMeters = 100.0f;
     };
 
     struct AimbotSettings

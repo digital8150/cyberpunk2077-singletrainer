@@ -10,11 +10,13 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 
 namespace
 {
     // RED4ext/CET 공식 주소 해시: world::RuntimeEntityRegistry::RegisterEntity.
     constexpr std::uint32_t kRegisterEntityAddressHash = 2840271332u;
+    constexpr std::uint32_t kCClassGetPropertyAddressHash = 0x8F031512u;
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
@@ -47,6 +49,55 @@ namespace
     static_assert(offsetof(ClassLayout, parent) == 0x10);
     static_assert(offsetof(ClassLayout, nameHash) == 0x18);
 
+    struct DynArrayLayout
+    {
+        void** entries;
+        std::uint32_t capacity;
+        std::uint32_t size;
+    };
+    static_assert(sizeof(DynArrayLayout) == 0x10);
+
+    struct PropertyLayout
+    {
+        void* type;
+        std::uint64_t nameHash;
+        std::uint64_t groupHash;
+        ClassLayout* parent;
+        std::uint32_t valueOffset;
+        std::uint32_t pad24;
+        std::uint64_t flags;
+    };
+    static_assert(offsetof(PropertyLayout, valueOffset) == 0x20);
+    static_assert(offsetof(PropertyLayout, flags) == 0x28);
+
+    struct BoolPropertyLocation
+    {
+        std::uint32_t offset = 0;
+        bool inValueHolder = false;
+        bool found = false;
+    };
+
+    struct ClassificationLayout
+    {
+        BoolPropertyLocation civilian;
+        BoolPropertyLocation police;
+        BoolPropertyLocation ganger;
+        bool logged = false;
+    };
+
+    struct FunctionLayout
+    {
+        void* vtable;
+        std::uint64_t fullNameHash;
+        std::uint64_t shortNameHash;
+        std::byte pad18[0x80 - 0x18];
+        const std::uint8_t* bytecode;
+        std::uint32_t bytecodeSize;
+    };
+    static_assert(offsetof(FunctionLayout, shortNameHash) == 0x10);
+    static_assert(offsetof(FunctionLayout, bytecode) == 0x80);
+    static_assert(offsetof(FunctionLayout, bytecodeSize) == 0x88);
+
     struct WorldTransformLayout
     {
         std::int32_t x;
@@ -68,12 +119,14 @@ namespace
     {
         std::byte pad00[0x30];
         ClassLayout* nativeType;
-        std::byte pad38[0x48 - 0x38];
+        void* valueHolder;
+        std::byte pad40[0x48 - 0x40];
         std::uint64_t entityId;
         std::byte pad50[0xB0 - 0x50];
         PlacedComponentLayout* transformComponent;
     };
     static_assert(offsetof(EntityLayout, nativeType) == 0x30);
+    static_assert(offsetof(EntityLayout, valueHolder) == 0x38);
     static_assert(offsetof(EntityLayout, entityId) == 0x48);
     static_assert(offsetof(EntityLayout, transformComponent) == 0xB0);
 
@@ -97,10 +150,14 @@ namespace
     RegisterEntityFn g_originalRegisterEntity = nullptr;
 
     std::atomic_bool g_hookCreated{false};
+    std::atomic<void*> g_registry{nullptr};
     std::atomic_uint64_t g_registered{0};
     std::atomic_uint64_t g_positioned{0};
     std::atomic_uint64_t g_puppets{0};
     std::atomic_uint64_t g_trackedPuppets{0};
+    std::atomic_uint64_t g_trackedCivilians{0};
+    std::atomic_uint64_t g_trackedEnemies{0};
+    std::atomic_uint64_t g_trackedPolice{0};
     SRWLOCK g_lastEntityLock = SRWLOCK_INIT;
     std::uint64_t g_lastEntityId = 0;
     float g_lastPosition[3]{};
@@ -110,6 +167,166 @@ namespace
     SRWLOCK g_puppetListLock = SRWLOCK_INIT;
     std::array<TrackedPuppet, kMaxTrackedPuppets> g_puppetList{};
     std::uint64_t g_puppetSequence = 0;
+    ClassificationLayout g_classificationLayout;
+    using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
+    GetPropertyFn g_getProperty = nullptr;
+    bool g_getPropertyAttempted = false;
+
+    GetPropertyFn ResolveGetProperty()
+    {
+        if (g_getPropertyAttempted)
+            return g_getProperty;
+        g_getPropertyAttempted = true;
+
+        using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        if (resolve)
+            g_getProperty = reinterpret_cast<GetPropertyFn>(resolve(kCClassGetPropertyAddressHash));
+        Diagnostics::Log("CClass::GetProperty resolver: address=%p", reinterpret_cast<void*>(g_getProperty));
+        return g_getProperty;
+    }
+
+    bool FindBoolProperty(const ClassLayout* type, std::uint64_t propertyName, BoolPropertyLocation& result)
+    {
+        constexpr std::uint64_t kInValueHolderFlag = 1ull << 21;
+        if (GetPropertyFn getProperty = ResolveGetProperty())
+        {
+            const PropertyLayout* property = getProperty(const_cast<ClassLayout*>(type), propertyName);
+            if (property)
+            {
+                result.offset = property->valueOffset;
+                result.inValueHolder = (property->flags & kInValueHolderFlag) != 0;
+                result.found = true;
+                return true;
+            }
+        }
+
+        // Fallback for environments without RED4ext's address resolver. The engine helper above is preferred because
+        // it also handles overridden/script properties whose storage is not necessarily in the immediate class list.
+        for (unsigned depth = 0; type && depth < 24; ++depth, type = type->parent)
+        {
+            const auto* properties = reinterpret_cast<const DynArrayLayout*>(
+                reinterpret_cast<const std::byte*>(type) + 0x28);
+            if (!properties->entries || properties->size > properties->capacity || properties->size > 4096)
+                continue;
+
+            for (std::uint32_t i = 0; i < properties->size; ++i)
+            {
+                const auto* property = static_cast<const PropertyLayout*>(properties->entries[i]);
+                if (!property || property->nameHash != propertyName)
+                    continue;
+                result.offset = property->valueOffset;
+                result.inValueHolder = (property->flags & kInValueHolderFlag) != 0;
+                result.found = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const FunctionLayout* FindFunction(const ClassLayout* type, std::uint64_t functionName)
+    {
+        for (unsigned depth = 0; type && depth < 24; ++depth, type = type->parent)
+        {
+            const auto* functions = reinterpret_cast<const DynArrayLayout*>(
+                reinterpret_cast<const std::byte*>(type) + 0x48);
+            if (!functions->entries || functions->size > functions->capacity || functions->size > 8192)
+                continue;
+
+            for (std::uint32_t i = 0; i < functions->size; ++i)
+            {
+                const auto* function = static_cast<const FunctionLayout*>(functions->entries[i]);
+                if (function && function->shortNameHash == functionName)
+                    return function;
+            }
+        }
+        return nullptr;
+    }
+
+    bool FindBoolPropertyFromGetter(const ClassLayout* type, std::uint64_t propertyName,
+                                   const char* getterName, BoolPropertyLocation& result)
+    {
+        constexpr std::uint64_t kInValueHolderFlag = 1ull << 21;
+        const FunctionLayout* function = FindFunction(type, Fnv1a64(getterName));
+        if (!function || !function->bytecode || function->bytecodeSize < 10 || function->bytecodeSize > 4096)
+            return false;
+
+        // REDengine links a trivial scripted getter as: Return(0x27), ObjectField(0x1A), CProperty*.
+        // Using the linked property is safer than invoking the script VM from the render thread and also survives
+        // storage offsets moving between patches.
+        if (function->bytecode[0] != 0x27 || function->bytecode[1] != 0x1A)
+            return false;
+
+        const PropertyLayout* property = nullptr;
+        memcpy(&property, function->bytecode + 2, sizeof(property));
+        if (!property || property->nameHash != propertyName || property->valueOffset > 0x10000)
+            return false;
+
+        result.offset = property->valueOffset;
+        result.inValueHolder = (property->flags & kInValueHolderFlag) != 0;
+        result.found = true;
+        return true;
+    }
+
+    void ResolveClassificationLayout(const ClassLayout* type)
+    {
+        if (!g_classificationLayout.civilian.found)
+        {
+            constexpr std::uint64_t name = Fnv1a64("isCivilian");
+            if (!FindBoolProperty(type, name, g_classificationLayout.civilian))
+                FindBoolPropertyFromGetter(type, name, "IsCharacterCivilian", g_classificationLayout.civilian);
+        }
+        if (!g_classificationLayout.police.found)
+        {
+            constexpr std::uint64_t name = Fnv1a64("isPolice");
+            if (!FindBoolProperty(type, name, g_classificationLayout.police))
+                FindBoolPropertyFromGetter(type, name, "IsCharacterPolice", g_classificationLayout.police);
+        }
+        if (!g_classificationLayout.ganger.found)
+        {
+            constexpr std::uint64_t name = Fnv1a64("isGanger");
+            if (!FindBoolProperty(type, name, g_classificationLayout.ganger))
+                FindBoolPropertyFromGetter(type, name, "IsCharacterGanger", g_classificationLayout.ganger);
+        }
+
+        if (!g_classificationLayout.logged && g_classificationLayout.civilian.found &&
+            g_classificationLayout.police.found && g_classificationLayout.ganger.found)
+        {
+            Diagnostics::Log("NPC classification RTTI resolved: civilian=0x%X/%d police=0x%X/%d ganger=0x%X/%d",
+                             g_classificationLayout.civilian.offset,
+                             g_classificationLayout.civilian.inValueHolder ? 1 : 0,
+                             g_classificationLayout.police.offset,
+                             g_classificationLayout.police.inValueHolder ? 1 : 0,
+                             g_classificationLayout.ganger.offset,
+                             g_classificationLayout.ganger.inValueHolder ? 1 : 0);
+            g_classificationLayout.logged = true;
+        }
+    }
+
+    bool ReadBoolProperty(const EntityLayout* entity, const BoolPropertyLocation& property)
+    {
+        if (!property.found)
+            return false;
+        const std::byte* base = property.inValueHolder
+                                    ? static_cast<const std::byte*>(entity->valueHolder)
+                                    : reinterpret_cast<const std::byte*>(entity);
+        return base && *reinterpret_cast<const bool*>(base + property.offset);
+    }
+
+    Game::EntityTracker::NpcCategory ClassifyNpc(EntityLayout* entity)
+    {
+        ResolveClassificationLayout(entity->nativeType);
+        if (ReadBoolProperty(entity, g_classificationLayout.police))
+            return Game::EntityTracker::NpcCategory::Police;
+        if (ReadBoolProperty(entity, g_classificationLayout.civilian))
+            return Game::EntityTracker::NpcCategory::Civilian;
+        if (ReadBoolProperty(entity, g_classificationLayout.ganger))
+            return Game::EntityTracker::NpcCategory::Enemy;
+        return Game::EntityTracker::NpcCategory::Other;
+    }
 
     PuppetKind ClassifyPuppet(const ClassLayout* type)
     {
@@ -210,6 +427,7 @@ namespace
             snapshot.position[0] = position[0];
             snapshot.position[1] = position[1];
             snapshot.position[2] = position[2];
+            snapshot.category = ClassifyNpc(entity);
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -273,7 +491,15 @@ namespace
         HookLifecycle::CallbackGuard callback;
         g_originalRegisterEntity(registry, entity);
         if (!HookLifecycle::IsShuttingDown())
+        {
+            void* expected = nullptr;
+            if (g_registry.compare_exchange_strong(expected, registry, std::memory_order_release,
+                                                   std::memory_order_relaxed))
+            {
+                Diagnostics::Log("runtime entity registry captured: registry=%p", registry);
+            }
             CaptureEntity(entity);
+        }
     }
 
     std::uint8_t* ResolveRegisterEntity()
@@ -326,6 +552,7 @@ namespace Game::EntityTracker
     void Shutdown()
     {
         g_hookCreated.store(false, std::memory_order_release);
+        g_registry.store(nullptr, std::memory_order_release);
         g_originalRegisterEntity = nullptr;
     }
 
@@ -337,6 +564,9 @@ namespace Game::EntityTracker
         result.positioned = g_positioned.load(std::memory_order_relaxed);
         result.puppets = g_puppets.load(std::memory_order_relaxed);
         result.trackedPuppets = g_trackedPuppets.load(std::memory_order_acquire);
+        result.trackedCivilians = g_trackedCivilians.load(std::memory_order_acquire);
+        result.trackedEnemies = g_trackedEnemies.load(std::memory_order_acquire);
+        result.trackedPolice = g_trackedPolice.load(std::memory_order_acquire);
 
         AcquireSRWLockShared(&g_lastEntityLock);
         result.lastEntityId = g_lastEntityId;
@@ -359,6 +589,9 @@ namespace Game::EntityTracker
 
         std::size_t count = 0;
         std::uint64_t trackedCount = 0;
+        std::uint64_t civilians = 0;
+        std::uint64_t enemies = 0;
+        std::uint64_t police = 0;
         AcquireSRWLockExclusive(&g_puppetListLock);
         for (TrackedPuppet& tracked : g_puppetList)
         {
@@ -373,10 +606,16 @@ namespace Game::EntityTracker
             }
 
             ++trackedCount;
+            civilians += snapshot.category == NpcCategory::Civilian ? 1u : 0u;
+            enemies += snapshot.category == NpcCategory::Enemy ? 1u : 0u;
+            police += snapshot.category == NpcCategory::Police ? 1u : 0u;
             if (count < capacity)
                 output[count++] = snapshot;
         }
         g_trackedPuppets.store(trackedCount, std::memory_order_release);
+        g_trackedCivilians.store(civilians, std::memory_order_release);
+        g_trackedEnemies.store(enemies, std::memory_order_release);
+        g_trackedPolice.store(police, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
         return count;
     }

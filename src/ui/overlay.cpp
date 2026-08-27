@@ -17,23 +17,32 @@
 #include <backends/imgui_impl_win32.h>
 #include <backends/imgui_impl_dx12.h>
 
+#include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 namespace
 {
-    struct FrameContext
+    struct BackBufferContext
     {
-        ComPtr<ID3D12CommandAllocator> commandAllocator;
         ComPtr<ID3D12Resource> backBuffer;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle{};
+    };
+
+    struct AllocatorContext
+    {
+        ComPtr<ID3D12CommandAllocator> commandAllocator;
         UINT64 fenceValue = 0;  // 이 얼로케이터를 쓴 마지막 커맨드리스트가 GPU에서 끝났음을 보장하는 값
     };
 
     // 최신 ImGui DX12 백엔드(1.92+)는 SRV 디스크립터를 필요할 때마다(폰트 외 텍스처가 생길 때) 동적으로
     // 요청한다 — 그래서 힙을 넉넉히 잡고 간단한 슬롯 할당기(alloc/free 콜백)를 붙여줘야 한다.
     constexpr UINT kSrvHeapCapacity = 64;
+    constexpr UINT kMinimumAllocatorCount = 4;
+    constexpr UINT kMaximumAllocatorCount = 32;
 
     bool g_initialized = false;
     bool g_renderingDisabled = false;  // 치명적 초기화/동기화 오류 뒤 게임을 살리기 위한 fail-closed 상태
@@ -46,13 +55,15 @@ namespace
     bool g_win32BackendInitialized = false;
     bool g_dx12BackendInitialized = false;
     bool g_loggedFirstRenderedFrame = false;
-    bool g_loggedDeferredFrame = false;
+    bool g_loggedAllocatorExpansion = false;
 
     ComPtr<ID3D12Device> g_device;
+    ComPtr<ID3D12CommandQueue> g_commandQueue;
     ComPtr<ID3D12DescriptorHeap> g_rtvHeap;
     ComPtr<ID3D12DescriptorHeap> g_srvHeap;
     ComPtr<ID3D12GraphicsCommandList> g_commandList;
-    std::vector<FrameContext> g_frameContexts;
+    std::vector<BackBufferContext> g_backBuffers;
+    std::vector<AllocatorContext> g_allocatorPool;
     UINT g_bufferCount = 0;
     UINT g_rtvDescriptorSize = 0;
     UINT g_srvDescriptorSize = 0;
@@ -65,6 +76,12 @@ namespace
     ComPtr<ID3D12Fence> g_fence;
     UINT64 g_fenceLastSignaled = 0;
     HANDLE g_fenceEvent = nullptr;
+    std::mutex g_renderMutex;
+    std::atomic_uint64_t g_presentCount{0};
+    std::atomic_uint64_t g_submitCount{0};
+    std::atomic_uint64_t g_allocatorMissCount{0};
+    ULONGLONG g_lastTelemetryTick = 0;
+    UINT g_telemetryWindows = 0;
 
     void DisableOverlayRendering()
     {
@@ -74,35 +91,83 @@ namespace
             ImGui::GetIO().MouseDrawCursor = false;
     }
 
-    enum class FrameFenceStatus
+    enum class AllocatorStatus
     {
         Ready,
-        Deferred,
+        Exhausted,
         Failed,
     };
 
-    // The game is allowed to have more CPU frames in flight than our swap-chain buffer count. Never reset an
-    // allocator that the GPU still owns, but do not stall Present either: skip only this overlay frame and retry.
-    FrameFenceStatus GetFrameFenceStatus(FrameContext& frame)
+    // DLSS Frame Generation can issue asynchronous presents and keep more frames in flight than the swap-chain's
+    // back-buffer count. Allocators therefore live in a separate pool instead of being fixed one-per-back-buffer.
+    // A busy allocator is never reset; the pool grows on demand up to a conservative bound.
+    AllocatorStatus AcquireAllocator(AllocatorContext*& result)
     {
+        result = nullptr;
         const UINT64 completed = g_fence->GetCompletedValue();
         if (completed == UINT64_MAX)
         {
             Diagnostics::Log("overlay fence reports device removal");
             Diagnostics::LogDeviceRemovedData(g_device.Get(), "fence GetCompletedValue");
-            return FrameFenceStatus::Failed;
+            return AllocatorStatus::Failed;
         }
-        if (frame.fenceValue == 0 || completed >= frame.fenceValue)
-            return FrameFenceStatus::Ready;
 
-        if (!g_loggedDeferredFrame)
+        for (AllocatorContext& allocator : g_allocatorPool)
         {
-            Diagnostics::Log("overlay frame deferred without allocator reset: wanted=%llu completed=%llu",
-                             static_cast<unsigned long long>(frame.fenceValue),
-                             static_cast<unsigned long long>(g_fence->GetCompletedValue()));
-            g_loggedDeferredFrame = true;
+            if (allocator.fenceValue == 0 || completed >= allocator.fenceValue)
+            {
+                result = &allocator;
+                return AllocatorStatus::Ready;
+            }
         }
-        return FrameFenceStatus::Deferred;
+
+        if (g_allocatorPool.size() < kMaximumAllocatorCount)
+        {
+            AllocatorContext allocator;
+            const HRESULT hr = g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                 IID_PPV_ARGS(&allocator.commandAllocator));
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("CreateCommandAllocator(pool expansion)", hr);
+                return AllocatorStatus::Failed;
+            }
+            g_allocatorPool.emplace_back(std::move(allocator));
+            result = &g_allocatorPool.back();
+            if (!g_loggedAllocatorExpansion)
+            {
+                Diagnostics::Log("overlay allocator pool expanded beyond initial size: size=%zu",
+                                 g_allocatorPool.size());
+                g_loggedAllocatorExpansion = true;
+            }
+            return AllocatorStatus::Ready;
+        }
+
+        g_allocatorMissCount.fetch_add(1, std::memory_order_relaxed);
+        return AllocatorStatus::Exhausted;
+    }
+
+    void MaybeLogTelemetry()
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (g_lastTelemetryTick == 0)
+        {
+            g_lastTelemetryTick = now;
+            return;
+        }
+        if (now - g_lastTelemetryTick < 5000)
+            return;
+
+        const std::uint64_t presents = g_presentCount.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t submits = g_submitCount.exchange(0, std::memory_order_relaxed);
+        const std::uint64_t misses = g_allocatorMissCount.exchange(0, std::memory_order_relaxed);
+        ++g_telemetryWindows;
+        if (g_telemetryWindows <= 3 || misses > 0)
+        {
+            Diagnostics::Log("overlay cadence (5s): presents=%llu submitted=%llu allocatorMisses=%llu pool=%zu",
+                             static_cast<unsigned long long>(presents), static_cast<unsigned long long>(submits),
+                             static_cast<unsigned long long>(misses), g_allocatorPool.size());
+        }
+        g_lastTelemetryTick = now;
     }
 
     void SrvDescriptorAlloc(ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
@@ -187,8 +252,8 @@ namespace
             }
             g_device->CreateRenderTargetView(backBuffer.Get(), nullptr, rtvHandle);
 
-            g_frameContexts[i].backBuffer = backBuffer;
-            g_frameContexts[i].rtvHandle = rtvHandle;
+            g_backBuffers[i].backBuffer = backBuffer;
+            g_backBuffers[i].rtvHandle = rtvHandle;
             rtvHandle.ptr += g_rtvDescriptorSize;
         }
         return true;
@@ -244,8 +309,10 @@ namespace
             g_fenceEvent = nullptr;
         }
 
-        g_frameContexts.clear();
+        g_backBuffers.clear();
+        g_allocatorPool.clear();
         g_commandList.Reset();
+        g_commandQueue.Reset();
         g_fence.Reset();
         g_srvHeap.Reset();
         g_rtvHeap.Reset();
@@ -260,7 +327,12 @@ namespace
         g_swapChain = nullptr;
         g_initialized = false;
         g_loggedFirstRenderedFrame = false;
-        g_loggedDeferredFrame = false;
+        g_loggedAllocatorExpansion = false;
+        g_presentCount.store(0, std::memory_order_relaxed);
+        g_submitCount.store(0, std::memory_order_relaxed);
+        g_allocatorMissCount.store(0, std::memory_order_relaxed);
+        g_lastTelemetryTick = 0;
+        g_telemetryWindows = 0;
         for (bool& used : g_srvSlotUsed)
             used = false;
     }
@@ -339,11 +411,13 @@ namespace
         for (bool& used : g_srvSlotUsed)
             used = false;
 
-        g_frameContexts.resize(g_bufferCount);
-        for (auto& frame : g_frameContexts)
+        g_backBuffers.resize(g_bufferCount);
+        const UINT initialAllocatorCount = (std::max)(g_bufferCount, kMinimumAllocatorCount);
+        g_allocatorPool.resize(initialAllocatorCount);
+        for (auto& allocator : g_allocatorPool)
         {
             hr = g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                  IID_PPV_ARGS(&frame.commandAllocator));
+                                                  IID_PPV_ARGS(&allocator.commandAllocator));
             if (FAILED(hr))
             {
                 Diagnostics::LogHr("CreateCommandAllocator", hr);
@@ -352,7 +426,7 @@ namespace
         }
 
         hr = g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         g_frameContexts[0].commandAllocator.Get(), nullptr,
+                                         g_allocatorPool[0].commandAllocator.Get(), nullptr,
                                          IID_PPV_ARGS(&g_commandList));
         if (FAILED(hr))
         {
@@ -425,6 +499,7 @@ namespace
         CursorHook::SetMenuCapture(g_visible);
 
         g_swapChain = swapChain;
+        g_commandQueue = commandQueue;
         Diagnostics::Log("overlay initialization completed");
         return true;
     }
@@ -434,13 +509,18 @@ namespace Overlay
 {
     void OnPresent(IDXGISwapChain3* swapChain, ID3D12CommandQueue* commandQueue)
     {
+        std::lock_guard<std::mutex> renderGuard(g_renderMutex);
+
         // 렌더 큐를 아직 못 잡았으면(ExecuteCommandLists가 이번 세션에서 아직 한 번도 안 불렸으면) 초기화도
         // 포함해서 이번 프레임은 통째로 건너뛴다 — 새 ImGui DX12 백엔드는 Init 시점에 CommandQueue가 필요함.
-        if (!swapChain || !commandQueue || g_renderingDisabled)
+        if (!swapChain || (!commandQueue && !g_commandQueue) || g_renderingDisabled)
             return;
 
         if (g_initialized && swapChain != g_swapChain)
             return;
+
+        g_presentCount.fetch_add(1, std::memory_order_relaxed);
+        MaybeLogTelemetry();
 
         if (!g_initialized)
         {
@@ -464,29 +544,29 @@ namespace Overlay
 
         ImGui::Render();
 
+        ID3D12CommandQueue* renderQueue = g_commandQueue ? g_commandQueue.Get() : commandQueue;
         const UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
-        if (backBufferIndex >= g_frameContexts.size())
+        if (backBufferIndex >= g_backBuffers.size())
         {
             Diagnostics::Log("invalid back-buffer index: index=%u contexts=%zu", backBufferIndex,
-                             g_frameContexts.size());
+                             g_backBuffers.size());
             DisableOverlayRendering();
             return;
         }
-        FrameContext& frame = g_frameContexts[backBufferIndex];
+        BackBufferContext& backBuffer = g_backBuffers[backBufferIndex];
 
-        // 이 얼로케이터를 마지막으로 썼던 커맨드리스트가 GPU에서 완전히 끝났는지 확인하고 나서 Reset한다
-        // (동기화 없이 Reset하는 건 D3D12 스펙 위반 — 드라이버 타임아웃/hang의 원인이 될 수 있다).
-        const FrameFenceStatus fenceStatus = GetFrameFenceStatus(frame);
-        if (fenceStatus == FrameFenceStatus::Deferred)
+        AllocatorContext* allocator = nullptr;
+        const AllocatorStatus allocatorStatus = AcquireAllocator(allocator);
+        if (allocatorStatus == AllocatorStatus::Exhausted)
             return;
-        if (fenceStatus == FrameFenceStatus::Failed)
+        if (allocatorStatus == AllocatorStatus::Failed || !allocator)
         {
             Diagnostics::Log("overlay rendering disabled after fence/device failure");
             DisableOverlayRendering();
             return;
         }
 
-        HRESULT hr = frame.commandAllocator->Reset();
+        HRESULT hr = allocator->commandAllocator->Reset();
         if (FAILED(hr))
         {
             Diagnostics::LogHr("ID3D12CommandAllocator::Reset", hr);
@@ -494,7 +574,7 @@ namespace Overlay
             DisableOverlayRendering();
             return;
         }
-        hr = g_commandList->Reset(frame.commandAllocator.Get(), nullptr);
+        hr = g_commandList->Reset(allocator->commandAllocator.Get(), nullptr);
         if (FAILED(hr))
         {
             Diagnostics::LogHr("ID3D12GraphicsCommandList::Reset", hr);
@@ -505,13 +585,13 @@ namespace Overlay
 
         D3D12_RESOURCE_BARRIER barrier{};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = frame.backBuffer.Get();
+        barrier.Transition.pResource = backBuffer.backBuffer.Get();
         barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_commandList->ResourceBarrier(1, &barrier);
 
-        g_commandList->OMSetRenderTargets(1, &frame.rtvHandle, FALSE, nullptr);
+        g_commandList->OMSetRenderTargets(1, &backBuffer.rtvHandle, FALSE, nullptr);
         ID3D12DescriptorHeap* heaps[] = {g_srvHeap.Get()};
         g_commandList->SetDescriptorHeaps(1, heaps);
         ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_commandList.Get());
@@ -531,11 +611,11 @@ namespace Overlay
         ID3D12CommandList* lists[] = {g_commandList.Get()};
         // 주의: commandQueue의 vtable도 훅되어 있으므로 이 호출은 hkExecuteCommandLists를 한 번 더
         // 거쳐간다 (같은 Direct 큐가 스레드별 마지막 큐로 다시 기록될 뿐 원본으로 패스스루된다).
-        commandQueue->ExecuteCommandLists(1, lists);
+        renderQueue->ExecuteCommandLists(1, lists);
 
         // 이 프레임에서 이 얼로케이터를 다시 Reset해도 되는 시점을 펜스 값으로 남겨둔다.
         ++g_fenceLastSignaled;
-        hr = commandQueue->Signal(g_fence.Get(), g_fenceLastSignaled);
+        hr = renderQueue->Signal(g_fence.Get(), g_fenceLastSignaled);
         if (FAILED(hr))
         {
             Diagnostics::LogHr("ID3D12CommandQueue::Signal", hr);
@@ -543,7 +623,8 @@ namespace Overlay
             DisableOverlayRendering();
             return;
         }
-        frame.fenceValue = g_fenceLastSignaled;
+        allocator->fenceValue = g_fenceLastSignaled;
+        g_submitCount.fetch_add(1, std::memory_order_relaxed);
 
         if (!g_loggedFirstRenderedFrame)
         {
@@ -555,6 +636,7 @@ namespace Overlay
 
     void OnResizeBuffers(IDXGISwapChain3* swapChain)
     {
+        std::lock_guard<std::mutex> renderGuard(g_renderMutex);
         if (!g_initialized || swapChain != g_swapChain)
             return;
 

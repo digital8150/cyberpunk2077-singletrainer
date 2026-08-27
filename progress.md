@@ -178,3 +178,32 @@
     `complete=1`, 메뉴 capture on/off, 첫 오버레이 프레임, 정상 GPU 지연 시 프레임 skip, NPC 등록 및
     월드 투영이 모두 로그에 나타나고 게임이 계속 응답함을 확인. 실제 커서 조작성/FPS 배지/박스의 시각적
     최종 확인은 사용자 인게임 확인을 기다리는 중.
+- **고FPS/DLSS Frame Generation 환경의 오버레이 깜빡임 해결**:
+  - 사용자가 메뉴 커서, FPS 배지, NPC 박스 세 항목을 모두 인게임 통과로 확인한 뒤, 게임 포커스가 있고
+    약 150 FPS일 때 메뉴와 ESP가 함께 깜빡이며 포커스를 잃어 약 89 FPS가 되면 사라지는 현상을 보고함.
+    기존 구현은 swap-chain back buffer마다 command allocator 하나만 두고 해당 allocator의 fence가 아직
+    완료되지 않았으면 그 오버레이 프레임을 건너뛰었으므로, 높은 프레임률과 비동기 Present에서 실제 게임
+    프레임은 계속 나오지만 오버레이 제출만 교대로 누락되는 구조였음.
+  - back buffer와 allocator 수명을 분리하고 초기 4개, 필요 시 최대 32개까지 늘어나는 allocator pool에서
+    완료된 항목만 Reset하도록 변경. 처음 검증된 렌더 command queue를 보유해 비동기 Present에서도 같은
+    queue를 사용하고, Present/Resize를 직렬화했으며 5초 단위 cadence 계측을 추가함.
+  - PID 21768의 약 150 FPS 라이브 로그에서 `presents=742 submitted=742 allocatorMisses=0 pool=4` 등으로
+    모든 Present에 오버레이가 제출됐고, 사용자가 깜빡임이 해결됐다고 확인함.
+- **NPC 시민/적/경찰 분류 및 거리 필터 진단 구현**:
+  - 게임 2.31 REDmod 스크립트의 `ScriptedPuppet`에서 `IsCharacterCivilian`, `IsCharacterPolice`,
+    `IsCharacterGanger`가 각각 캐시된 private bool을 반환함을 확인. 런타임 CClass의 일반 property 조회에서
+    처음에는 `m_is*` 이름이 나오지 않았으나, 세 getter의 linked bytecode가 모두
+    `Return(0x27), ObjectField(0x1A), CProperty*` 형식임을 실메모리에서 확인함. 런타임 property 이름은
+    접두사 없는 `isCivilian/isPolice/isGanger`이며 value-holder 오프셋은 각각
+    `0x3E4/0x3E5/0x3E6`이었음.
+  - 고정 오프셋 대신 매 실행 RTTI 조회를 우선하고, 실패 시 getter bytecode의 CProperty를 해석하는 fallback을
+    구현. 시민은 초록색, 갱 계열 적은 빨간색, 경찰은 파란색, 아직 분류되지 않은 puppet은 회색으로 표시하고
+    각각 독립 토글 및 10~300m 거리 슬라이더를 추가함.
+  - 월드 투영의 양수 clip W(카메라 전방 깊이)를 현재 거리값으로 노출하고, 3초 단위 로그에 카테고리 수,
+    투영/전방/거리 초과/거리 통과/실제 draw 수와 전방 깊이 범위를 기록하도록 구현. PID 21768 라이브 값은
+    `categories[civilian=0 enemy=0 police=1 other=1]`, `depthRange=[33.74,78.93]`,
+    `maxDistance=100.0`, `distanceRejected=0`, `withinDistance=2`였으므로 당시 미표시 원인은 거리 필터가
+    아니라 잘못된 분류 이름이었음을 확인함. 재주입으로 설정이 기본값(ESP off, 100m)으로 초기화되는 점은
+    사용자에게 안내했으며, 최신 분류 색상의 시각적 확인은 다음 인게임 피드백에서 이어갈 것.
+  - `build-next` 및 정식 `build/bin/Release` 전체 Release 빌드를 통과했고, 최신 검증 DLL을 PID 21768에
+    안전 언로드/재주입한 상태에서 게임 응답, 약 125 FPS cadence, allocator miss 0을 확인함.

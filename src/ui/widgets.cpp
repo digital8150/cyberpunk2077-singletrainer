@@ -143,7 +143,7 @@ namespace Widgets
 
     void DrawMainMenu()
     {
-        ImGui::SetNextWindowSize(ImVec2(520.0f, 550.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 660.0f), ImGuiCond_FirstUseEver);
         ImGui::Begin("Cyberpunk 2077 Trainer");
 
         Features::Settings& settings = Features::GetSettings();
@@ -171,6 +171,20 @@ namespace Widgets
         ImGui::TextUnformatted("Health bars");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_health", &settings.esp.healthBars);
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Civilians");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_civilians", &settings.esp.showCivilians);
+        ImGui::TextUnformatted("Enemies");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_enemies", &settings.esp.showEnemies);
+        ImGui::TextUnformatted("Police");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_police", &settings.esp.showPolice);
+        ImGui::TextUnformatted("Unclassified");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_unclassified", &settings.esp.showUnclassified);
+        FilledSliderFloat("Max distance", &settings.esp.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
         ImGui::Unindent(14.0f);
 
         ImGui::TextDisabled("Entity feed: %s | registered %llu | positioned %llu | NPCs %llu | live %llu",
@@ -179,6 +193,10 @@ namespace Widgets
                             static_cast<unsigned long long>(entityStats.positioned),
                             static_cast<unsigned long long>(entityStats.puppets),
                             static_cast<unsigned long long>(entityStats.trackedPuppets));
+        ImGui::TextDisabled("Classified live: civilian %llu | enemy %llu | police %llu",
+                            static_cast<unsigned long long>(entityStats.trackedCivilians),
+                            static_cast<unsigned long long>(entityStats.trackedEnemies),
+                            static_cast<unsigned long long>(entityStats.trackedPolice));
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -196,8 +214,9 @@ namespace Widgets
 
         ImGui::Separator();
         ImGui::TextWrapped(
-            "ESP tracks registered NPC positions and draws projected prototype boxes. "
-            "Verified bone and health access are still pending; those toggles currently draw nothing.");
+            "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
+            "Distance currently uses camera-forward depth. Verified bone, health, dynamic hostility, and true AABB "
+            "access are still pending.");
 
         ImGui::End();
     }
