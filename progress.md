@@ -628,3 +628,37 @@
     전투 중 사람이 직접 확인해야 한다. 다음 전투에서 메뉴의 `Targets: candidates/eligible/no pool/over cap/
     occluded` 줄과 `silent aim armed:` 로그의 같은 카운터를 비교할 것.
 - Release 빌드는 `/W4`에서 경고 없이 통과, `git diff --check` 깨끗.
+
+## 2026-08-28 - 07:52 GPU 크래시: 근거 재검토와 DRED 실측 준비
+
+- **07:52:55.77 크래시는 GPU device removal이다.** RED4ext 로그에 게임 자체 핸들러
+  `gpuApiDX12Error.cpp:42`("Gpu Crash for unknown reasons... Check if Breadcrumbs or Aftermath logged
+  anything useful")가 남았고, 우리 쪽 CPU 예외 콜스택은 없다. 우리 로그의 마지막 줄은 07:52:55.649
+  `config saved`이며, 그 직전 07:52:51에 세이브 로드(메가빌딩 H8), 07:52:55.1에 no-recoil 토글
+  (`path=waiting-for-equipped-weapon`이라 게임 상태 변경 없음)이 있었다.
+- **"오버레이가 원인"은 아직 확립된 사실이 아니다 — 기록을 검증한 결과 근거가 없었다.**
+  `overlay.cpp`의 "DRED가 두 번 page fault를 보고했다"는 주석(`979eb10`에서 도입)을 append 모드로
+  누적된 5.5MB 로그 전체와 대조했다. 실제로 있는 것은 `overlay fence reports device removal` 두 줄뿐이다:
+  00:20:15.606 `hr=0x887A0006`(DEVICE_HUNG), 02:42:53.301 `hr=0x887A0001`. **DRED breadcrumb/page fault
+  줄은 단 한 줄도 없다.** 애초에 DRED는 디바이스 생성 전에 켜져야 데이터가 채워지는데 우리는 주입 시점이
+  디바이스 생성 이후라 켤 수 없다. 즉 페이지 폴트 서술은 추론이 주석에 사실처럼 굳은 것이었다. 주석을
+  로그가 실제로 말하는 내용으로 교정했다.
+- **그래서 headless A/B를 먼저 돌리지 않는다.** 크래시가 확률적이라 1회 재현으로는 정보량이 낮고,
+  headless는 제출 경로뿐 아니라 ImGui/ESP 드로우 전체를 동시에 끄기 때문에 어느 쪽이 원인인지 구분도
+  못 한다. 실측 데이터를 먼저 확보한다.
+- **시스템 DRED를 Cyberpunk2077.exe 범위로 강제 활성화.** `d3dconfig.exe`가 이미
+  `C:\Windows\System32`에 있고 관리자 권한 없이 설정이 적용됐다.
+  - `d3dconfig apps --add "G:\SteamLibrary\steamapps\common\Cyberpunk 2077ind\Cyberpunk2077.exe"`
+    로 적용 범위를 게임 하나로 한정했다 (다른 D3D12 앱에 breadcrumb 오버헤드를 주지 않기 위해).
+  - `d3dconfig dred --force-on-all` → `auto-breadcrumbs`, `breadcrumb-contexts`, `page-faults`,
+    `watson-dumps`가 모두 `force-on`. **설정은 디바이스 생성 시점에 읽히므로 게임을 재시작해야 적용된다.**
+  - 조사가 끝나면 `d3dconfig dred --force-sys-controlled-all`과 `d3dconfig apps --clear`로 되돌릴 것.
+- **device removal 워치독 추가 (`overlay.cpp`).** 이번 크래시는 게임 핸들러가 프로세스를 먼저 죽여서
+  Present 경로의 펜스 검사(`AcquireAllocator`)까지 도달하지 못했다. 디바이스를 얻은 직후 전용 스레드를
+  띄워 8ms 주기로 `GetDeviceRemovedReason`을 확인하고, 실패하면 즉시 기존 `LogDeviceRemovedData`로
+  DRED breadcrumb/page fault VA를 덤프한다. 스레드는 자기 `AddRef` 사본을 들고 돌아 렌더 뮤텍스를 잡지
+  않으며, `ReleaseOverlayResources`에서 `g_device.Reset()` 전에 stop 이벤트로 신호를 주고 join하므로
+  안전 언로드 순서를 깨지 않는다.
+- Release 빌드는 `/W4`에서 경고 없이 통과. 라이브 검증은 게임 재시작 후 재주입해서 (1) 시작 로그에
+  `device watchdog started`가 찍히는지, (2) 다음 크래시에서 `device watchdog observed removal` +
+  `DRED breadcrumb[...]`/`DRED page fault VA=` 줄이 남는지 확인하는 것으로 한다.

@@ -84,6 +84,77 @@ namespace
     ULONGLONG g_lastTelemetryTick = 0;
     UINT g_telemetryWindows = 0;
 
+    // 게임 자체 GPU 에러 핸들러(gpuApiDX12Error)가 device removal을 감지하면 곧바로 프로세스를 죽이기
+    // 때문에, Present 경로의 펜스 검사까지 살아남지 못하는 크래시가 있다. 별도 스레드가 짧은 주기로
+    // GetDeviceRemovedReason을 확인해 DRED breadcrumb/page fault를 먼저 덤프한다. DRED 자체는 디바이스
+    // 생성 전에 켜져 있어야 데이터가 채워지므로, 주입 전에 d3dconfig로 forced-on 해 둘 것.
+    constexpr DWORD kDeviceWatchdogPollMs = 8;
+    HANDLE g_deviceWatchdogThread = nullptr;
+    HANDLE g_deviceWatchdogStop = nullptr;
+
+    DWORD WINAPI DeviceRemovalWatchdog(LPVOID parameter)
+    {
+        ID3D12Device* device = static_cast<ID3D12Device*>(parameter);
+        for (;;)
+        {
+            if (WaitForSingleObject(g_deviceWatchdogStop, kDeviceWatchdogPollMs) == WAIT_OBJECT_0)
+                break;
+
+            const HRESULT reason = device->GetDeviceRemovedReason();
+            if (FAILED(reason))
+            {
+                Diagnostics::Log("device watchdog observed removal");
+                Diagnostics::LogDeviceRemovedData(device, "device watchdog");
+                break;
+            }
+        }
+        device->Release();
+        return 0;
+    }
+
+    void StartDeviceWatchdog()
+    {
+        if (g_deviceWatchdogThread || !g_device)
+            return;
+
+        g_deviceWatchdogStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!g_deviceWatchdogStop)
+        {
+            Diagnostics::Log("device watchdog not started: CreateEventW failed error=%lu", GetLastError());
+            return;
+        }
+
+        ID3D12Device* device = g_device.Get();
+        device->AddRef();
+        g_deviceWatchdogThread = CreateThread(nullptr, 0, DeviceRemovalWatchdog, device, 0, nullptr);
+        if (!g_deviceWatchdogThread)
+        {
+            Diagnostics::Log("device watchdog not started: CreateThread failed error=%lu", GetLastError());
+            device->Release();
+            CloseHandle(g_deviceWatchdogStop);
+            g_deviceWatchdogStop = nullptr;
+            return;
+        }
+        Diagnostics::Log("device watchdog started: pollMs=%lu", kDeviceWatchdogPollMs);
+    }
+
+    void StopDeviceWatchdog()
+    {
+        if (g_deviceWatchdogStop)
+            SetEvent(g_deviceWatchdogStop);
+        if (g_deviceWatchdogThread)
+        {
+            WaitForSingleObject(g_deviceWatchdogThread, INFINITE);
+            CloseHandle(g_deviceWatchdogThread);
+            g_deviceWatchdogThread = nullptr;
+        }
+        if (g_deviceWatchdogStop)
+        {
+            CloseHandle(g_deviceWatchdogStop);
+            g_deviceWatchdogStop = nullptr;
+        }
+    }
+
     void DisableOverlayRendering()
     {
         g_renderingDisabled = true;
@@ -317,6 +388,7 @@ namespace
         g_fence.Reset();
         g_srvHeap.Reset();
         g_rtvHeap.Reset();
+        StopDeviceWatchdog();
         g_device.Reset();
 
         g_fenceLastSignaled = 0;
@@ -369,6 +441,8 @@ namespace
             Diagnostics::LogHr("IDXGISwapChain::GetDevice", hr);
             return false;
         }
+
+        StartDeviceWatchdog();
 
         ComPtr<ID3D12Device> queueDevice;
         hr = commandQueue->GetDevice(IID_PPV_ARGS(&queueDevice));
@@ -528,12 +602,13 @@ namespace Overlay
     {
         std::lock_guard<std::mutex> renderGuard(g_renderMutex);
 
-        // DRED가 두 번, 스왑체인 생성 뒤에 추론한 큐로 제출하던 중 해제된 게임 리소스에서 page fault를
-        // 보고했다. 그 경로를 격리해 재현/검증할 수 있도록, GPU 제출 없이 타겟 선택만 CPU에서 돌리는 진단
-        // 모드를 남겨둔다. 예전에는 사일런트 에임을 켜기만 하면 무조건 이 경로로 빠져 메뉴가 통째로
-        // 사라졌고, WndProc 훅이 오버레이 초기화 경로에서만 걸리므로 Insert까지 죽어서 설정을 되돌릴
-        // 방법이 없었다. 이제는 별도 진단 토글로 분리하고, 오버레이가 한 번 초기화된 뒤 메뉴가 닫혀 있을
-        // 때만 적용한다.
+        // 오버레이 펜스가 device removal을 두 번 관측했다 (00:20:15 hr=0x887A0006 DEVICE_HUNG,
+        // 02:42:53 hr=0x887A0001). 두 번 모두 DRED가 꺼져 있어 breadcrumb/page fault 데이터는 없었고,
+        // "제출 큐가 원인"은 아직 측정으로 확인되지 않은 가설이다. 그 가설을 격리해 볼 수 있도록 GPU
+        // 제출 없이 타겟 선택만 CPU에서 돌리는 진단 모드를 남겨둔다. 예전에는 사일런트 에임을 켜기만 하면
+        // 무조건 이 경로로 빠져 메뉴가 통째로 사라졌고, WndProc 훅이 오버레이 초기화 경로에서만 걸리므로
+        // Insert까지 죽어서 설정을 되돌릴 방법이 없었다. 이제는 별도 진단 토글로 분리하고, 오버레이가 한 번
+        // 초기화된 뒤 메뉴가 닫혀 있을 때만 적용한다.
         if (swapChain && g_initialized && swapChain == g_swapChain && !g_visible &&
             Features::GetSettings().aimbot.headlessDiagnostics)
         {
