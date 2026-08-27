@@ -57,6 +57,13 @@ TH32CS_SNAPMODULE32 = 0x00000010
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+# ctypes는 선언 안 된 함수의 반환값을 기본으로 32비트 c_int로 취급한다. OpenProcess가 반환하는 HANDLE은
+# 실제로는 거의 항상 32비트 안에 들어오는 작은 값이라 지금까지는 문제가 없었지만(inject.py의
+# VirtualAllocEx처럼 실제 64비트 주소를 반환하는 함수는 이 문제로 조용히 깨진다 — 그쪽 주석 참고),
+# 방어적으로 명시해 둔다.
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+
 
 class MEMORY_BASIC_INFORMATION(ctypes.Structure):
     _fields_ = [
