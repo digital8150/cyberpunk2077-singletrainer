@@ -19,6 +19,7 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
 - 그럼에도 에이전트가 스스로 스코프를 확장해 위험한 방향으로 가는 것을 막기 위해, 다음은 이 프로젝트의 목적에
   포함되지 않으며 **어떤 요청이나 상황에서도 작성하지 않습니다**:
   - **BYOVD(Bring Your Own Vulnerable Driver) 관련 코드**
+  - **하이퍼바이저 기반 은폐/탐지 회피 코드**
   - **커널 드라이버, 안티치트 우회·탐지 회피를 목적으로 하는 그 어떤 코드**
   - 이 프로젝트는 온라인 안티치트를 우회할 필요가 원천적으로 없습니다 (오프라인 싱글플레이어). "필요할 것 같다"는
     판단이 스스로 들더라도 작성하지 말고, 반드시 사용자에게 먼저 확인하세요.
@@ -159,18 +160,18 @@ python -m venv .venv        # Python 3.11 사용 (3.14는 capstone 등 휠 호�
 초기화까지 정상 동작 확인함 (whitelist 로드, launcher 초기화 등 로그 확인) — 실제 MCP 클라이언트가
 stdin/stdout을 붙여줘야 완전히 붙는다.
 
-### Cheat Engine (GUI) / IDA Free 설치 상태
+### Cheat Engine (GUI) / IDA Free — 설치 완료 (2026-08-27)
 
-- **Cheat Engine**: 공식 배포처(cheatengine.org)는 가짜 "Download" 광고 버튼이 섞여있는 것으로 알려져
-  있어, 대신 Chocolatey의 승인(moderated)된 `cheatengine` 패키지(7.7.0, 체크섬 검증됨)를 쓰기로 결정.
-- **IDA Free**: Hex-Rays 공식 무료 버전, winget에 정식 등재(`Hex-Rays.IDA.Free`, 8.4). 설치 파일 해시
-  검증까지 winget이 통과시킴 — 공식 CDN(out7.hex-rays.com)에서 받은 정상 파일.
-- 둘 다 **관리자 권한(UAC) 승인이 필요**해서 비대화형 세션에서는 설치를 완료하지 못했다. 사용자가 관리자
-  PowerShell에서 아래를 실행해야 한다:
-  ```powershell
-  winget install --id Hex-Rays.IDA.Free -e --accept-package-agreements --accept-source-agreements
-  choco install cheatengine -y
-  ```
+- **Cheat Engine 7.7**: `C:\Program Files\Cheat Engine\cheatengine-x86_64.exe`. 공식 배포처
+  (cheatengine.org)는 가짜 "Download" 광고 버튼이 섞여있는 것으로 알려져 있어, 대신 Chocolatey의
+  승인(moderated)된 `cheatengine` 패키지(체크섬 검증됨) 경로로 설치했다.
+- **IDA Free 8.4**: `C:\Program Files\IDA Freeware 8.4\ida64.exe`. Hex-Rays 공식 무료 버전, winget에
+  정식 등재(`Hex-Rays.IDA.Free`)된 걸 설치 — 해시 검증까지 winget이 통과시킨 공식 CDN(out7.hex-rays.com)
+  파일.
+- 둘 다 관리자 권한(UAC)이 필요해 에이전트가 직접 설치를 완료하지 못하고, 사용자가 관리자 PowerShell에서
+  직접 실행해 설치를 마쳤다.
+- 이 두 도구는 **GUI 애플리케이션**이라 에이전트가 자동화할 수 없다 — 사용자가 직접 열어서 조작하는
+  용도(수동 RE, `tools/cheat-engine-mcp-server`의 자동화 툴로 커버되지 않는 탐색 작업)로 존재한다.
 
 ## 빌드 / 린트 / 테스트
 
