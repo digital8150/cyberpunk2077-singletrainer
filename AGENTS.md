@@ -126,9 +126,18 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
 
 ## 빌드 / 린트 / 테스트
 
-- **트레이너 DLL 본체**: 아직 코드와 빌드 시스템이 존재하지 않습니다 (TBD). 스캐폴딩(CMakeLists.txt,
-  `vendor/`의 ImGui·MinHook 서브모듈 또는 vcpkg 구성 등)을 추가하는 즉시 이 항목을 실제 명령어로
-  갱신하세요.
+- **트레이너 DLL 본체**: `vendor/imgui`, `vendor/minhook` git submodule + `CMakeLists.txt`로 빌드된다.
+  ```powershell
+  cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+  cmake --build build --config Release
+  ```
+  산출물: `build/bin/Release/cp2077_trainer.dll`. 새 `.cpp`를 추가하면 `CMakeLists.txt`의
+  `add_library(cp2077_trainer SHARED ...)` 목록에도 추가할 것. MSVC는 소스가 UTF-8(한글 주석 포함)이라
+  `/utf-8` 컴파일 옵션이 필요함 — 이미 CMakeLists.txt에 반영되어 있음, 새 타겟을 추가할 때도 잊지 말 것.
+  이 개발 머신엔 `cmake`가 PATH에 없을 수 있음 — 있다면 그냥 쓰고, 없으면 `winget install --id
+  Kitware.CMake --scope user`로 설치(관리자 권한 불필요, 새 셸부터 PATH 반영).
+- **의존성(`vendor/`)**: ImGui/MinHook은 git submodule(`vendor/imgui`, `vendor/minhook`)로 관리한다.
+  새로 clone한 사람은 `git submodule update --init --recursive` 필요.
 - **`tools/scripts/memtool.py`**: 지금 바로 사용 가능. `python tools/scripts/memtool.py --help`
   (Windows, Python 3.9+, 외부 의존성 없음). 문법 검사는 `python -m py_compile tools/scripts/memtool.py`.
 - **`tools/cheat-engine-mcp-server/`**: `tools/cheat-engine-mcp-server/.venv/Scripts/python.exe -m pytest`
