@@ -696,3 +696,51 @@
   resource 타입 항목이 나와야 한다.
 - Release 빌드는 `/W4`에서 경고 없이 통과. 다음 세션에서 게임 재시작 후 재주입해 메뉴를 반복적으로
   열고 닫으며 device removal이 사라졌는지 확인할 것.
+
+## 2026-08-28 - ESP 커스텀 드로잉·에임봇 전멸의 원인: 투영 초기화가 실패를 영구 래치했다
+
+- **증상**: 네이티브 하이라이트만 작동하고 바운딩 박스/스켈레톤/체력바가 전부 사라졌으며, 클래식·사일런트
+  에임 양쪽 모두 반응이 없었다. UI 재배선 직후에 드러나서 UI 회귀로 보였지만 UI와 무관했다.
+- **로그가 원인을 그대로 찍고 있었다.** `build/bin/Release/cp2077_trainer.log`:
+  - `[08:36:54.576] projection unavailable: gameICameraSystem was not found`
+  - 이후 세션 끝까지 모든 `ESP diagnostics`가 `projected=0 front=0 drawn=0 camera=0`. 엔티티는 정상
+    (`snapshots=83`, 카테고리 분류·체력 모두 유효)이었고, 실패 지점은 오직 월드→스크린 투영이었다.
+  - 같은 세션에서 `silent aim armed` / `memory aim active`가 한 줄도 없다. 에임봇도 후보 선별에
+    `Projection::WorldToScreen`을 쓰기 때문에 같은 원인으로 함께 죽었다.
+  - 네이티브 하이라이트만 살아남은 이유는 그 경로만 투영을 안 쓰기 때문이다. 사용자가 관측한 증상 조합이
+    그대로 설명된다.
+- **근본 원인**: `src/game/projection.cpp`의 `Initialize()`가 `g_state.attempted` 한 번으로 래치되는
+  일회성 초기화였다. 실패하면 그 프로세스 수명 내내 투영이 죽은 채로 남는다. `GetCameraPosition`의
+  `CameraPositionSource::Unavailable`도 같은 방식으로 영구 래치였다.
+- **왜 지금 터졌나**: `tools/scripts/auto_inject_cp2077.cmd`(= `inject.py --auto`)로 게임 시작과 동시에
+  주입하게 되면서, 첫 Present가 항상 메인 메뉴/로딩 시점에 잡힌다. 그때는 `gameICameraSystem`이 아직
+  없다. 예전처럼 인게임에 들어간 뒤 수동 주입할 때는 첫 시도가 곧바로 성공해서 래치가 문제가 안 됐다.
+  08:26 세션(수동 주입 추정)은 `projection initialized` 후 `projected=57`로 정상 동작했고, 08:36 세션
+  (자동 주입)만 죽었다 — 로그에서 두 세션이 대조된다.
+- **수정** (`src/game/projection.cpp`):
+  - `Initialize()`를 `ResolveStatics()` + `ResolveCameraSystem()` + `EnsureCameraSystem()`으로 쪼갰다.
+    주소 라이브러리 조회 결과만 한 번 캐시하고, 카메라 시스템 포인터는 250 ms 간격으로 다시 해석한다.
+    실패는 더 이상 래치되지 않고, 세션 전환으로 포인터가 갈려도 따라간다.
+  - 포인터가 바뀌면 `cameraPositionSource`와 first-projection 로그 플래그를 리셋한다.
+  - `CameraPositionSource::Unavailable`은 2초마다 재시도한다. 한 번 고른 소스가 나중에 실패하면
+    `Unknown`으로 되돌려 다시 고르게 한다.
+  - 로그 스팸 방지: `loggedUnavailable` / `loggedCameraSource`로 상태가 바뀔 때만 찍는다.
+  - 카메라 시스템 포인터가 이제 런타임에 바뀌므로 `std::atomic`으로 바꾸고, 사용하는 쪽이 한 번
+    스냅샷해서 `ProjectRaw` / `ReadCameraPositionFrom*` / `IsCameraPositionPlausible`에 인자로 넘기도록
+    했다. 다른 스레드가 그 사이에 널로 되돌린 포인터를 역참조하는 창을 없앤다.
+  - 엔진 포인터 체인 역참조는 주입 직후 폴트 가능성이 있어 `ResolveCameraSystem`을 SEH로 감쌌다.
+- **빌드**: `build-next`에서 Release 빌드 통과(경고 없음). `build/`는 게임이 DLL을 물고 있어 링크가
+  막혔다 — 아래 항목 참고.
+
+### 같이 발견한 별개 버그: 안전 언로드가 무한 루프에 빠진다
+
+- `inject.py --unload`가 성공하지 않고 다음 3줄을 1초 주기로 무한 반복한다:
+  `hook shutdown started` -> `no-recoil cleanup timed out: targetId=0x99F261` ->
+  `hook shutdown aborted: main-tick feature cleanup did not acknowledge safely` ->
+  `safe unload is waiting for hook cleanup; retrying in 1000 ms`.
+- `src/dllmain.cpp`의 `while (!Hooks::Shutdown())` 루프에 포기 조건이 없어서, `PrepareForShutdown`이
+  ack를 못 받는 상태가 되면 게임을 종료하는 것 외에 빠져나갈 방법이 없다.
+- 메인 틱 자체는 돌고 있었다(같은 구간에 `visibility tick`이 계속 찍힘). 따라서 의심 지점은
+  `PlayerModifiers::OnGameMainTick`의 정리 경로 — `ResolveRuntimeOnMainTick()`이 계속 실패해
+  `g_cleanupAcknowledged`가 영영 안 서는 쪽이다. 아직 측정으로 확인하지 않은 가설이다.
+- 아직 수정하지 않았다. 재현이 쉬우니 다음 작업 기점으로 잡을 것.

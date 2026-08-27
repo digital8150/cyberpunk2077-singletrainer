@@ -3,6 +3,7 @@
 #include "../diagnostics.h"
 #include "../framework.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -65,13 +66,29 @@ namespace
         Unavailable,
     };
 
+    // 트레이너가 게임 실행과 동시에 주입되면 첫 Present 시점에는 아직 gameICameraSystem이 없다. 예전
+    // 구현은 초기화를 딱 한 번만 시도하고 실패를 영구 래치해서, 메인 메뉴에서 주입된 세션은 세이브를
+    // 불러온 뒤에도 투영이 죽은 채로 남았다 — ESP 박스/스켈레톤/체력바와 에임봇 타겟 선정이 통째로
+    // 사라지고, 투영이 필요 없는 네이티브 하이라이트만 살아 있는 증상이 된다. 이제는 주기적으로 다시
+    // 해석하고, 세션 전환으로 카메라 시스템 포인터가 갈려도 따라간다.
+    constexpr ULONGLONG kCameraResolveIntervalMs = 250;
+    constexpr ULONGLONG kCameraSourceRetryIntervalMs = 2000;
+
     struct ProjectionState
     {
-        bool attempted = false;
-        void* cameraSystem = nullptr;
+        // 주소 라이브러리 조회 결과는 모듈 베이스에 묶여 있어 프로세스 수명 동안 바뀌지 않는다.
+        bool staticsResolved = false;
+        std::uintptr_t enginePointerAddress = 0;
+        std::uintptr_t rttiGetAddress = 0;
         ProjectPointFn projectPoint = nullptr;
+
+        std::atomic<void*> cameraSystem{nullptr};
+        std::atomic<ULONGLONG> lastResolveTick{0};
+        bool loggedUnavailable = false;
         bool loggedFirstProjection = false;
         CameraPositionSource cameraPositionSource = CameraPositionSource::Unknown;
+        CameraPositionSource loggedCameraSource = CameraPositionSource::Unknown;
+        ULONGLONG cameraSourceTick = 0;
     };
 
     ProjectionState g_state;
@@ -84,11 +101,10 @@ namespace
         return table ? table[index] : nullptr;
     }
 
-    bool Initialize()
+    bool ResolveStatics()
     {
-        if (g_state.attempted)
-            return g_state.cameraSystem && g_state.projectPoint;
-        g_state.attempted = true;
+        if (g_state.staticsResolved)
+            return true;
 
         HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
         const auto resolve = red4ext
@@ -96,7 +112,11 @@ namespace
                                  : nullptr;
         if (!resolve)
         {
-            Diagnostics::Log("projection unavailable: RED4ext address resolver is not loaded");
+            if (!g_state.loggedUnavailable)
+            {
+                Diagnostics::Log("projection unavailable: RED4ext address resolver is not loaded");
+                g_state.loggedUnavailable = true;
+            }
             return false;
         }
 
@@ -105,40 +125,95 @@ namespace
         const std::uintptr_t projectPointAddress = resolve(kCameraProjectPointAddressHash);
         if (!enginePointerAddress || !rttiGetAddress || !projectPointAddress)
         {
-            Diagnostics::Log("projection unavailable: an address-library lookup failed");
+            if (!g_state.loggedUnavailable)
+            {
+                Diagnostics::Log("projection unavailable: an address-library lookup failed");
+                g_state.loggedUnavailable = true;
+            }
             return false;
         }
 
-        void* engine = *reinterpret_cast<void**>(enginePointerAddress);
-        void* framework = engine ? *reinterpret_cast<void**>(static_cast<std::byte*>(engine) + 0x308) : nullptr;
-        void* gameInstance = framework
-                                 ? *reinterpret_cast<void**>(static_cast<std::byte*>(framework) + 0x10)
-                                 : nullptr;
-        void* rttiSystem = reinterpret_cast<GetRttiSystemFn>(rttiGetAddress)();
-
-        const auto getClass = reinterpret_cast<GetClassFn>(VirtualFunction(rttiSystem, 2));
-        void* cameraType = getClass ? getClass(rttiSystem, Fnv1a64("gameICameraSystem")) : nullptr;
-        const auto getSystem = reinterpret_cast<GetSystemFn>(VirtualFunction(gameInstance, 1));
-        g_state.cameraSystem = getSystem && cameraType ? getSystem(gameInstance, cameraType) : nullptr;
+        g_state.enginePointerAddress = enginePointerAddress;
+        g_state.rttiGetAddress = rttiGetAddress;
         g_state.projectPoint = reinterpret_cast<ProjectPointFn>(projectPointAddress);
-
-        if (!g_state.cameraSystem)
-        {
-            Diagnostics::Log("projection unavailable: gameICameraSystem was not found");
-            g_state.projectPoint = nullptr;
-            return false;
-        }
-
-        Diagnostics::Log("projection initialized: cameraSystem=%p camera=%p ProjectPoint=%p", g_state.cameraSystem,
-                         static_cast<std::byte*>(g_state.cameraSystem) + 0x60,
-                         reinterpret_cast<void*>(g_state.projectPoint));
+        g_state.staticsResolved = true;
         return true;
     }
 
-    bool ProjectRaw(const Vector3& point, Vector4& output)
+    // 게임 인스턴스에서 gameICameraSystem을 다시 찾는다. 주입 직후나 세션 전환 중에는 엔진 포인터 체인이
+    // 아직 다 채워지지 않은 상태라 역참조가 폴트를 낼 수 있어 SEH로 감싼다.
+    void* ResolveCameraSystem()
+    {
+        __try
+        {
+            void* engine = *reinterpret_cast<void**>(g_state.enginePointerAddress);
+            void* framework = engine ? *reinterpret_cast<void**>(static_cast<std::byte*>(engine) + 0x308) : nullptr;
+            void* gameInstance = framework
+                                     ? *reinterpret_cast<void**>(static_cast<std::byte*>(framework) + 0x10)
+                                     : nullptr;
+            if (!gameInstance)
+                return nullptr;
+
+            void* rttiSystem = reinterpret_cast<GetRttiSystemFn>(g_state.rttiGetAddress)();
+            const auto getClass = reinterpret_cast<GetClassFn>(VirtualFunction(rttiSystem, 2));
+            void* cameraType = getClass ? getClass(rttiSystem, Fnv1a64("gameICameraSystem")) : nullptr;
+            const auto getSystem = reinterpret_cast<GetSystemFn>(VirtualFunction(gameInstance, 1));
+            return getSystem && cameraType ? getSystem(gameInstance, cameraType) : nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    // ESP 한 프레임만 그려도 투영이 수백 번 불리므로, 재해석은 kCameraResolveIntervalMs 간격으로만 하고
+    // 그 사이에는 캐시된 포인터를 그대로 쓴다.
+    bool EnsureCameraSystem(void*& cameraSystem)
+    {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG lastResolveTick = g_state.lastResolveTick.load(std::memory_order_acquire);
+        void* cached = g_state.cameraSystem.load(std::memory_order_acquire);
+        if (lastResolveTick != 0 && now - lastResolveTick < kCameraResolveIntervalMs)
+        {
+            cameraSystem = cached;
+            return cached != nullptr;
+        }
+        g_state.lastResolveTick.store(now, std::memory_order_release);
+
+        cameraSystem = ResolveStatics() ? ResolveCameraSystem() : nullptr;
+        if (!cameraSystem)
+        {
+            if (g_state.staticsResolved && !g_state.loggedUnavailable)
+            {
+                Diagnostics::Log("projection unavailable: gameICameraSystem was not found (previous=%p); "
+                                 "retrying every %ums",
+                                 cached, static_cast<unsigned>(kCameraResolveIntervalMs));
+                g_state.loggedUnavailable = true;
+            }
+            g_state.cameraSystem.store(nullptr, std::memory_order_release);
+            g_state.cameraPositionSource = CameraPositionSource::Unknown;
+            return false;
+        }
+
+        if (cameraSystem != cached)
+        {
+            Diagnostics::Log("projection initialized: cameraSystem=%p camera=%p ProjectPoint=%p", cameraSystem,
+                             static_cast<std::byte*>(cameraSystem) + 0x60,
+                             reinterpret_cast<void*>(g_state.projectPoint));
+            g_state.cameraSystem.store(cameraSystem, std::memory_order_release);
+            g_state.cameraPositionSource = CameraPositionSource::Unknown;
+            g_state.loggedCameraSource = CameraPositionSource::Unknown;
+            g_state.cameraSourceTick = 0;
+            g_state.loggedFirstProjection = false;
+        }
+        g_state.loggedUnavailable = false;
+        return true;
+    }
+
+    bool ProjectRaw(void* cameraSystem, const Vector3& point, Vector4& output)
     {
         output = {};
-        void* camera = static_cast<std::byte*>(g_state.cameraSystem) + 0x60;
+        void* camera = static_cast<std::byte*>(cameraSystem) + 0x60;
         g_state.projectPoint(camera, output, point);
         return std::isfinite(output.x) && std::isfinite(output.y) && std::isfinite(output.w);
     }
@@ -155,20 +230,20 @@ namespace
 
     // A point sitting on the camera projects to ~zero forward depth. Anything else means the slot/function we
     // read is not the active camera position on this build, so the caller must try the other source.
-    bool IsCameraPositionPlausible(const float world[3])
+    bool IsCameraPositionPlausible(void* cameraSystem, const float world[3])
     {
         if (!IsFinitePosition(world))
             return false;
         Vector4 projected{};
         const Vector3 point{world[0], world[1], world[2]};
-        return ProjectRaw(point, projected) && std::abs(projected.w) < 1.0f;
+        return ProjectRaw(cameraSystem, point, projected) && std::abs(projected.w) < 1.0f;
     }
 
-    bool ReadCameraPositionFromVirtualSlot(float world[3])
+    bool ReadCameraPositionFromVirtualSlot(void* cameraSystem, float world[3])
     {
         __try
         {
-            void** table = *reinterpret_cast<void***>(g_state.cameraSystem);
+            void** table = *reinterpret_cast<void***>(cameraSystem);
             if (!table)
                 return false;
             const auto read = reinterpret_cast<GetCameraPositionFn>(
@@ -177,7 +252,7 @@ namespace
                 return false;
 
             Vector3 position{};
-            read(g_state.cameraSystem, position);
+            read(cameraSystem, position);
             world[0] = position.x;
             world[1] = position.y;
             world[2] = position.z;
@@ -189,12 +264,12 @@ namespace
         }
     }
 
-    bool ReadCameraPositionFromScript(float world[3])
+    bool ReadCameraPositionFromScript(void* cameraSystem, float world[3])
     {
         __try
         {
             Game::Rtti::Function* function =
-                Game::Rtti::FindFunction(Game::Rtti::NativeType(g_state.cameraSystem),
+                Game::Rtti::FindFunction(Game::Rtti::NativeType(cameraSystem),
                                          Game::Rtti::Hash("GetActiveCameraWorldTransform"));
             if (!function)
                 return false;
@@ -202,7 +277,7 @@ namespace
             Transform transform{};
             bool result = false;
             Game::Rtti::Argument arguments[] = {{&transform}};
-            if (!Game::Rtti::Invoke(function, g_state.cameraSystem, arguments, 1, &result) || !result)
+            if (!Game::Rtti::Invoke(function, cameraSystem, arguments, 1, &result) || !result)
                 return false;
 
             world[0] = transform.position.x;
@@ -222,12 +297,13 @@ namespace Game::Projection
     bool WorldToScreen(const float world[3], float displayWidth, float displayHeight, ScreenPoint& result)
     {
         result = {};
-        if (!world || displayWidth <= 0.0f || displayHeight <= 0.0f || !Initialize())
+        void* cameraSystem = nullptr;
+        if (!world || displayWidth <= 0.0f || displayHeight <= 0.0f || !EnsureCameraSystem(cameraSystem))
             return false;
 
         const Vector3 point{world[0], world[1], world[2]};
         Vector4 projected{};
-        if (!ProjectRaw(point, projected))
+        if (!ProjectRaw(cameraSystem, point, projected))
             return false;
 
         result.behind = projected.w <= 0.0f;
@@ -254,15 +330,33 @@ namespace Game::Projection
 
     bool GetCameraPosition(float world[3])
     {
-        if (!world || !Initialize() || g_state.cameraPositionSource == CameraPositionSource::Unavailable)
+        void* cameraSystem = nullptr;
+        if (!world || !EnsureCameraSystem(cameraSystem))
             return false;
+
+        // Unavailable도 영구 래치하지 않는다. 카메라 시스템이 막 만들어진 직후에는 두 소스 모두 실패할 수
+        // 있고, 그 한 번의 실패로 ESP 사각형의 폭 계산과 에임봇 시야 필터가 세션 내내 죽어버린다.
+        const ULONGLONG now = GetTickCount64();
+        if (g_state.cameraPositionSource == CameraPositionSource::Unavailable)
+        {
+            if (now - g_state.cameraSourceTick < kCameraSourceRetryIntervalMs)
+                return false;
+            g_state.cameraPositionSource = CameraPositionSource::Unknown;
+        }
 
         switch (g_state.cameraPositionSource)
         {
         case CameraPositionSource::VirtualSlot:
-            return ReadCameraPositionFromVirtualSlot(world);
+            if (ReadCameraPositionFromVirtualSlot(cameraSystem, world))
+                return true;
+            // 한 번 고른 소스가 갑자기 실패하면 다음 호출에서 다시 고르도록 되돌린다.
+            g_state.cameraPositionSource = CameraPositionSource::Unknown;
+            return false;
         case CameraPositionSource::ScriptTransform:
-            return ReadCameraPositionFromScript(world);
+            if (ReadCameraPositionFromScript(cameraSystem, world))
+                return true;
+            g_state.cameraPositionSource = CameraPositionSource::Unknown;
+            return false;
         default:
             break;
         }
@@ -270,19 +364,26 @@ namespace Game::Projection
         world[0] = 0.0f;
         world[1] = 0.0f;
         world[2] = 0.0f;
-        if (ReadCameraPositionFromVirtualSlot(world) && IsCameraPositionPlausible(world))
+        g_state.cameraSourceTick = now;
+        if (ReadCameraPositionFromVirtualSlot(cameraSystem, world) &&
+            IsCameraPositionPlausible(cameraSystem, world))
             g_state.cameraPositionSource = CameraPositionSource::VirtualSlot;
-        else if (ReadCameraPositionFromScript(world) && IsCameraPositionPlausible(world))
+        else if (ReadCameraPositionFromScript(cameraSystem, world) &&
+                 IsCameraPositionPlausible(cameraSystem, world))
             g_state.cameraPositionSource = CameraPositionSource::ScriptTransform;
         else
             g_state.cameraPositionSource = CameraPositionSource::Unavailable;
 
-        Diagnostics::Log("camera position source: %s world=(%.2f, %.2f, %.2f)",
-                         g_state.cameraPositionSource == CameraPositionSource::VirtualSlot ? "virtual slot"
-                         : g_state.cameraPositionSource == CameraPositionSource::ScriptTransform
-                             ? "GetActiveCameraWorldTransform"
-                             : "unavailable",
-                         world[0], world[1], world[2]);
+        if (g_state.cameraPositionSource != g_state.loggedCameraSource)
+        {
+            Diagnostics::Log("camera position source: %s world=(%.2f, %.2f, %.2f)",
+                             g_state.cameraPositionSource == CameraPositionSource::VirtualSlot ? "virtual slot"
+                             : g_state.cameraPositionSource == CameraPositionSource::ScriptTransform
+                                 ? "GetActiveCameraWorldTransform"
+                                 : "unavailable",
+                             world[0], world[1], world[2]);
+            g_state.loggedCameraSource = g_state.cameraPositionSource;
+        }
         return g_state.cameraPositionSource != CameraPositionSource::Unavailable;
     }
 }
