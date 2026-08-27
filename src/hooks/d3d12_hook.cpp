@@ -15,6 +15,7 @@
 #include "../game/player_modifiers.h"
 #include "../game/visibility.h"
 #include "../features/aimbot.h"
+#include "../game/aim_assist.h"
 #include "../ui/overlay.h"
 
 #include <MinHook.h>
@@ -248,6 +249,8 @@ namespace Hooks
         Game::EntityTracker::CreateHook();
         // Visibility is optional: its synchronous physics work is drained from the game-main-tick hook.
         Game::Visibility::CreateHook();
+        // Memory aim is optional and version-gated by a unique FPPCameraComponent 2.31 signature.
+        Game::AimAssist::CreateHook();
         CursorHook::CreateHooks();
 
         status = MH_EnableHook(MH_ALL_HOOKS);

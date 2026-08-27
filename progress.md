@@ -364,3 +364,23 @@
     응답했고 `CrashInfo.json`은 이전 크래시 시각 19:23:29에서 변하지 않았다. 테스트용 사용자 설정
     `no_recoil=1`은 종료 후 다시 0으로 복구했다. 이벤트 handle의 완전한 소멸 ABI는 추정하지 않고 4096개
     bounded 보수적 수명 정책을 유지하며, 정상 전이 전용 큐잉으로 일반 세션에서는 매우 천천히 증가한다.
+- **Native LookAt을 제거하고 FPPCameraComponent 직접 메모리 에임으로 전환**:
+  - smoothing 0에서도 체감 Ease가 남는다는 인게임 피드백을 받아 `TargetingSystem::LookAt` 요청 필드 조정으로는
+    해결할 수 없다고 판단했다. PID 10908의 `gameCameraSystem`과 로컬 플레이어 component를 실메모리에서
+    대조해 활성 카메라 quaternion이 `cameraSystem+0x70` 및 `gameFPPCameraComponent+0xF0`에 있고, 실제 입력
+    yaw/pitch 상태가 FPPCameraComponent `+0x42C/+0x430`에 있음을 확인했다.
+  - 두 필드의 writer/reader xref를 디스어셈블해 `Cyberpunk2077.exe+0x4E2968`의 provider-read helper가
+    FPPCameraComponent 업데이트 초기에 yaw/pitch 포인터를 채운다는 것을 확인했다. 2.31 실행 파일에서 40바이트
+    AOB가 정확히 1개만 매치하며, MinHook으로 원본 provider read 직후 두 값을 덮어쓰도록 구현했다. 이로써
+    `AimRequest`, `LookAt`, `BreakLookAt` 경로를 전부 제거했다.
+  - 라이브 조사 중 camera state에 따라 yaw 기준축이 절대/상대 방식으로 바뀌고, pitch limit 필드도 현재 유효
+    offset과 일치하지 않는 상태가 있음을 자체 layout check가 검출했다(초안 오차 yaw 50.797도, 다른 상태의
+    pitch clamp 오차 29.469도). 고정 body quaternion이나 동적 min/max를 가정하지 않고, 매 카메라 틱의 현재
+    world quaternion과 현재 offset의 차이에 목표 world angle delta만 더하는 방식으로 수정했다. 최종 live
+    check는 `current=(-15.000,0.000) resolved=(-15.000,0.000) delta=(-0.000,0.000)`으로 통과했다.
+  - smoothing 0은 hook 안에서 계산된 yaw/pitch를 같은 틱에 그대로 쓰며 엔진 easing을 전혀 거치지 않는다.
+    0보다 큰 값만 trainer 자체의 frame-time 기반 지수 보간을 사용한다. Present→camera tick 대상 전달은
+    odd/even generation seqlock으로 찢어진 좌표를 방지하고, 훅 콜백은 공용 unload lifecycle guard에 포함했다.
+  - Release 빌드와 `git diff --check`, 여러 차례 안전 언로드/재주입을 통과했다. 최종 주입 로그에서 AOB 1개,
+    hook callback 유입(`callbacks=3`), 로컬 FPP camera 해석, 0도 layout 오차를 확인했고 게임은 계속 응답했다.
+    현재 스트림에 enemy가 다시 잡혔지만 실제 우클릭 hard-lock의 시각적 체감 확인은 사용자 피드백을 기다린다.

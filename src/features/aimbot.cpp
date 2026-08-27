@@ -26,7 +26,7 @@ namespace Aimbot
         void StopAim()
         {
             if (g_aimActive)
-                Game::AimAssist::BreakLookAt();
+                Game::AimAssist::ClearMemoryAim();
             g_aimActive = false;
             g_lockedEntityId = 0;
             g_lastApplyTick = 0;
@@ -82,6 +82,8 @@ namespace Aimbot
             StopAim();
             return;
         }
+
+        Game::AimAssist::ProbePlayerCamera();
 
         const ImGuiIO& io = ImGui::GetIO();
         if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f)
@@ -177,13 +179,13 @@ namespace Aimbot
         const bool hardLock = settings.smoothing <= 0.001f;
         if (hardLock || now - g_lastApplyTick >= 16)
         {
-            g_aimActive = Game::AimAssist::ApplyLookAt(bestWorld, settings.smoothing);
+            g_aimActive = Game::AimAssist::ApplyMemoryAim(bestWorld, settings.smoothing);
             g_lastApplyTick = now;
         }
         static ULONGLONG lastLogTick = 0;
         if (now - lastLogTick >= 2000)
         {
-            Diagnostics::Log("native aim active: target=%016llX mode=%s world=(%.2f,%.2f,%.2f) "
+            Diagnostics::Log("memory aim active: target=%016llX mode=%s world=(%.2f,%.2f,%.2f) "
                              "screenDelta=(%.1f,%.1f) depth=%.1f",
                              static_cast<unsigned long long>(bestEntityId), hardLock ? "hard" : "smooth",
                              bestWorld[0], bestWorld[1], bestWorld[2],
