@@ -46,7 +46,7 @@ namespace
 
     bool g_initialized = false;
     bool g_renderingDisabled = false;  // 치명적 초기화/동기화 오류 뒤 게임을 살리기 위한 fail-closed 상태
-    bool g_visible = true;  // Insert 키로 토글 (AGENTS.md 기술 스택 절)
+    bool g_visible = false;  // 로드 시 숨김, Insert 키로 토글
     HWND g_hwnd = nullptr;
     IDXGISwapChain3* g_swapChain = nullptr;  // 이 인스턴스 외의 보조 스왑체인 Present는 무시한다.
     WNDPROC g_originalWndProc = nullptr;
@@ -539,6 +539,7 @@ namespace Overlay
         ImGui::NewFrame();
 
         Features::DrawOverlay();
+        Widgets::DrawStartupHint();
         if (g_visible)
             Widgets::DrawMainMenu();
 

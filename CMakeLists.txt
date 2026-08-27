@@ -29,11 +29,13 @@ target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 # --- 트레이너 DLL 본체 ---
 add_library(cp2077_trainer SHARED
     src/dllmain.cpp
+    src/config.cpp
     src/diagnostics.cpp
     src/features/features.cpp
     src/features/aimbot.cpp
     src/features/esp.cpp
     src/features/fps_counter.cpp
+    src/game/animation_data.cpp
     src/game/signature_scanner.cpp
     src/game/entity_tracker.cpp
     src/game/projection.cpp

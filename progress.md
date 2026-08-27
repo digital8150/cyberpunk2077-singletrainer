@@ -207,3 +207,37 @@
     사용자에게 안내했으며, 최신 분류 색상의 시각적 확인은 다음 인게임 피드백에서 이어갈 것.
   - `build-next` 및 정식 `build/bin/Release` 전체 Release 빌드를 통과했고, 최신 검증 DLL을 PID 21768에
     안전 언로드/재주입한 상태에서 게임 응답, 약 125 FPS cadence, allocator miss 0을 확인함.
+- **설정 자동 저장/로드와 숨김 시작 UX 구현**:
+  - Windows INI API로 `%LOCALAPPDATA%\\cbpk\\config.ini`를 만들고 FPS, ESP 표시 항목/카테고리/거리,
+    네이티브 하이라이트, 사망 대상 숨김, 에임봇 대상/FOV/스무딩/거리를 500ms debounce로 자동 저장함.
+    DLL 안전 종료 때 미저장 변경을 flush하며, PID 21768에서 파일 생성과 여러 UI 변경의 즉시 저장,
+    안전 재주입 뒤 `config loaded` 및 값 복원을 확인함.
+  - DLL 로드 시 메뉴 기본 상태를 닫힘으로 바꾸고, 화면 상단에 커스텀 draw-list 패널이 cubic ease-in-out으로
+    0.55초 slide-in, 3초 유지, 0.55초 slide-out하며 Insert 안내를 표시하도록 구현. 재주입 뒤 저장된 기능은
+    복원되지만 메뉴 capture/toggle 로그 없이 닫힌 상태로 첫 프레임이 제출됨을 확인함.
+- **애니메이션 시스템 기반 실제 AABB/rig 스켈레톤 ESP 구현**:
+  - 공식 RED4ext SDK/Codeware 런타임 시스템 매핑을 기준으로 `worldAnimationSystem` 인덱스 7과
+    `AnimatedEntitiesBucket`의 EntityID→index 맵을 직접 읽는 `src/game/animation_data.*`를 추가. 처음엔
+    상속 베이스 뒤 bucket 시작을 0x80으로 오인했으나 실메모리에서 `system+0x50`에
+    `size=54/capacity=211/stride=0x18` 맵이 있음을 확인해 수정함. 공개 SDK에 없는 EntityID 전용 hasher는
+    추정에 의존하지 않고 활성 hash-chain 전체를 순회하는 fallback으로 처리함.
+  - animation bounds의 8개 꼭짓점을 전부 게임 카메라로 투영해 실제 화면 사각형을 만들고, 데이터가 없는
+    대상만 기존 1.8m 근사 박스로 fallback함. MetaRig의 bone transform/parent index를 엔티티 월드 회전과
+    합성하고 독립 AABB 안에 들어오는지 검증한 뒤 최대 64개 parent-child 선분을 스켈레톤으로 그림.
+  - PID 21768에서 `animation bounds resolved`가 실제 NPC ID/인덱스와 약 1.8m 높이의 월드 min/max를
+    기록했고 `animation skeleton resolved: segments=64`, ESP 진단 `realBounds=8/8`을 확인. 게임은 계속
+    응답하고 DX12 allocator miss/device 오류가 없음.
+- **네이티브 하이라이트, 사망 필터, 클래식 에임봇 첫 단위 구현**:
+  - NPC의 skinned/morph mesh component에서 render proxy를 찾아 주소 라이브러리의
+    `RenderProxy::SetHighlightParams`/`SetScanningState`를 호출하는 네이티브 through-wall highlight를
+    추가. 기본값은 꺼짐이며 카테고리/사망 필터를 따르고, 토글 off와 DLL 언로드 때 현재 살아 있는 proxy를
+    `ScanningState::Off`로 정리함. 라이브에서 함수 해석, 활성화, 안전 언로드 시 15개 엔티티 정리와 게임
+    응답 유지를 확인함.
+  - 높이나 자세 추정 대신 엔티티 component 목록의 `entCorpseComponent`를 RTTI 상속 체인으로 판별하는
+    `Hide dead NPCs`(기본 on)를 추가하고 설정 저장에 포함. 현재 관측 구간에는 dead 대상이 없어 실제
+    생존→사망 전환의 시각 검증은 다음 전투 테스트에 남아 있음.
+  - 에임봇은 적/선택 시 경찰 중 FOV 내부 화면 중심에 가장 가까운 살아 있는 대상을 선택하고, 실제 AABB
+    상단 12% 지점을 머리 조준점으로 사용(없으면 위치+1.62m fallback). 메뉴가 닫혀 있고 게임이 foreground인
+    동안 우클릭을 누르면 프레임률 독립 smoothing과 소수점 누적을 거쳐 상대 `SendInput`으로 조준함.
+    PID 21768에서 실제 target ID, screen delta, depth를 기록하는 `aimbot active` 로그와 게임 응답 유지를
+    확인. silent aim, 실제 health/stat pool, 동적 hostility는 아직 미구현.

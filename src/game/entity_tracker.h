@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "animation_data.h"
+
 namespace Game::EntityTracker
 {
     enum class NpcCategory : std::uint8_t
@@ -34,7 +36,10 @@ namespace Game::EntityTracker
     {
         std::uint64_t entityId = 0;
         float position[3]{};
+        float orientation[4]{0.0f, 0.0f, 0.0f, 1.0f};
         NpcCategory category = NpcCategory::Other;
+        bool isDead = false;
+        AnimationData::VisualData visual;
     };
 
     // MinHook 초기화 후, MH_EnableHook(MH_ALL_HOOKS) 전에 호출한다.
@@ -44,4 +49,8 @@ namespace Game::EntityTracker
 
     // Refreshes registered NPC pointers defensively and copies only validated ID/position snapshots to the caller.
     std::size_t GetPuppetSnapshots(PuppetSnapshot* output, std::size_t capacity);
+
+    // Applies or clears the engine's own through-wall render highlight on currently tracked NPC mesh proxies.
+    void UpdateNativeHighlights(bool enabled, bool showCivilians, bool showEnemies, bool showPolice,
+                                bool showUnclassified, bool hideDead);
 }

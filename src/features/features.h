@@ -8,19 +8,24 @@ namespace Features
         bool boundingBoxes = true;
         bool skeleton = false;
         bool healthBars = true;
+        bool nativeHighlight = false;
+        bool hideDead = true;
         bool showCivilians = true;
         bool showEnemies = true;
         bool showPolice = true;
         bool showUnclassified = true;
-        float maxDistanceMeters = 100.0f;
+        float maxDistanceMeters = 300.0f;
     };
 
     struct AimbotSettings
     {
         bool enabled = false;
         bool drawFovCircle = true;
+        bool targetEnemies = true;
+        bool targetPolice = false;
         float fovRadiusPixels = 180.0f;
         float smoothing = 8.0f;
+        float maxDistanceMeters = 150.0f;
     };
 
     struct Settings

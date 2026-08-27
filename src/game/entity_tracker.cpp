@@ -1,4 +1,5 @@
 #include "entity_tracker.h"
+#include "animation_data.h"
 #include "signature_scanner.h"
 #include "../diagnostics.h"
 #include "../framework.h"
@@ -17,6 +18,8 @@ namespace
     // RED4ext/CET 공식 주소 해시: world::RuntimeEntityRegistry::RegisterEntity.
     constexpr std::uint32_t kRegisterEntityAddressHash = 2840271332u;
     constexpr std::uint32_t kCClassGetPropertyAddressHash = 0x8F031512u;
+    constexpr std::uint32_t kRenderProxySetHighlightParamsAddressHash = 1093803822u;
+    constexpr std::uint32_t kRenderProxySetScanningStateAddressHash = 2838044016u;
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
@@ -104,7 +107,7 @@ namespace
         std::int32_t y;
         std::int32_t z;
         std::byte pad0C[4];
-        std::byte orientation[16];
+        float orientation[4];
     };
     static_assert(sizeof(WorldTransformLayout) == 0x20);
 
@@ -122,13 +125,34 @@ namespace
         void* valueHolder;
         std::byte pad40[0x48 - 0x40];
         std::uint64_t entityId;
-        std::byte pad50[0xB0 - 0x50];
+        std::byte pad50[0xA0 - 0x50];
+        struct
+        {
+            std::byte* entries;
+            std::uint32_t capacity;
+            std::uint32_t size;
+        } components;
         PlacedComponentLayout* transformComponent;
     };
     static_assert(offsetof(EntityLayout, nativeType) == 0x30);
     static_assert(offsetof(EntityLayout, valueHolder) == 0x38);
     static_assert(offsetof(EntityLayout, entityId) == 0x48);
+    static_assert(offsetof(EntityLayout, components) == 0xA0);
     static_assert(offsetof(EntityLayout, transformComponent) == 0xB0);
+
+    struct HighlightParams
+    {
+        bool seeThroughWalls;
+        std::uint8_t patternType;
+        std::uint8_t fillIndex;
+        std::uint8_t outlineIndex;
+        float opacity;
+        bool forced;
+    };
+    static_assert(offsetof(HighlightParams, opacity) == 0x4);
+
+    using SetHighlightParamsFn = std::uint8_t (*)(void*, const HighlightParams&);
+    using SetScanningStateFn = std::uint8_t (*)(void*, std::int8_t);
 
     enum class PuppetKind
     {
@@ -147,6 +171,7 @@ namespace
     constexpr std::size_t kMaxTrackedPuppets = 256;
 
     using RegisterEntityFn = void (*)(void* registry, EntityLayout* entity);
+    using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
     RegisterEntityFn g_originalRegisterEntity = nullptr;
 
     std::atomic_bool g_hookCreated{false};
@@ -171,6 +196,11 @@ namespace
     using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
     GetPropertyFn g_getProperty = nullptr;
     bool g_getPropertyAttempted = false;
+    SetHighlightParamsFn g_setHighlightParams = nullptr;
+    SetScanningStateFn g_setScanningState = nullptr;
+    bool g_highlightResolveAttempted = false;
+    bool g_nativeHighlightActive = false;
+    ULONGLONG g_lastNativeHighlightTick = 0;
 
     GetPropertyFn ResolveGetProperty()
     {
@@ -359,7 +389,49 @@ namespace
         return isPuppet ? PuppetKind::Npc : PuppetKind::None;
     }
 
-    bool ReadPosition(const EntityLayout* entity, float position[3])
+    bool IsClassOrDerived(const ClassLayout* type, std::uint64_t nameHash)
+    {
+        for (unsigned depth = 0; type && depth < 24; ++depth, type = type->parent)
+        {
+            if (type->nameHash == nameHash)
+                return true;
+        }
+        return false;
+    }
+
+    template<typename Callback>
+    void ForEachComponent(const EntityLayout* entity, Callback&& callback)
+    {
+        if (!entity || !entity->components.entries || entity->components.size > entity->components.capacity ||
+            entity->components.size > 512)
+        {
+            return;
+        }
+        for (std::uint32_t i = 0; i < entity->components.size; ++i)
+        {
+            std::byte* handle = entity->components.entries + static_cast<std::size_t>(i) * 0x10;
+            void* component = *reinterpret_cast<void**>(handle);
+            if (component)
+                callback(static_cast<std::byte*>(component));
+        }
+    }
+
+    bool IsDead(const EntityLayout* entity)
+    {
+        constexpr std::uint64_t corpseComponentNames[] = {
+            Fnv1a64("entCorpseComponent"),
+            Fnv1a64("CorpseComponent"),
+        };
+        bool dead = false;
+        ForEachComponent(entity, [&](std::byte* component) {
+            const auto* type = *reinterpret_cast<ClassLayout**>(component + 0x30);
+            for (const std::uint64_t name : corpseComponentNames)
+                dead = dead || IsClassOrDerived(type, name);
+        });
+        return dead;
+    }
+
+    bool ReadTransform(const EntityLayout* entity, float position[3], float orientation[4])
     {
         if (!entity || !entity->transformComponent)
             return false;
@@ -369,9 +441,13 @@ namespace
         position[0] = static_cast<float>(transform.x) * kFixedPointScale;
         position[1] = static_cast<float>(transform.y) * kFixedPointScale;
         position[2] = static_cast<float>(transform.z) * kFixedPointScale;
+        memcpy(orientation, transform.orientation, sizeof(transform.orientation));
+        const float orientationLength = orientation[0] * orientation[0] + orientation[1] * orientation[1] +
+                                        orientation[2] * orientation[2] + orientation[3] * orientation[3];
         return std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]) &&
                std::abs(position[0]) < 1000000.0f && std::abs(position[1]) < 1000000.0f &&
-               std::abs(position[2]) < 1000000.0f;
+               std::abs(position[2]) < 1000000.0f && std::isfinite(orientationLength) &&
+               orientationLength > 0.01f && orientationLength < 4.0f;
     }
 
     void TrackPuppet(EntityLayout* entity)
@@ -420,14 +496,19 @@ namespace
             }
 
             float position[3]{};
-            if (!ReadPosition(entity, position))
+            float orientation[4]{};
+            if (!ReadTransform(entity, position, orientation))
                 return false;
 
             snapshot.entityId = tracked.entityId;
             snapshot.position[0] = position[0];
             snapshot.position[1] = position[1];
             snapshot.position[2] = position[2];
+            memcpy(snapshot.orientation, orientation, sizeof(orientation));
             snapshot.category = ClassifyNpc(entity);
+            snapshot.isDead = IsDead(entity);
+            Game::AnimationData::ReadVisualData(snapshot.entityId, snapshot.position, snapshot.orientation,
+                                                snapshot.visual);
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -450,8 +531,9 @@ namespace
             g_puppets.fetch_add(1, std::memory_order_relaxed);
 
         float position[3]{};
+        float orientation[4]{};
         bool hasPosition = false;
-        if (ReadPosition(entity, position))
+        if (ReadTransform(entity, position, orientation))
         {
             hasPosition = true;
             g_positioned.fetch_add(1, std::memory_order_relaxed);
@@ -484,6 +566,53 @@ namespace
                              static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
                              hasPosition ? 1 : 0, position[0], position[1], position[2]);
         }
+    }
+
+    bool ResolveHighlightFunctions()
+    {
+        if (g_highlightResolveAttempted)
+            return g_setHighlightParams && g_setScanningState;
+        g_highlightResolveAttempted = true;
+
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        if (resolve)
+        {
+            g_setHighlightParams = reinterpret_cast<SetHighlightParamsFn>(
+                resolve(kRenderProxySetHighlightParamsAddressHash));
+            g_setScanningState = reinterpret_cast<SetScanningStateFn>(
+                resolve(kRenderProxySetScanningStateAddressHash));
+        }
+        Diagnostics::Log("native highlight resolver: params=%p scanning=%p",
+                         reinterpret_cast<void*>(g_setHighlightParams),
+                         reinterpret_cast<void*>(g_setScanningState));
+        return g_setHighlightParams && g_setScanningState;
+    }
+
+    void SetEntityNativeHighlight(EntityLayout* entity, bool enabled)
+    {
+        constexpr std::uint64_t skinnedMeshName = Fnv1a64("entSkinnedMeshComponent");
+        constexpr std::uint64_t morphMeshName = Fnv1a64("entMorphTargetSkinnedMeshComponent");
+        const HighlightParams params = enabled ? HighlightParams{true, 0, 0, 1, 1.0f, true}
+                                               : HighlightParams{false, 0, 0, 0, 0.0f, false};
+        ForEachComponent(entity, [&](std::byte* component) {
+            const auto* type = *reinterpret_cast<ClassLayout**>(component + 0x30);
+            std::size_t proxyOffset = 0;
+            if (IsClassOrDerived(type, morphMeshName))
+                proxyOffset = 0x1E8;
+            else if (IsClassOrDerived(type, skinnedMeshName))
+                proxyOffset = 0x1E0;
+            if (proxyOffset == 0)
+                return;
+
+            void* proxy = *reinterpret_cast<void**>(component + proxyOffset);
+            if (!proxy)
+                return;
+            g_setHighlightParams(proxy, params);
+            g_setScanningState(proxy, enabled ? 4 : 0); // rendPostFx_ScanningState::Complete / Off
+        });
     }
 
     void HookRegisterEntity(void* registry, EntityLayout* entity)
@@ -551,6 +680,8 @@ namespace Game::EntityTracker
 
     void Shutdown()
     {
+        if (g_nativeHighlightActive)
+            UpdateNativeHighlights(false, false, false, false, false, false);
         g_hookCreated.store(false, std::memory_order_release);
         g_registry.store(nullptr, std::memory_order_release);
         g_originalRegisterEntity = nullptr;
@@ -618,5 +749,67 @@ namespace Game::EntityTracker
         g_trackedPolice.store(police, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
         return count;
+    }
+
+    void UpdateNativeHighlights(bool enabled, bool showCivilians, bool showEnemies, bool showPolice,
+                                bool showUnclassified, bool hideDead)
+    {
+        if (!enabled && !g_nativeHighlightActive)
+            return;
+        if (!ResolveHighlightFunctions())
+            return;
+
+        const ULONGLONG now = GetTickCount64();
+        if (enabled == g_nativeHighlightActive && now - g_lastNativeHighlightTick < 250)
+            return;
+        g_lastNativeHighlightTick = now;
+
+        std::size_t touched = 0;
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (const TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+            __try
+            {
+                EntityLayout* entity = tracked.entity;
+                if (!entity || entity->entityId != tracked.entityId ||
+                    ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
+                {
+                    continue;
+                }
+
+                const NpcCategory category = ClassifyNpc(entity);
+                bool categoryEnabled = false;
+                switch (category)
+                {
+                case NpcCategory::Civilian:
+                    categoryEnabled = showCivilians;
+                    break;
+                case NpcCategory::Enemy:
+                    categoryEnabled = showEnemies;
+                    break;
+                case NpcCategory::Police:
+                    categoryEnabled = showPolice;
+                    break;
+                default:
+                    categoryEnabled = showUnclassified;
+                    break;
+                }
+                const bool shouldHighlight = enabled && categoryEnabled && !(hideDead && IsDead(entity));
+                SetEntityNativeHighlight(entity, shouldHighlight);
+                ++touched;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+
+        if (enabled != g_nativeHighlightActive)
+        {
+            Diagnostics::Log("native highlight %s: entities=%zu", enabled ? "enabled" : "disabled", touched);
+            g_nativeHighlightActive = enabled;
+        }
     }
 }

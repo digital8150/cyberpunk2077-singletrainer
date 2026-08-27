@@ -7,10 +7,21 @@
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace Widgets
 {
+    namespace
+    {
+        float EaseInOutCubic(float value)
+        {
+            const float t = std::clamp(value, 0.0f, 1.0f);
+            return t < 0.5f ? 4.0f * t * t * t
+                            : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+        }
+    }
+
     void ApplyStyle()
     {
         // 기본 ImGui 폰트엔 한글 글리프가 없어서 한글 텍스트가 "??"로 깨진다 (실사용 확인됨). Windows에
@@ -141,9 +152,72 @@ namespace Widgets
         return changed;
     }
 
+    void DrawStartupHint()
+    {
+        constexpr float slideDuration = 0.55f;
+        constexpr float holdDuration = 3.0f;
+        constexpr float panelWidth = 560.0f;
+        constexpr float panelHeight = 78.0f;
+        constexpr float restingY = 24.0f;
+
+        static ULONGLONG startedAt = 0;
+        if (startedAt == 0)
+            startedAt = GetTickCount64();
+
+        const float elapsed = static_cast<float>(GetTickCount64() - startedAt) / 1000.0f;
+        const float totalDuration = slideDuration + holdDuration + slideDuration;
+        if (elapsed >= totalDuration)
+            return;
+
+        float progress = 1.0f;
+        if (elapsed < slideDuration)
+            progress = EaseInOutCubic(elapsed / slideDuration);
+        else if (elapsed > slideDuration + holdDuration)
+            progress = 1.0f - EaseInOutCubic((elapsed - slideDuration - holdDuration) / slideDuration);
+
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.DisplaySize.x <= panelWidth)
+            return;
+
+        const float hiddenY = -panelHeight - 18.0f;
+        const float y = hiddenY + (restingY - hiddenY) * progress;
+        const float x = (io.DisplaySize.x - panelWidth) * 0.5f;
+        const ImVec2 minimum(x, y);
+        const ImVec2 maximum(x + panelWidth, y + panelHeight);
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+
+        const int alpha = static_cast<int>(255.0f * progress);
+        drawList->AddRectFilled(ImVec2(minimum.x + 3.0f, minimum.y + 8.0f),
+                                ImVec2(maximum.x + 3.0f, maximum.y + 8.0f),
+                                IM_COL32(0, 0, 0, static_cast<int>(90.0f * progress)), 14.0f);
+        drawList->AddRectFilled(minimum, maximum, IM_COL32(20, 22, 29, alpha), 14.0f);
+        drawList->AddRect(minimum, maximum, IM_COL32(76, 137, 244, static_cast<int>(150.0f * progress)),
+                          14.0f, 1.0f, ImDrawFlags_None);
+        drawList->AddRectFilled(ImVec2(minimum.x, minimum.y + 16.0f),
+                                ImVec2(minimum.x + 4.0f, maximum.y - 16.0f),
+                                IM_COL32(69, 146, 255, alpha), 2.0f);
+
+        const ImVec2 titlePos(minimum.x + 24.0f, minimum.y + 14.0f);
+        drawList->AddText(titlePos, IM_COL32(116, 168, 255, alpha), "CBPK  /  TRAINER READY");
+
+        drawList->AddText(ImVec2(minimum.x + 24.0f, minimum.y + 45.0f),
+                          IM_COL32(226, 231, 241, alpha), "메뉴를 열려면");
+        const ImVec2 keyMinimum(minimum.x + 142.0f, minimum.y + 41.0f);
+        const ImVec2 keyMaximum(keyMinimum.x + 74.0f, keyMinimum.y + 25.0f);
+        drawList->AddRectFilled(keyMinimum, keyMaximum, IM_COL32(44, 49, 61, alpha), 6.0f);
+        drawList->AddRect(keyMinimum, keyMaximum, IM_COL32(102, 115, 139, alpha), 6.0f);
+        const ImVec2 keyTextSize = ImGui::CalcTextSize("INSERT");
+        drawList->AddText(ImVec2(keyMinimum.x + (keyMaximum.x - keyMinimum.x - keyTextSize.x) * 0.5f,
+                                 keyMinimum.y + (keyMaximum.y - keyMinimum.y - keyTextSize.y) * 0.5f),
+                          IM_COL32(240, 244, 252, alpha), "INSERT");
+        drawList->AddText(ImVec2(keyMaximum.x + 13.0f, keyMinimum.y + 3.0f),
+                          IM_COL32(226, 231, 241, alpha), "버튼을 누르세요");
+    }
+
     void DrawMainMenu()
     {
-        ImGui::SetNextWindowSize(ImVec2(520.0f, 660.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 780.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(520.0f, 740.0f), ImVec2(900.0f, 1000.0f));
         ImGui::Begin("Cyberpunk 2077 Trainer");
 
         Features::Settings& settings = Features::GetSettings();
@@ -171,6 +245,12 @@ namespace Widgets
         ImGui::TextUnformatted("Health bars");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_health", &settings.esp.healthBars);
+        ImGui::TextUnformatted("Native highlight");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_native", &settings.esp.nativeHighlight);
+        ImGui::TextUnformatted("Hide dead NPCs");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_hide_dead", &settings.esp.hideDead);
         ImGui::Spacing();
         ImGui::TextUnformatted("Civilians");
         ImGui::SameLine(430.0f);
@@ -208,15 +288,23 @@ namespace Widgets
         ImGui::TextUnformatted("Draw FOV circle");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_fov_circle", &settings.aimbot.drawFovCircle);
+        ImGui::TextUnformatted("Target enemies");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_target_enemies", &settings.aimbot.targetEnemies);
+        ImGui::TextUnformatted("Target police");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_target_police", &settings.aimbot.targetPolice);
         FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
         FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 1.0f, 30.0f, "%.1f");
+        FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
+        ImGui::TextDisabled("Hold right mouse while the menu is closed to aim.");
         ImGui::Unindent(14.0f);
 
         ImGui::Separator();
         ImGui::TextWrapped(
             "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
-            "Distance currently uses camera-forward depth. Verified bone, health, dynamic hostility, and true AABB "
-            "access are still pending.");
+            "Distance uses camera-forward depth. Animation-system AABB and rig skeleton data are used when "
+            "available; health values and dynamic hostility are still pending.");
 
         ImGui::End();
     }

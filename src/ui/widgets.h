@@ -9,6 +9,7 @@ namespace Widgets
     void ApplyStyle();
 
     void DrawMainMenu();
+    void DrawStartupHint();
 
     // pill 모양 토글 스위치. 스톡 위젯이 없어서 InvisibleButton으로 입력만 가져오고 배경/thumb은
     // ImDrawList로 직접 그린다. 반환값은 "이번 프레임에 눌렸는지"(값 자체는 *value에 반영됨).

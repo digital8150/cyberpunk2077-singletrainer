@@ -4,6 +4,7 @@
 // 실제 초기화는 별도 스레드(MainThread)에서 수행한다.
 #include "framework.h"
 #include "diagnostics.h"
+#include "config.h"
 #include "hooks/d3d12_hook.h"
 
 #include <cstdio>
@@ -17,6 +18,7 @@ namespace
         const HMODULE module = static_cast<HMODULE>(parameter);
         Diagnostics::Initialize(module);
         Diagnostics::Log("initialization thread started");
+        Config::Initialize();
         Hooks::Initialize();
 
         wchar_t unloadEventName[96]{};
@@ -46,6 +48,7 @@ namespace
         }
 
         Diagnostics::Log("safe unload checks passed; releasing DLL");
+        Config::Shutdown();
         if (unloadEvent)
             CloseHandle(unloadEvent);
         Diagnostics::Shutdown();
