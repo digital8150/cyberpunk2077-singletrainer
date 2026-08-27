@@ -23,6 +23,7 @@ namespace Aimbot
         bool g_aimActive = false;
         std::uint64_t g_lockedEntityId = 0;
         ULONGLONG g_lastApplyTick = 0;
+        Stats g_stats;
 
         void StopAim()
         {
@@ -99,6 +100,7 @@ namespace Aimbot
             drawList->AddCircle(center, settings.fovRadiusPixels, IM_COL32(62, 157, 255, 220), 128, 1.4f);
         }
 
+        g_stats = Stats{};
         static std::array<Game::EntityTracker::PuppetSnapshot, 128> puppets{};
         const std::size_t count = Game::EntityTracker::GetPuppetSnapshots(puppets.data(), puppets.size());
         float bestScreenDistance = (std::numeric_limits<float>::max)();
@@ -119,6 +121,22 @@ namespace Aimbot
             const auto& puppet = puppets[i];
             if (!IsEligible(puppet, settings))
                 continue;
+            ++g_stats.candidates;
+
+            // 스탯 풀이 아직 안 잡힌 대상은 살아 있는지도, 체력이 얼마인지도 확인되지 않는다. 실제로
+            // healthValid=0인 대상이 사일런트 에임에 armed된 사례가 로그에 남아서 기본으로 걸러낸다.
+            if (settings.requireHealthPool && (!puppet.healthValid || puppet.healthCurrent <= 0.0f))
+            {
+                ++g_stats.skippedNoHealthPool;
+                continue;
+            }
+            // 차량/보스급 퍼펫이 일반 NPC로 분류되어 들어오는 경우를 최대 체력으로 걸러낸다. 관측된 사례는
+            // 최대 체력 4,343짜리 대상이었다. 체력 풀이 아직 없으면 위 필터가 처리하므로 여기선 건너뛴다.
+            if (settings.limitHealthPool && puppet.healthValid && puppet.healthMax > settings.maxHealthPool)
+            {
+                ++g_stats.skippedHealthCap;
+                continue;
+            }
 
             float aimWorld[3]{};
             GetAimPoint(puppet, aimWorld);
@@ -145,9 +163,12 @@ namespace Aimbot
                 if (Game::Visibility::Query(puppet.entityId, camera, aimWorld, torso, priority) ==
                     Game::Visibility::State::Occluded)
                 {
+                    ++g_stats.skippedOccluded;
                     continue;
                 }
             }
+
+            ++g_stats.eligible;
             if (activationHeld && puppet.entityId == g_lockedEntityId)
             {
                 lockedTargetAvailable = true;
@@ -175,6 +196,23 @@ namespace Aimbot
             return;
         }
 
+        const Game::EntityTracker::PuppetSnapshot* selected = nullptr;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (puppets[i].entityId == bestEntityId)
+            {
+                selected = &puppets[i];
+                break;
+            }
+        }
+        g_stats.targetEntityId = bestEntityId;
+        if (selected)
+        {
+            g_stats.targetHealthValid = selected->healthValid;
+            g_stats.targetHealth = selected->healthCurrent;
+            g_stats.targetHealthMax = selected->healthMax;
+        }
+
         if (drawList)
             drawList->AddCircle(ImVec2(bestPoint.x, bestPoint.y), 5.0f, IM_COL32(255, 92, 105, 245), 20, 1.6f);
         if (!activationHeld || Overlay::IsVisible() || !IsGameForeground())
@@ -196,39 +234,20 @@ namespace Aimbot
             if (now - lastSilentLogTick >= 2000)
             {
                 const Game::SilentAim::DiagnosticsSnapshot diagnostics = Game::SilentAim::GetDiagnostics();
-                const Game::EntityTracker::PuppetSnapshot* selected = nullptr;
-                for (std::size_t i = 0; i < count; ++i)
-                {
-                    if (puppets[i].entityId == bestEntityId)
-                    {
-                        selected = &puppets[i];
-                        break;
-                    }
-                }
                 Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) "
                                  "healthValid=%u health=%.2f/%.2f dead=%u "
-                                 "producerHooks=%u listenerHooks=%u callbacks=%llu projectile=%llu local=%llu validated=%llu "
-                                 "effectRun=%llu attackStart=%llu attackPrepare=%llu crosshair=%llu defaultCrosshair=%llu "
-                                 "nativeCrosshairCore=%llu nativeCrosshairRedirects=%llu "
-                                 "redirected=%llu rejected=%llu mutation=1",
+                                 "candidates=%u eligible=%u noPool=%u overCap=%u occluded=%u "
+                                 "crosshairCoreHook=%u calls=%llu redirects=%llu rejected=%llu",
                                  static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
                                  selected && selected->healthValid ? 1u : 0u,
                                  selected ? selected->healthCurrent : 0.0f,
                                  selected ? selected->healthMax : 0.0f,
                                  selected && selected->isDead ? 1u : 0u,
-                                 diagnostics.producerHooks, diagnostics.listenerHooks,
-                                 static_cast<unsigned long long>(diagnostics.callbacks),
-                                 static_cast<unsigned long long>(diagnostics.projectileEvents),
-                                 static_cast<unsigned long long>(diagnostics.localPlayerEvents),
-                                 static_cast<unsigned long long>(diagnostics.validatedLocalEvents),
-                                 static_cast<unsigned long long>(diagnostics.effectRuns),
-                                 static_cast<unsigned long long>(diagnostics.attackStarts),
-                                 static_cast<unsigned long long>(diagnostics.attackPrepares),
-                                 static_cast<unsigned long long>(diagnostics.crosshairCalls),
-                                 static_cast<unsigned long long>(diagnostics.defaultCrosshairCalls),
+                                 g_stats.candidates, g_stats.eligible, g_stats.skippedNoHealthPool,
+                                 g_stats.skippedHealthCap, g_stats.skippedOccluded,
+                                 diagnostics.crosshairCoreHookCreated ? 1u : 0u,
                                  static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreCalls),
                                  static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreRedirects),
-                                 static_cast<unsigned long long>(diagnostics.redirectedShots),
                                  static_cast<unsigned long long>(diagnostics.rejectedShots));
                 lastSilentLogTick = now;
             }
@@ -257,6 +276,11 @@ namespace Aimbot
                              diagnostics.fppCamera, diagnostics.cameraSystem, diagnostics.angularError);
             lastLogTick = now;
         }
+    }
+
+    Stats GetStats()
+    {
+        return g_stats;
     }
 
     void DrawOverlay(const Features::AimbotSettings& settings)

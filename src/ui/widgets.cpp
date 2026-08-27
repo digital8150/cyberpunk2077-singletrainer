@@ -1,5 +1,6 @@
 #include "widgets.h"
 #include "../framework.h"  // GetFileAttributesW/INVALID_FILE_ATTRIBUTES
+#include "../features/aimbot.h"
 #include "../features/features.h"
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
@@ -436,7 +437,15 @@ namespace Widgets
         ImGui::TextUnformatted("Only visible targets");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_visible_only", &settings.aimbot.visibleOnly);
-        FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
+        ImGui::TextUnformatted("Require health pool");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_require_health", &settings.aimbot.requireHealthPool);
+        ImGui::TextUnformatted("Limit health pool");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_limit_health", &settings.aimbot.limitHealthPool);
+        if (settings.aimbot.limitHealthPool)
+            FilledSliderFloat("Max health pool", &settings.aimbot.maxHealthPool, 500.0f, 6000.0f, "%.0f HP");
+        FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 2500.0f, "%.0f px");
         if (!settings.aimbot.silentAim)
             FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
@@ -452,6 +461,24 @@ namespace Widgets
         {
             Hint("Only visible targets shares the ESP visibility cache, so targets behind cover are skipped in "
                  "both modes. An entity with no cached result yet is still allowed through.");
+        }
+        if (settings.aimbot.requireHealthPool || settings.aimbot.limitHealthPool)
+        {
+            Hint("Health filters drop NPCs whose stat pool has not resolved yet, and puppets whose maximum health "
+                 "is far above a normal NPC - vehicles and boss-class actors. Raise the limit if a real enemy is "
+                 "being skipped.");
+        }
+
+        const Aimbot::Stats aimStats = Aimbot::GetStats();
+        ImGui::TextDisabled("Targets: candidates %u | eligible %u | no pool %u | over cap %u | occluded %u",
+                            aimStats.candidates, aimStats.eligible, aimStats.skippedNoHealthPool,
+                            aimStats.skippedHealthCap, aimStats.skippedOccluded);
+        if (aimStats.targetEntityId != 0)
+        {
+            ImGui::TextDisabled("Selected 0x%llX | health %.0f / %.0f%s",
+                                static_cast<unsigned long long>(aimStats.targetEntityId),
+                                aimStats.targetHealth, aimStats.targetHealthMax,
+                                aimStats.targetHealthValid ? "" : " (stat pool unresolved)");
         }
 
         const Game::Visibility::Stats visibilityStats = Game::Visibility::GetStats();
@@ -475,17 +502,23 @@ namespace Widgets
             ImGui::TextDisabled("Crosshair core: calls %llu | redirects %llu",
                                 static_cast<unsigned long long>(silentStats.nativeCrosshairCoreCalls),
                                 static_cast<unsigned long long>(silentStats.nativeCrosshairCoreRedirects));
-            ImGui::TextDisabled("Observation hooks: producer %u | projectile %u",
-                                silentStats.producerHooks, silentStats.listenerHooks);
-            ImGui::TextDisabled("Calls: effect %llu | start %llu | prepare %llu | crosshair %llu/%llu | "
-                                "projectile %llu/%llu",
-                                static_cast<unsigned long long>(silentStats.effectRuns),
-                                static_cast<unsigned long long>(silentStats.attackStarts),
-                                static_cast<unsigned long long>(silentStats.attackPrepares),
-                                static_cast<unsigned long long>(silentStats.crosshairCalls),
-                                static_cast<unsigned long long>(silentStats.defaultCrosshairCalls),
-                                static_cast<unsigned long long>(silentStats.projectileEvents),
-                                static_cast<unsigned long long>(silentStats.localPlayerEvents));
+            if (silentStats.producerHooks == 0 && silentStats.listenerHooks == 0)
+            {
+                ImGui::TextDisabled("Observation hooks: disabled in this build");
+            }
+            else
+            {
+                ImGui::TextDisabled("Observation hooks: producer %u | projectile %u | effect %llu | start %llu | "
+                                    "prepare %llu | crosshair %llu/%llu | projectile events %llu/%llu",
+                                    silentStats.producerHooks, silentStats.listenerHooks,
+                                    static_cast<unsigned long long>(silentStats.effectRuns),
+                                    static_cast<unsigned long long>(silentStats.attackStarts),
+                                    static_cast<unsigned long long>(silentStats.attackPrepares),
+                                    static_cast<unsigned long long>(silentStats.crosshairCalls),
+                                    static_cast<unsigned long long>(silentStats.defaultCrosshairCalls),
+                                    static_cast<unsigned long long>(silentStats.projectileEvents),
+                                    static_cast<unsigned long long>(silentStats.localPlayerEvents));
+            }
         }
         ImGui::Unindent(14.0f);
 

@@ -43,6 +43,9 @@ namespace
                lhs.aimbot.targetEnemies == rhs.aimbot.targetEnemies &&
                lhs.aimbot.targetPolice == rhs.aimbot.targetPolice &&
                lhs.aimbot.visibleOnly == rhs.aimbot.visibleOnly &&
+               lhs.aimbot.requireHealthPool == rhs.aimbot.requireHealthPool &&
+               lhs.aimbot.limitHealthPool == rhs.aimbot.limitHealthPool &&
+               lhs.aimbot.maxHealthPool == rhs.aimbot.maxHealthPool &&
                lhs.aimbot.fovRadiusPixels == rhs.aimbot.fovRadiusPixels &&
                lhs.aimbot.smoothing == rhs.aimbot.smoothing &&
                lhs.aimbot.maxDistanceMeters == rhs.aimbot.maxDistanceMeters;
@@ -128,6 +131,9 @@ namespace
         ok &= WriteBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         ok &= WriteBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
         ok &= WriteBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
+        ok &= WriteBool(L"aimbot", L"require_health_pool", settings.aimbot.requireHealthPool);
+        ok &= WriteBool(L"aimbot", L"limit_health_pool", settings.aimbot.limitHealthPool);
+        ok &= WriteFloat(L"aimbot", L"max_health_pool", settings.aimbot.maxHealthPool);
         ok &= WriteFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels);
         ok &= WriteFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing);
         ok &= WriteFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters);
@@ -198,8 +204,14 @@ namespace Config
         settings.aimbot.targetEnemies = ReadBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         settings.aimbot.targetPolice = ReadBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
         settings.aimbot.visibleOnly = ReadBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
+        settings.aimbot.requireHealthPool =
+            ReadBool(L"aimbot", L"require_health_pool", settings.aimbot.requireHealthPool);
+        settings.aimbot.limitHealthPool =
+            ReadBool(L"aimbot", L"limit_health_pool", settings.aimbot.limitHealthPool);
+        settings.aimbot.maxHealthPool =
+            ReadFloat(L"aimbot", L"max_health_pool", settings.aimbot.maxHealthPool, 500.0f, 6000.0f);
         settings.aimbot.fovRadiusPixels =
-            ReadFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels, 40.0f, 600.0f);
+            ReadFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels, 40.0f, 2500.0f);
         settings.aimbot.smoothing = ReadFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing, 0.0f, 30.0f);
         settings.aimbot.maxDistanceMeters =
             ReadFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters, 10.0f, 300.0f);

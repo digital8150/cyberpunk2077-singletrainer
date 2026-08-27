@@ -596,3 +596,35 @@
   (`build-next`로 빌드해 확인), 메뉴/키 바인딩/사일런트 조준은 사람이 직접 조작해야 확인되는 항목이다.
   다음 세션에서 `--unload` 후 재빌드·재주입해 (1) 사일런트 에임 켠 상태로 메뉴가 뜨는지, (2) 바인딩한 키로
   조준이 걸리는지, (3) visible-only를 켰을 때 엄폐 중인 적이 후보에서 빠지는지 확인할 것.
+
+## 2026-08-28 - Target quality filters and the first non-diagnostic silent aim build
+
+- **관측 모드 종료.** 사일런트 에임이 크로스헤어 코어 리다이렉트만으로 동작하는 것이 확인됐으므로, Step 1
+  진단용이던 후크들을 기본 빌드에서 뺐다. `kEnableProducerObservationHooks = false`,
+  새로 추가한 `kEnableProjectileObservationHooks = false`. 이제 설치되는 후크는 크로스헤어 코어 하나뿐이다
+  (라이브 로그: `producers=0 projectileListeners=0 weaponListenerHooks=0 queueHook=0 crosshairCore=1`).
+  RTTI 조회/열거와 로깅은 시작 시 한 번만 도는 읽기 전용이라 그대로 뒀다. 다시 조사할 일이 생기면 두 상수만
+  되돌리면 된다.
+- **타겟 품질 필터.** 07:26 로그에서 `healthValid=0`인 대상과 최대 체력 4,343짜리 대상이 armed된 사례가
+  있었다. 둘 다 타겟 선택 단계에서 걸러낸다 (클래식/사일런트 공통 경로).
+  - `requireHealthPool`(기본 켜짐): 스탯 풀이 아직 안 잡혔거나(`healthValid=0`) 현재 체력이 0 이하인 대상 제외.
+    살아 있는지조차 확인되지 않은 대상에 탄도를 돌리지 않는다.
+  - `limitHealthPool`(기본 켜짐) + `maxHealthPool`(기본 2500, 500~6000): 최대 체력이 일반 NPC 범위를 크게
+    벗어나는 차량/보스급 퍼펫 제외. 실제 적이 걸러지면 슬라이더를 올리면 된다. 두 값 모두 `config.ini`에 저장된다.
+  - `Aimbot::GetStats()`로 프레임별 후보/통과/제외 사유(no pool, over cap, occluded) 카운트와 현재 선택된
+    대상의 체력을 노출해 메뉴와 사일런트 에임 로그에 함께 찍는다. 필터가 실제로 무엇을 걸러내는지 눈으로
+    확인하지 않으면 임계값을 조정할 근거가 없기 때문이다.
+- **FOV 반경 상한 40~600 -> 40~2500.** 사용자가 손으로 `fov_radius_pixels=2500`을 넣어둔 상태였는데, 로드
+  시 클램프가 600으로 깎고 그대로 저장해버린다. 2560x1440에서 화면 전체를 덮는 FOV는 사일런트 에임에서
+  정상적인 설정이라 상한을 올려 설정을 보존했다.
+- **라이브 검증 (PID 2620, 07:49 재주입).** `--unload`로 이전 DLL을 안전 언로드한 뒤 `build/`로 재빌드해
+  재주입했다. 확인된 것:
+  - `silent_aim=1`인 상태에서 `first overlay frame submitted`가 찍혔다 — headless 분리 이후 사일런트 에임과
+    오버레이가 동시에 살아 있는 첫 빌드다. 5초 창 기준 presents 2671/3402/3378에 `submitted`가 동일하고
+    `allocatorMisses=0`, device removal/펜스 타임아웃 로그 없음, 게임 `Responding=True` 유지.
+  - 크로스헤어 코어 후크 생성 성공(`target=00007FF752108354`), 시야 리졸버(`preset=Sight Blocker`),
+    메모리 에임 훅, 프로젝션 모두 정상 초기화.
+  - 다만 재주입 시점의 세이브 위치에 NPC가 없어(`snapshots=0 tracked=0`) 체력 필터/시야 필터/키 바인딩은
+    전투 중 사람이 직접 확인해야 한다. 다음 전투에서 메뉴의 `Targets: candidates/eligible/no pool/over cap/
+    occluded` 줄과 `silent aim armed:` 로그의 같은 카운터를 비교할 것.
+- Release 빌드는 `/W4`에서 경고 없이 통과, `git diff --check` 깨끗.

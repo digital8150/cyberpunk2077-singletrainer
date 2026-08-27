@@ -29,8 +29,13 @@ namespace
     // Live observation must establish the exact event path and payload before any projectile field is modified.
     constexpr bool kEnableProjectileMutation = false;
     // Native RTTI handlers have one documented VM ABI. These hooks only count calls while a target is armed;
-    // they do not inspect stack-frame parameters or modify effect/crosshair data.
-    constexpr bool kEnableProducerObservationHooks = true;
+    // they do not inspect stack-frame parameters or modify effect/crosshair data. The crosshair core redirect alone
+    // drives silent aim on 2.31, so the shipped trainer installs none of them - keep them off unless a producer
+    // path has to be re-investigated.
+    constexpr bool kEnableProducerObservationHooks = false;
+    // Same reasoning for the projectile ShootEvent listeners: with projectile mutation permanently gated off they
+    // only counted events on a hot native dispatch path.
+    constexpr bool kEnableProjectileObservationHooks = false;
     // Hooking the two RTTI event-108 callback targets is unsafe: those code targets are reused outside the typed
     // listener dispatch, and the live game crashed before a valid weapon payload was observed.
     constexpr bool kEnableWeaponListenerObservationHooks = false;
@@ -965,9 +970,12 @@ namespace Game::SilentAim
                 g_weaponShootClass = reinterpret_cast<Game::Rtti::Class*>(weaponShootEvent);
                 // Enumeration remains read-only. The two event-108 callback targets are deliberately never hooked.
                 EnumerateWeaponShootListeners(weaponShootEvent->eventTypeId);
-                created = AddListenerHooks(projectileComponent, setUpEvent->eventTypeId, shootEvent->eventTypeId,
-                                           shootTargetEvent->eventTypeId,
-                                           ListenerHookKind::Projectile) || created;
+                if (kEnableProjectileObservationHooks)
+                {
+                    created = AddListenerHooks(projectileComponent, setUpEvent->eventTypeId,
+                                               shootEvent->eventTypeId, shootTargetEvent->eventTypeId,
+                                               ListenerHookKind::Projectile) || created;
+                }
             }
             g_state.hookCreated.store(created, std::memory_order_release);
             Diagnostics::Log("silent aim hooks created: producers=%u projectileListeners=%u "

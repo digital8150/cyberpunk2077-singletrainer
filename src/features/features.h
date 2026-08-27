@@ -37,6 +37,12 @@ namespace Features
         // ESP의 visibilityCheck와 같은 게임 메인 틱 시야 캐시를 쓴다. 켜면 벽 뒤 대상은 클래식/사일런트
         // 양쪽 모두에서 타겟 후보에서 빠진다. 기본값은 ESP 쪽과 같이 꺼둔다.
         bool visibleOnly = false;
+        // 스탯 풀이 아직 안 잡힌 대상(healthValid=0)은 살아 있는지도 확인되지 않은 상태라 후보에서 뺀다.
+        bool requireHealthPool = true;
+        // 차량/보스급 퍼펫이 일반 NPC로 분류되어 들어오는 경우를 최대 체력으로 걸러낸다. 관측된 사례는
+        // 최대 체력 4,343짜리 대상이 사일런트 에임에 걸린 것이었다.
+        bool limitHealthPool = true;
+        float maxHealthPool = 2500.0f;
         float fovRadiusPixels = 180.0f;
         float smoothing = 8.0f;
         float maxDistanceMeters = 150.0f;
