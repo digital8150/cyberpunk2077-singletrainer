@@ -140,11 +140,14 @@ def main(argv=None) -> int:
         print("this tool is Windows-only.", file=sys.stderr)
         return 1
 
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Keep runtime/help output ASCII-only so this remains usable from cp949 and other legacy Windows consoles.
+    parser = argparse.ArgumentParser(
+        description="Inject a DLL with LoadLibraryW and CreateRemoteThread."
+    )
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--pid", type=int)
-    target.add_argument("--name", help="예: Cyberpunk2077.exe")
-    parser.add_argument("--dll", required=True, help="주입할 DLL 경로")
+    target.add_argument("--name", help="process executable name, e.g. Cyberpunk2077.exe")
+    parser.add_argument("--dll", required=True, help="path to the DLL to inject")
     args = parser.parse_args(argv)
 
     pid = resolve_pid(args)

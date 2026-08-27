@@ -10,7 +10,7 @@ namespace Overlay
     void OnPresent(IDXGISwapChain3* swapChain, ID3D12CommandQueue* commandQueue);
 
     // ResizeBuffers 훅에서 호출 — 다음 OnPresent에서 렌더 타겟을 다시 만들도록 상태를 리셋한다.
-    void OnResizeBuffers();
+    void OnResizeBuffers(IDXGISwapChain3* swapChain);
 
     void Shutdown();
 

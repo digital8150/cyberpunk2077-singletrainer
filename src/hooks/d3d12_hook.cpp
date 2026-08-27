@@ -8,9 +8,12 @@
 // 이후 선언 순서). 이 프로젝트에서 새로 알아낸 게 아니라 DX12 오버레이 후킹의 표준 관례값이다.
 #include "d3d12_hook.h"
 #include "../framework.h"
+#include "../diagnostics.h"
 #include "../ui/overlay.h"
 
 #include <MinHook.h>
+
+#include <atomic>
 
 namespace
 {
@@ -27,28 +30,53 @@ namespace
     ExecuteCommandListsFn oExecuteCommandLists = nullptr;
 
     // Present 훅 시점엔 어떤 커맨드큐가 "렌더용"인지 알 수 없다 (스왑체인 API엔 큐가 안 딸려 온다).
-    // 그래서 ExecuteCommandLists 훅에서 처음 관측되는 큐를 렌더 큐로 가정해 캡처해 둔다.
-    // TODO: D3D12_COMMAND_QUEUE_DESC.Type == D3D12_COMMAND_LIST_TYPE_DIRECT 확인해서 더 견고하게 만들 것.
-    ID3D12CommandQueue* g_commandQueue = nullptr;
+    // 처음 관측된 Direct 큐는 진단용으로만 남긴다. 실제 제출에는 아래의 스레드별 마지막 큐를 사용한다.
+    // 서로 다른 렌더 스레드에서도 안전하게 로그에 표시할 수 있도록 포인터 자체는 atomic으로 게시한다.
+    std::atomic<ID3D12CommandQueue*> g_firstDirectQueue{nullptr};
+    // DX12 엔진은 커맨드리스트 기록을 여러 스레드에서 해도 실제 큐 제출과 Present는 보통 같은 렌더
+    // 스레드에서 연달아 수행한다. 그 스레드에서 마지막으로 본 Direct 큐만 Present에 넘겨, 무관한
+    // Direct 큐(업로드/보조 렌더 등)를 "첫 큐"라는 이유만으로 쓰지 않는다.
+    thread_local ID3D12CommandQueue* t_lastDirectQueue = nullptr;
+    std::atomic_bool g_loggedFirstPresent{false};
 
     HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain3* swapChain, UINT syncInterval, UINT flags)
     {
-        Overlay::OnPresent(swapChain, g_commandQueue);
+        ID3D12CommandQueue* commandQueue = t_lastDirectQueue;
+        if (!g_loggedFirstPresent.exchange(true))
+            Diagnostics::Log("first Present intercepted: swapChain=%p sameThreadDirectQueue=%p firstDirectQueue=%p",
+                             swapChain, commandQueue, g_firstDirectQueue.load(std::memory_order_acquire));
+
+        Overlay::OnPresent(swapChain, commandQueue);
         return oPresent(swapChain, syncInterval, flags);
     }
 
     HRESULT STDMETHODCALLTYPE hkResizeBuffers(IDXGISwapChain3* swapChain, UINT bufferCount, UINT width,
                                                UINT height, DXGI_FORMAT newFormat, UINT swapChainFlags)
     {
-        Overlay::OnResizeBuffers();
+        Overlay::OnResizeBuffers(swapChain);
         return oResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
     }
 
     void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists,
                                                   ID3D12CommandList* const* commandLists)
     {
-        if (!g_commandQueue)
-            g_commandQueue = queue;
+        // 엔진은 보통 큐를 여러 개(Direct/Compute/Copy) 굴린다. RTV를 건드리는 ImGui 커맨드리스트는
+        // Direct 큐로만 제출할 수 있으므로 그게 아니면 절대 캡처하면 안 된다 — 예전엔 이 필터가 없어서
+        // "그냥 처음 관측된 큐"를 렌더 큐로 오인해 캡처했고, 그게 Compute/Copy 큐였을 경우 그 큐로
+        // ImGui 커맨드리스트를 ExecuteCommandLists 하는 게 되어(불법 제출) GPU가 그대로 멈춰버렸다
+        // (실제로 재현됨 — 펜스 대기가 영원히 안 풀리는 형태의 행으로 나타났다).
+        const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+        if (desc.Type == D3D12_COMMAND_LIST_TYPE_DIRECT)
+        {
+            t_lastDirectQueue = queue;
+            ID3D12CommandQueue* expected = nullptr;
+            if (g_firstDirectQueue.compare_exchange_strong(expected, queue, std::memory_order_release,
+                                                           std::memory_order_relaxed))
+            {
+                Diagnostics::Log("captured Direct queue candidate: queue=%p priority=%d flags=0x%X nodeMask=0x%X",
+                                 queue, desc.Priority, static_cast<unsigned>(desc.Flags), desc.NodeMask);
+            }
+        }
         oExecuteCommandLists(queue, numCommandLists, commandLists);
     }
 
@@ -61,28 +89,50 @@ namespace
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"cp2077_trainer_dummy";
-        RegisterClassExW(&wc);
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        {
+            Diagnostics::Log("RegisterClassExW(dummy) failed: error=%lu", GetLastError());
+            return false;
+        }
 
         HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"dummy", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, nullptr,
                                      nullptr, wc.hInstance, nullptr);
+        if (!hwnd)
+        {
+            Diagnostics::Log("CreateWindowExW(dummy) failed: error=%lu", GetLastError());
+            UnregisterClassW(wc.lpszClassName, wc.hInstance);
+            return false;
+        }
 
         bool ok = false;
 
         do
         {
             ComPtr<ID3D12Device> device;
-            if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
+            HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("D3D12CreateDevice(dummy)", hr);
                 break;
+            }
 
             D3D12_COMMAND_QUEUE_DESC queueDesc{};
             queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
             ComPtr<ID3D12CommandQueue> queue;
-            if (FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue))))
+            hr = device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue));
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("CreateCommandQueue(dummy)", hr);
                 break;
+            }
 
             ComPtr<IDXGIFactory4> factory;
-            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+            hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("CreateDXGIFactory1(dummy)", hr);
                 break;
+            }
 
             DXGI_SWAP_CHAIN_DESC1 scDesc{};
             scDesc.BufferCount = 2;
@@ -94,12 +144,20 @@ namespace
             scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 
             ComPtr<IDXGISwapChain1> swapChain1;
-            if (FAILED(factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &scDesc, nullptr, nullptr, &swapChain1)))
+            hr = factory->CreateSwapChainForHwnd(queue.Get(), hwnd, &scDesc, nullptr, nullptr, &swapChain1);
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("CreateSwapChainForHwnd(dummy)", hr);
                 break;
+            }
 
             ComPtr<IDXGISwapChain3> swapChain3;
-            if (FAILED(swapChain1.As(&swapChain3)))
+            hr = swapChain1.As(&swapChain3);
+            if (FAILED(hr))
+            {
+                Diagnostics::LogHr("QueryInterface(IDXGISwapChain3 dummy)", hr);
                 break;
+            }
 
             void** swapChainVTable = *reinterpret_cast<void***>(swapChain3.Get());
             void** queueVTable = *reinterpret_cast<void***>(queue.Get());
@@ -107,6 +165,8 @@ namespace
             *presentAddr = swapChainVTable[kPresentIndex];
             *resizeBuffersAddr = swapChainVTable[kResizeBuffersIndex];
             *executeCommandListsAddr = queueVTable[kExecuteCommandListsIndex];
+            Diagnostics::Log("resolved hook targets: Present=%p ResizeBuffers=%p ExecuteCommandLists=%p",
+                             *presentAddr, *resizeBuffersAddr, *executeCommandListsAddr);
             ok = true;
         } while (false);
 
@@ -120,27 +180,63 @@ namespace Hooks
 {
     void Initialize()
     {
-        if (MH_Initialize() != MH_OK)
+        Diagnostics::Log("hook initialization started");
+
+        MH_STATUS status = MH_Initialize();
+        if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED)
+        {
+            Diagnostics::Log("MH_Initialize failed: %s (%d)", MH_StatusToString(status), status);
             return;
+        }
 
         void* presentAddr = nullptr;
         void* resizeBuffersAddr = nullptr;
         void* executeCommandListsAddr = nullptr;
         if (!GetVTableAddresses(&presentAddr, &resizeBuffersAddr, &executeCommandListsAddr))
+        {
+            Diagnostics::Log("failed to resolve hook targets");
             return;
+        }
 
-        MH_CreateHook(presentAddr, &hkPresent, reinterpret_cast<void**>(&oPresent));
-        MH_CreateHook(resizeBuffersAddr, &hkResizeBuffers, reinterpret_cast<void**>(&oResizeBuffers));
-        MH_CreateHook(executeCommandListsAddr, &hkExecuteCommandLists,
-                      reinterpret_cast<void**>(&oExecuteCommandLists));
+        status = MH_CreateHook(presentAddr, &hkPresent, reinterpret_cast<void**>(&oPresent));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(Present) failed: %s (%d)", MH_StatusToString(status), status);
+            return;
+        }
 
-        MH_EnableHook(MH_ALL_HOOKS);
+        status = MH_CreateHook(resizeBuffersAddr, &hkResizeBuffers, reinterpret_cast<void**>(&oResizeBuffers));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(ResizeBuffers) failed: %s (%d)", MH_StatusToString(status), status);
+            return;
+        }
+
+        status = MH_CreateHook(executeCommandListsAddr, &hkExecuteCommandLists,
+                               reinterpret_cast<void**>(&oExecuteCommandLists));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(ExecuteCommandLists) failed: %s (%d)", MH_StatusToString(status), status);
+            return;
+        }
+
+        status = MH_EnableHook(MH_ALL_HOOKS);
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_EnableHook failed: %s (%d)", MH_StatusToString(status), status);
+            return;
+        }
+
+        Diagnostics::Log("all hooks enabled");
     }
 
     void Shutdown()
     {
+        Diagnostics::Log("hook shutdown started");
         Overlay::Shutdown();
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
+        g_firstDirectQueue.store(nullptr, std::memory_order_release);
+        Diagnostics::Log("hook shutdown finished");
     }
 }
