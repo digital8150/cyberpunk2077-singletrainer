@@ -662,3 +662,37 @@
 - Release 빌드는 `/W4`에서 경고 없이 통과. 라이브 검증은 게임 재시작 후 재주입해서 (1) 시작 로그에
   `device watchdog started`가 찍히는지, (2) 다음 크래시에서 `device watchdog observed removal` +
   `DRED breadcrumb[...]`/`DRED page fault VA=` 줄이 남는지 확인하는 것으로 한다.
+
+## 2026-08-28 - DRED 실측: 메뉴 오픈 직후 device hung, ImGui 프레임 링 깊이가 원인
+
+- **워치독이 데이터를 잡았다.** 08:27:16.090 `device watchdog observed removal`,
+  `hr=0x887A0006`(DXGI_ERROR_DEVICE_HUNG), `DRED page fault VA=0x10C5863000`. 게임 자체 핸들러보다
+  먼저 덤프하는 데 성공했다.
+- **메뉴 오픈과의 상관은 3대 3이다.** 지금까지 GPU 사망 3건 모두 `overlay visibility toggled: visible=1`
+  직후다: 00:20:14.622 -> 00:20:15.606, 07:52:52.357 -> 07:52:55.77, 08:27:15.014 -> 08:27:16.090.
+  반대로 headless 구간(00:37~05:06, 64회)에는 device removal이 한 건도 없다. 오버레이 제출 경로가
+  범인이라는 점은 이 시점에서 확정으로 본다. 다만 메뉴를 열고도 살아남은 토글이 여럿 있으므로
+  (08:26:09, 08:26:34 포함) 확률적 레이스다.
+- **원인 확정: ImGui DX12 백엔드의 프레임 링 깊이가 우리 in-flight 상한과 어긋나 있었다.**
+  `vendor/imgui/backends/imgui_impl_dx12.cpp`를 읽어 확인했다.
+  - 245행: `fr = &bd->pFrameResources[bd->frameIndex % bd->numFramesInFlight]`, 244행에서 frameIndex는
+    `RenderDrawData` 호출마다(= 오버레이 제출마다) 1씩 증가한다.
+  - 248~251행: 드로우 데이터가 커지면 그 슬롯의 정점 버퍼를 `SafeRelease`로 **즉시 해제**하고 더 큰 것을
+    만든다. 펜스 대기가 없다. 리사이즈가 없어도 매 프레임 CPU가 그 버퍼에 memcpy한다.
+  - 우리는 `NumFramesInFlight = g_bufferCount`, 즉 2를 넘겼는데, 같은 파일의 얼로케이터 풀은 DLSS Frame
+    Generation 때문에 최대 `kMaximumAllocatorCount`(32)까지 커진다. 제출은 32프레임까지 in-flight가 될 수
+    있는데 정점 버퍼 링은 2였다. GPU가 아직 읽는 버퍼를 해제하거나 덮어쓰는 창이 상시 열려 있었다.
+  - 메뉴를 열면 드로우 데이터가 거의 0에서 한 번에 커져 248행의 해제 경로를 정확히 밟는다. 3건 모두
+    메뉴 오픈 직후인 이유가 이것이고, page fault + DEVICE_HUNG이라는 증상과도 맞는다.
+  - 수정: `initInfo.NumFramesInFlight`를 `kMaximumAllocatorCount`로 맞췄다. 링 깊이가 in-flight 상한과
+    같으면 슬롯 i가 재사용될 때 그 사이에 32번의 제출이 있었다는 뜻이고, 얼로케이터 풀이 그만큼 재활용됐다는
+    것은 해당 펜스가 완료됐다는 뜻이다. 프레임당 버퍼가 작아 메모리 비용은 무시할 만하다.
+- **DRED breadcrumb은 여전히 비어 있었다.** page fault VA는 나왔는데 breadcrumb은 한 줄도 안 나왔다.
+  `GetAutoBreadcrumbsOutput1`의 HRESULT와 노드 0개인 경우를 구분해 로그로 남기도록 고쳤다.
+- **page fault 할당 노드 로깅 추가.** VA만으로는 누구 메모리인지 모른다.
+  `pHeadExistingAllocationNode`와 `pHeadRecentFreedAllocationNode`를 각각 최대 32개까지 순회해
+  오브젝트 이름과 `D3D12_DRED_ALLOCATION_TYPE`을 찍는다. 다음 크래시가 나면 폴트가 난 할당이 방금 해제된
+  것인지, 그리고 그게 리소스인지 다른 오브젝트인지 이름으로 드러난다. 위 가설이 맞다면 recent freed 쪽에
+  resource 타입 항목이 나와야 한다.
+- Release 빌드는 `/W4`에서 경고 없이 통과. 다음 세션에서 게임 재시작 후 재주입해 메뉴를 반복적으로
+  열고 닫으며 device removal이 사라졌는지 확인할 것.

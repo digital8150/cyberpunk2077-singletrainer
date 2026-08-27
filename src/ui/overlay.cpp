@@ -549,7 +549,14 @@ namespace
         ImGui_ImplDX12_InitInfo initInfo{};
         initInfo.Device = g_device.Get();
         initInfo.CommandQueue = commandQueue;  // 텍스처 업로드용 (신규 백엔드가 요구)
-        initInfo.NumFramesInFlight = static_cast<int>(g_bufferCount);
+        // ImGui DX12 백엔드는 프레임 리소스(정점/인덱스 버퍼)를 NumFramesInFlight 개의 링으로 돌리고,
+        // 드로우 데이터가 커지면 그 슬롯의 기존 버퍼를 즉시 Release한 뒤 더 큰 것을 만든다. 즉 링 깊이가
+        // "동시에 GPU에 떠 있는 오버레이 프레임 수"보다 얕으면 GPU가 아직 읽고 있는 버퍼를 해제/재사용하게
+        // 된다. 백버퍼 수(2)를 그대로 쓰면 DLSS Frame Generation 때문에 얼로케이터 풀이 최대 32까지
+        // 늘어나는 이 코드와 어긋난다 — 제출은 32프레임까지 in-flight가 될 수 있는데 링은 2였다.
+        // 링 깊이를 in-flight 상한(kMaximumAllocatorCount)과 같게 맞춘다. 프레임당 버퍼는 작아서
+        // 메모리 비용은 무시할 만하다.
+        initInfo.NumFramesInFlight = static_cast<int>(kMaximumAllocatorCount);
         // 게임의 실제 스왑체인 포맷을 써야 한다. HDR에서 흔한 R10G10B10A2/R16G16B16A16 등에
         // R8G8B8A8용 PSO를 제출하면 디버그 레이어 오류 또는 device removal이 날 수 있다.
         initInfo.RTVFormat = g_rtvFormat;
