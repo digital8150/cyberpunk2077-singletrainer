@@ -12,6 +12,7 @@
 #include "../framework.h"
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
+#include "../features/aimbot.h"
 #include "../ui/overlay.h"
 
 #include <MinHook.h>
@@ -290,6 +291,7 @@ namespace Hooks
 
         Overlay::Shutdown();
         CursorHook::Shutdown();
+        Aimbot::Shutdown();
         Game::EntityTracker::Shutdown();
         if (g_minHookInitialized)
         {

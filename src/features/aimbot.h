@@ -8,4 +8,5 @@ namespace Features
 namespace Aimbot
 {
     void DrawOverlay(const Features::AimbotSettings& settings);
+    void Shutdown();
 }

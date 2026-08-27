@@ -164,7 +164,7 @@ namespace Config
         settings.aimbot.targetPolice = ReadBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
         settings.aimbot.fovRadiusPixels =
             ReadFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels, 40.0f, 600.0f);
-        settings.aimbot.smoothing = ReadFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing, 1.0f, 30.0f);
+        settings.aimbot.smoothing = ReadFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing, 0.0f, 30.0f);
         settings.aimbot.maxDistanceMeters =
             ReadFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters, 10.0f, 300.0f);
 

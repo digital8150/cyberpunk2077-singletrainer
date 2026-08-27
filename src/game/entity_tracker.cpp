@@ -1,5 +1,6 @@
 #include "entity_tracker.h"
 #include "animation_data.h"
+#include "rtti_invoker.h"
 #include "signature_scanner.h"
 #include "../diagnostics.h"
 #include "../framework.h"
@@ -166,6 +167,8 @@ namespace
         EntityLayout* entity = nullptr;
         std::uint64_t entityId = 0;
         std::uint64_t sequence = 0;
+        Game::AnimationData::VisualData visual;
+        ULONGLONG visualUpdatedAt = 0;
     };
 
     constexpr std::size_t kMaxTrackedPuppets = 256;
@@ -416,6 +419,79 @@ namespace
         }
     }
 
+    bool ReadSlotPosition(const EntityLayout* entity, std::uint64_t slotName, float output[3])
+    {
+        constexpr std::uint64_t slotComponentName = Fnv1a64("entSlotComponent");
+        constexpr std::uint64_t getSlotTransformName = Fnv1a64("GetSlotTransform");
+        bool found = false;
+        ForEachComponent(entity, [&](std::byte* component) {
+            if (found)
+                return;
+            auto* type = Game::Rtti::NativeType(component);
+            if (!Game::Rtti::IsClassOrDerived(type, slotComponentName))
+                return;
+            Game::Rtti::Function* function = Game::Rtti::FindFunction(type, getSlotTransformName);
+            if (!function)
+                return;
+
+            WorldTransformLayout transform{};
+            bool result = false;
+            Game::Rtti::Argument arguments[] = {{&slotName}, {&transform}};
+            if (!Game::Rtti::Invoke(function, component, arguments, 2, &result) || !result)
+                return;
+
+            constexpr float fixedPointScale = 1.0f / static_cast<float>(2 << 16);
+            output[0] = static_cast<float>(transform.x) * fixedPointScale;
+            output[1] = static_cast<float>(transform.y) * fixedPointScale;
+            output[2] = static_cast<float>(transform.z) * fixedPointScale;
+            found = std::isfinite(output[0]) && std::isfinite(output[1]) && std::isfinite(output[2]) &&
+                    std::abs(output[0]) < 1000000.0f && std::abs(output[1]) < 1000000.0f &&
+                    std::abs(output[2]) < 1000000.0f;
+        });
+        return found;
+    }
+
+    void AddSkeletonSegment(Game::AnimationData::VisualData& visual, const float start[3], const float end[3])
+    {
+        if (visual.skeletonSegmentCount >= Game::AnimationData::kMaxSkeletonSegments)
+            return;
+        auto& segment = visual.skeletonSegments[visual.skeletonSegmentCount++];
+        memcpy(segment.start, start, sizeof(segment.start));
+        memcpy(segment.end, end, sizeof(segment.end));
+    }
+
+    void ReadCurrentPoseSlots(const EntityLayout* entity, Game::AnimationData::VisualData& visual)
+    {
+        struct PosePoint
+        {
+            bool valid = false;
+            float position[3]{};
+        };
+
+        PosePoint head, chest, hips, rightHand, leftLeg, rightLeg;
+        head.valid = ReadSlotPosition(entity, Fnv1a64("Head"), head.position);
+        chest.valid = ReadSlotPosition(entity, Fnv1a64("Chest"), chest.position);
+        hips.valid = ReadSlotPosition(entity, Fnv1a64("Hips"), hips.position);
+        rightHand.valid = ReadSlotPosition(entity, Fnv1a64("RightHand"), rightHand.position);
+        leftLeg.valid = ReadSlotPosition(entity, Fnv1a64("LegLeft"), leftLeg.position);
+        rightLeg.valid = ReadSlotPosition(entity, Fnv1a64("LegRight"), rightLeg.position);
+
+        visual.hasHeadPosition = head.valid;
+        if (head.valid)
+            memcpy(visual.headPosition, head.position, sizeof(visual.headPosition));
+        visual.skeletonSegmentCount = 0;
+        if (hips.valid && chest.valid)
+            AddSkeletonSegment(visual, hips.position, chest.position);
+        if (chest.valid && head.valid)
+            AddSkeletonSegment(visual, chest.position, head.position);
+        if (chest.valid && rightHand.valid)
+            AddSkeletonSegment(visual, chest.position, rightHand.position);
+        if (hips.valid && leftLeg.valid)
+            AddSkeletonSegment(visual, hips.position, leftLeg.position);
+        if (hips.valid && rightLeg.valid)
+            AddSkeletonSegment(visual, hips.position, rightLeg.position);
+    }
+
     bool IsDead(const EntityLayout* entity)
     {
         constexpr std::uint64_t corpseComponentNames[] = {
@@ -471,6 +547,8 @@ namespace
 
         if (!target)
             target = oldest;
+        if (target->entityId != entity->entityId)
+            *target = {};
         target->entity = entity;
         target->entityId = entity->entityId;
         target->sequence = ++g_puppetSequence;
@@ -482,7 +560,7 @@ namespace
         ReleaseSRWLockExclusive(&g_puppetListLock);
     }
 
-    bool TrySnapshot(const TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
+    bool TrySnapshot(TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
     {
         // Game streaming can free/reuse an entity independently of our list. Validate all identity data at the
         // point of use and contain a stale-pointer access; no raw pointer leaves this function.
@@ -507,8 +585,16 @@ namespace
             memcpy(snapshot.orientation, orientation, sizeof(orientation));
             snapshot.category = ClassifyNpc(entity);
             snapshot.isDead = IsDead(entity);
-            Game::AnimationData::ReadVisualData(snapshot.entityId, snapshot.position, snapshot.orientation,
-                                                snapshot.visual);
+            const ULONGLONG now = GetTickCount64();
+            if (tracked.visualUpdatedAt == 0 || now - tracked.visualUpdatedAt >= 33)
+            {
+                Game::AnimationData::VisualData refreshed;
+                Game::AnimationData::ReadVisualData(snapshot.entityId, snapshot.position, refreshed);
+                ReadCurrentPoseSlots(entity, refreshed);
+                tracked.visual = refreshed;
+                tracked.visualUpdatedAt = now;
+            }
+            snapshot.visual = tracked.visual;
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)

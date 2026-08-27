@@ -295,16 +295,16 @@ namespace Widgets
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_target_police", &settings.aimbot.targetPolice);
         FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
-        FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 1.0f, 30.0f, "%.1f");
+        FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
-        ImGui::TextDisabled("Hold right mouse while the menu is closed to aim.");
+        ImGui::TextDisabled("Hold right mouse to use native aim offset. Smoothing 0 is hard lock.");
         ImGui::Unindent(14.0f);
 
         ImGui::Separator();
         ImGui::TextWrapped(
             "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
-            "Distance uses camera-forward depth. Animation-system AABB and rig skeleton data are used when "
-            "available; health values and dynamic hostility are still pending.");
+            "Distance uses camera-forward depth. Animation-system AABB and live SlotComponent pose points are "
+            "used when available; health values and dynamic hostility are still pending.");
 
         ImGui::End();
     }

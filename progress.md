@@ -241,3 +241,19 @@
     동안 우클릭을 누르면 프레임률 독립 smoothing과 소수점 누적을 거쳐 상대 `SendInput`으로 조준함.
     PID 21768에서 실제 target ID, screen delta, depth를 기록하는 `aimbot active` 로그와 게임 응답 유지를
     확인. silent aim, 실제 health/stat pool, 동적 hostility는 아직 미구현.
+- **라이브 포즈 슬롯과 게임 네이티브 에임 오프셋으로 전환**:
+  - REDmod 원본 스크립트에서 `entSlotComponent::GetSlotTransform`, `gameITargetingSystem::LookAt`/
+    `BreakLookAt`, `AimRequest` 필드 구성을 확인하고, 함수 자체의 RTTI 파라미터 타입을 사용해 REDengine
+    함수를 호출하는 공용 `rtti_invoker`를 추가함. 기존 MetaRig transform은 현재 애니메이션 포즈가 아니라
+    T 포즈로 보이는 bind pose였으므로 스켈레톤 소스로 사용하지 않도록 제거함.
+  - NPC의 `Head`, `Chest`, `Hips`, `RightHand`, `LegLeft`, `LegRight` 슬롯 월드 transform을 33ms 캐시로
+    읽어 라이브 스켈레톤을 만들고, 실제 `Head` 위치를 에임 타겟으로 우선 사용함. PID 31280에서 실제 AABB
+    5개와 슬롯 기반 skeleton line 25개가 지속 갱신되고, RTTI internal execute 해석 뒤 게임이 정상 응답함을
+    확인함.
+  - 마우스 상대 이동/`SendInput` 경로를 완전히 제거하고 TargetingSystem의 게임 내부 `LookAt` 요청으로
+    교체함. 우클릭 동안 타겟을 유지하며 smoothing 0은 1ms duration/ease-in 없음으로 매 프레임 헤드 월드
+    위치에 강력 고정하고, 0보다 크면 duration 기반 게임 네이티브 보간을 사용함. 라이브 로그에서 같은
+    세션에 `mode=smooth`와 `mode=hard`가 실제 NPC 헤드 좌표로 호출되고 화면 오차가 수렴하는 것을 확인함.
+  - 조사 중 Present 경로에서 런타임 타입명을 추가로 문자열화한 일회성 진단은 게임을 하드 프리즈시켜 즉시
+    전부 제거했고, 재시작 후에는 숫자/포인터만 기록하는 최소 진단으로 검증함. `build-next` 후보와 정식
+    `build/bin/Release` 전체 빌드, `git diff --check`, 게임 응답을 모두 통과함.

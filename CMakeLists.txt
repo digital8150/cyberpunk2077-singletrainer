@@ -35,7 +35,9 @@ add_library(cp2077_trainer SHARED
     src/features/aimbot.cpp
     src/features/esp.cpp
     src/features/fps_counter.cpp
+    src/game/aim_assist.cpp
     src/game/animation_data.cpp
+    src/game/rtti_invoker.cpp
     src/game/signature_scanner.cpp
     src/game/entity_tracker.cpp
     src/game/projection.cpp

@@ -31,25 +31,10 @@ namespace
         float w;
     };
 
-    struct Quaternion
-    {
-        float x;
-        float y;
-        float z;
-        float w;
-    };
-
     struct Box
     {
         Vector4 minimum;
         Vector4 maximum;
-    };
-
-    struct QsTransform
-    {
-        Vector4 translation;
-        Quaternion rotation;
-        Vector4 scale;
     };
 
     struct DynArrayLayout
@@ -76,23 +61,12 @@ namespace
         HashMapNodeList nodeList;
     };
 
-    struct MetaRigLayout
-    {
-        DynArrayLayout boneTransforms;
-        DynArrayLayout parentIndices;
-        DynArrayLayout boneNames;
-    };
-
     struct AnimatedObjectLayout
     {
-        std::uint64_t metaRigId;
-        MetaRigLayout* metaRig;
-        void* metaRigInfo;
-        std::byte padding18[0xC0 - 0x18];
+        std::byte padding00[0xC0];
         Box objectBounds;
     };
 
-    static_assert(sizeof(QsTransform) == 0x30);
     static_assert(sizeof(HashMapLayout) == 0x28);
     static_assert(offsetof(AnimatedObjectLayout, objectBounds) == 0xC0);
 
@@ -103,7 +77,6 @@ namespace
         bool attempted = false;
         std::byte* animationSystem = nullptr;
         bool loggedBounds = false;
-        bool loggedSkeleton = false;
     };
 
     State g_state;
@@ -116,37 +89,6 @@ namespace
     float LengthSquared(float x, float y, float z)
     {
         return x * x + y * y + z * z;
-    }
-
-    Quaternion Normalize(Quaternion value)
-    {
-        const float lengthSquared = LengthSquared(value.x, value.y, value.z) + value.w * value.w;
-        if (!std::isfinite(lengthSquared) || lengthSquared < 0.0001f)
-            return {0.0f, 0.0f, 0.0f, 1.0f};
-        const float inverseLength = 1.0f / std::sqrt(lengthSquared);
-        return {value.x * inverseLength, value.y * inverseLength, value.z * inverseLength,
-                value.w * inverseLength};
-    }
-
-    Quaternion Multiply(const Quaternion& lhs, const Quaternion& rhs)
-    {
-        return {
-            lhs.w * rhs.x + lhs.x * rhs.w + lhs.y * rhs.z - lhs.z * rhs.y,
-            lhs.w * rhs.y - lhs.x * rhs.z + lhs.y * rhs.w + lhs.z * rhs.x,
-            lhs.w * rhs.z + lhs.x * rhs.y - lhs.y * rhs.x + lhs.z * rhs.w,
-            lhs.w * rhs.w - lhs.x * rhs.x - lhs.y * rhs.y - lhs.z * rhs.z,
-        };
-    }
-
-    void Rotate(const Quaternion& rotation, const float input[3], float output[3])
-    {
-        const Quaternion q = Normalize(rotation);
-        const float tx = 2.0f * (q.y * input[2] - q.z * input[1]);
-        const float ty = 2.0f * (q.z * input[0] - q.x * input[2]);
-        const float tz = 2.0f * (q.x * input[1] - q.y * input[0]);
-        output[0] = input[0] + q.w * tx + (q.y * tz - q.z * ty);
-        output[1] = input[1] + q.w * ty + (q.z * tx - q.x * tz);
-        output[2] = input[2] + q.w * tz + (q.x * ty - q.y * tx);
     }
 
     std::uint32_t HashEntityId(std::uint64_t entityId)
@@ -320,109 +262,14 @@ namespace
         return found;
     }
 
-    bool PointInsideBounds(const float point[3], const Box& bounds, float margin)
-    {
-        return point[0] >= bounds.minimum.x - margin && point[0] <= bounds.maximum.x + margin &&
-               point[1] >= bounds.minimum.y - margin && point[1] <= bounds.maximum.y + margin &&
-               point[2] >= bounds.minimum.z - margin && point[2] <= bounds.maximum.z + margin;
-    }
-
-    std::size_t BuildSkeleton(std::byte* bucket, std::uint32_t entryIndex, const float entityPosition[3],
-                              const float entityOrientation[4], const Box& bounds,
-                              Game::AnimationData::SkeletonSegment* output, std::size_t capacity)
-    {
-        auto* animatedObject = *reinterpret_cast<AnimatedObjectLayout**>(
-            bucket + kAnimatedObjectsOffset + static_cast<std::size_t>(entryIndex) * sizeof(void*));
-        MetaRigLayout* metaRig = animatedObject ? animatedObject->metaRig : nullptr;
-        if (!metaRig || !metaRig->boneTransforms.entries || !metaRig->parentIndices.entries)
-            return 0;
-
-        const std::uint32_t boneCount = metaRig->boneTransforms.size;
-        if (boneCount < 2 || boneCount > 512 || boneCount > metaRig->boneTransforms.capacity ||
-            metaRig->parentIndices.size < boneCount || metaRig->parentIndices.size > metaRig->parentIndices.capacity)
-        {
-            return 0;
-        }
-
-        const auto* transforms = static_cast<const QsTransform*>(metaRig->boneTransforms.entries);
-        const auto* parents = static_cast<const std::int16_t*>(metaRig->parentIndices.entries);
-        std::array<std::array<float, 3>, 512> modelPositions{};
-        std::array<Quaternion, 512> modelRotations{};
-        const Quaternion entityRotation = Normalize(
-            {entityOrientation[0], entityOrientation[1], entityOrientation[2], entityOrientation[3]});
-
-        for (std::uint32_t i = 0; i < boneCount; ++i)
-        {
-            const QsTransform& transform = transforms[i];
-            if (!IsFinite(transform.translation.x) || !IsFinite(transform.translation.y) ||
-                !IsFinite(transform.translation.z))
-            {
-                return 0;
-            }
-
-            const float local[3] = {transform.translation.x, transform.translation.y, transform.translation.z};
-            const std::int16_t parent = parents[i];
-            if (parent >= 0 && static_cast<std::uint32_t>(parent) < i)
-            {
-                float rotated[3]{};
-                Rotate(modelRotations[parent], local, rotated);
-                modelPositions[i] = {modelPositions[parent][0] + rotated[0],
-                                     modelPositions[parent][1] + rotated[1],
-                                     modelPositions[parent][2] + rotated[2]};
-                modelRotations[i] = Normalize(Multiply(modelRotations[parent], transform.rotation));
-            }
-            else
-            {
-                modelPositions[i] = {local[0], local[1], local[2]};
-                modelRotations[i] = Normalize(transform.rotation);
-            }
-        }
-
-        std::array<std::array<float, 3>, 512> worldPositions{};
-        std::size_t pointsInside = 0;
-        for (std::uint32_t i = 0; i < boneCount; ++i)
-        {
-            float rotated[3]{};
-            Rotate(entityRotation, modelPositions[i].data(), rotated);
-            worldPositions[i] = {entityPosition[0] + rotated[0], entityPosition[1] + rotated[1],
-                                 entityPosition[2] + rotated[2]};
-            pointsInside += PointInsideBounds(worldPositions[i].data(), bounds, 0.75f) ? 1u : 0u;
-        }
-
-        // Reject a rig layout that does not agree with the entity's independently-read animation bounds.
-        if (pointsInside * 2 < boneCount)
-            return 0;
-
-        std::size_t written = 0;
-        for (std::uint32_t i = 0; i < boneCount && written < capacity; ++i)
-        {
-            const std::int16_t parent = parents[i];
-            if (parent < 0 || static_cast<std::uint32_t>(parent) >= boneCount)
-                continue;
-            const auto& start = worldPositions[parent];
-            const auto& end = worldPositions[i];
-            const float lengthSquared = LengthSquared(end[0] - start[0], end[1] - start[1], end[2] - start[2]);
-            if (lengthSquared < 0.0025f || lengthSquared > 2.25f ||
-                !PointInsideBounds(start.data(), bounds, 0.75f) ||
-                !PointInsideBounds(end.data(), bounds, 0.75f))
-            {
-                continue;
-            }
-            std::copy(start.begin(), start.end(), output[written].start);
-            std::copy(end.begin(), end.end(), output[written].end);
-            ++written;
-        }
-        return written;
-    }
 }
 
 namespace Game::AnimationData
 {
-    bool ReadVisualData(std::uint64_t entityId, const float entityPosition[3], const float entityOrientation[4],
-                        VisualData& output)
+    bool ReadVisualData(std::uint64_t entityId, const float entityPosition[3], VisualData& output)
     {
         output = {};
-        if (!entityPosition || !entityOrientation)
+        if (!entityPosition)
             return false;
 
         __try
@@ -446,8 +293,9 @@ namespace Game::AnimationData
             output.boundsMaximum[0] = bounds.maximum.x;
             output.boundsMaximum[1] = bounds.maximum.y;
             output.boundsMaximum[2] = bounds.maximum.z;
-            output.skeletonSegmentCount = BuildSkeleton(bucket, entryIndex, entityPosition, entityOrientation, bounds,
-                                                        output.skeletonSegments, kMaxSkeletonSegments);
+            // MetaRig::boneTransforms contains the reference/bind pose. Live pose points are populated from
+            // SlotComponent::GetSlotTransform by the entity tracker instead.
+            output.skeletonSegmentCount = 0;
 
             if (!g_state.loggedBounds)
             {
@@ -457,12 +305,6 @@ namespace Game::AnimationData
                                  bounds.minimum.y, bounds.minimum.z, bounds.maximum.x, bounds.maximum.y,
                                  bounds.maximum.z);
                 g_state.loggedBounds = true;
-            }
-            if (output.skeletonSegmentCount > 0 && !g_state.loggedSkeleton)
-            {
-                Diagnostics::Log("animation skeleton resolved: entity=%016llX segments=%zu",
-                                 static_cast<unsigned long long>(entityId), output.skeletonSegmentCount);
-                g_state.loggedSkeleton = true;
             }
             return true;
         }
