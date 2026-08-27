@@ -28,8 +28,10 @@ namespace Game::Visibility
     void BeginFrame();
 
     // Returns the cached result immediately. A stale/unknown entry may enqueue a bounded request, but this call
-    // never invokes the engine query itself.
-    State Query(std::uint64_t entityId, const float camera[3], const float primary[3], const float secondary[3]);
+    // never invokes the engine query itself. `priority` puts the request at the head of the queue - the aimbot uses
+    // it so its single armed target does not wait behind the ESP's bulk requests for the whole visible entity list.
+    State Query(std::uint64_t entityId, const float camera[3], const float primary[3], const float secondary[3],
+                bool priority = false);
 
     Stats GetStats();
 

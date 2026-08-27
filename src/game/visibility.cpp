@@ -375,7 +375,8 @@ namespace Game::Visibility
         // Query work is budgeted by the game-main-tick hook, so the render thread only reads/enqueues cache state.
     }
 
-    State Query(std::uint64_t entityId, const float camera[3], const float primary[3], const float secondary[3])
+    State Query(std::uint64_t entityId, const float camera[3], const float primary[3], const float secondary[3],
+                bool priority)
     {
         if (!camera || !primary || entityId == 0 || !g_state.hookCreated.load(std::memory_order_acquire) ||
             !g_state.spatialQueriesSystem.load(std::memory_order_acquire) ||
@@ -399,7 +400,15 @@ namespace Game::Visibility
         {
             if (g_queueCount < kQueueSize)
             {
-                Request& request = g_queue[(g_queueHead + g_queueCount) % kQueueSize];
+                // 우선 요청은 큐 머리 앞쪽으로 넣는다. 큐가 가득 찼을 때는 기존과 동일하게 그냥 버려서
+                // pending 상태로 남는 항목이 생기지 않게 한다.
+                std::size_t slot = (g_queueHead + g_queueCount) % kQueueSize;
+                if (priority)
+                {
+                    g_queueHead = (g_queueHead + kQueueSize - 1) % kQueueSize;
+                    slot = g_queueHead;
+                }
+                Request& request = g_queue[slot];
                 request = {};
                 request.entityId = entityId;
                 for (unsigned i = 0; i < 3; ++i)

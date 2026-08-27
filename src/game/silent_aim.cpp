@@ -152,6 +152,7 @@ namespace
     {
         std::atomic_bool hookCreated{false};
         std::atomic_bool queueHookCreated{false};
+        std::atomic_bool crosshairCoreHookCreated{false};
         std::atomic_uint32_t listenerHooks{0};
         std::atomic_bool targetActive{false};
         std::atomic<float> targetX{0.0f};
@@ -347,6 +348,7 @@ namespace
             return false;
         }
         g_nativeCrosshairCoreTarget = coreTarget;
+        g_state.crosshairCoreHookCreated.store(true, std::memory_order_release);
         Diagnostics::Log("silent aim native crosshair core hook created: target=%p original=%p mutation=1",
                          coreTarget, reinterpret_cast<void*>(g_originalNativeCrosshairCore));
         return true;
@@ -968,10 +970,11 @@ namespace Game::SilentAim
                                            ListenerHookKind::Projectile) || created;
             }
             g_state.hookCreated.store(created, std::memory_order_release);
-            Diagnostics::Log("silent aim observation hooks created: producers=%u projectileListeners=%u "
-                             "weaponListenerHooks=0 queueHook=0 mutation=0",
+            Diagnostics::Log("silent aim hooks created: producers=%u projectileListeners=%u "
+                             "weaponListenerHooks=0 queueHook=0 crosshairCore=%u",
                              g_state.producerHooks.load(std::memory_order_relaxed),
-                             g_state.listenerHooks.load(std::memory_order_relaxed));
+                             g_state.listenerHooks.load(std::memory_order_relaxed),
+                             g_state.crosshairCoreHookCreated.load(std::memory_order_acquire) ? 1u : 0u);
             return created;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1009,6 +1012,7 @@ namespace Game::SilentAim
         DiagnosticsSnapshot result;
         result.hookCreated = g_state.hookCreated.load(std::memory_order_acquire);
         result.queueHookCreated = g_state.queueHookCreated.load(std::memory_order_acquire);
+        result.crosshairCoreHookCreated = g_state.crosshairCoreHookCreated.load(std::memory_order_acquire);
         result.listenerHooks = g_state.listenerHooks.load(std::memory_order_relaxed);
         result.producerHooks = g_state.producerHooks.load(std::memory_order_relaxed);
         result.callbacks = g_state.callbacks.load(std::memory_order_relaxed);
@@ -1052,6 +1056,7 @@ namespace Game::SilentAim
             MH_RemoveHook(g_nativeCrosshairCoreTarget);
         g_nativeCrosshairCoreTarget = nullptr;
         g_originalNativeCrosshairCore = nullptr;
+        g_state.crosshairCoreHookCreated.store(false, std::memory_order_release);
         const std::uint32_t producerCount = g_state.producerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < producerCount && index < kMaxProducerHooks; ++index)
         {

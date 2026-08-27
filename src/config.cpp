@@ -37,6 +37,8 @@ namespace
                lhs.esp.maxDistanceMeters == rhs.esp.maxDistanceMeters &&
                lhs.aimbot.enabled == rhs.aimbot.enabled &&
                lhs.aimbot.silentAim == rhs.aimbot.silentAim &&
+               lhs.aimbot.activationKey == rhs.aimbot.activationKey &&
+               lhs.aimbot.headlessDiagnostics == rhs.aimbot.headlessDiagnostics &&
                lhs.aimbot.drawFovCircle == rhs.aimbot.drawFovCircle &&
                lhs.aimbot.targetEnemies == rhs.aimbot.targetEnemies &&
                lhs.aimbot.targetPolice == rhs.aimbot.targetPolice &&
@@ -49,6 +51,13 @@ namespace
     bool ReadBool(const wchar_t* section, const wchar_t* key, bool fallback)
     {
         return GetPrivateProfileIntW(section, key, fallback ? 1 : 0, g_configPath) != 0;
+    }
+
+    unsigned int ReadKey(const wchar_t* section, const wchar_t* key, unsigned int fallback)
+    {
+        const UINT value = GetPrivateProfileIntW(section, key, static_cast<INT>(fallback), g_configPath);
+        // 0x00과 0xFF는 가상 키 코드가 아니다. 범위를 벗어나면 조용히 기본값으로 돌린다.
+        return value >= 0x01 && value <= 0xFE ? static_cast<unsigned int>(value) : fallback;
     }
 
     float ReadFloat(const wchar_t* section, const wchar_t* key, float fallback, float minimum, float maximum)
@@ -74,6 +83,13 @@ namespace
     bool WriteBool(const wchar_t* section, const wchar_t* key, bool value)
     {
         return WriteValue(section, key, value ? L"1" : L"0");
+    }
+
+    bool WriteKey(const wchar_t* section, const wchar_t* key, unsigned int value)
+    {
+        wchar_t text[16]{};
+        swprintf_s(text, L"%u", value);
+        return WriteValue(section, key, text);
     }
 
     bool WriteFloat(const wchar_t* section, const wchar_t* key, float value)
@@ -106,6 +122,8 @@ namespace
 
         ok &= WriteBool(L"aimbot", L"enabled", settings.aimbot.enabled);
         ok &= WriteBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
+        ok &= WriteKey(L"aimbot", L"activation_key", settings.aimbot.activationKey);
+        ok &= WriteBool(L"aimbot", L"headless_diagnostics", settings.aimbot.headlessDiagnostics);
         ok &= WriteBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         ok &= WriteBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         ok &= WriteBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
@@ -172,6 +190,9 @@ namespace Config
 
         settings.aimbot.enabled = ReadBool(L"aimbot", L"enabled", settings.aimbot.enabled);
         settings.aimbot.silentAim = ReadBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
+        settings.aimbot.activationKey = ReadKey(L"aimbot", L"activation_key", settings.aimbot.activationKey);
+        settings.aimbot.headlessDiagnostics =
+            ReadBool(L"aimbot", L"headless_diagnostics", settings.aimbot.headlessDiagnostics);
         settings.aimbot.drawFovCircle =
             ReadBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         settings.aimbot.targetEnemies = ReadBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);

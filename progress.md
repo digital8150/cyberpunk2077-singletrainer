@@ -559,3 +559,40 @@
   armed are frequent by design; one armed target reported `healthValid=0` (stat pool not yet resolved) and one had
   4,343 max health (likely a vehicle/boss-class puppet) — target filtering may want a health-pool validity check
   later. Crash-cause isolation for the retired effect-ray path is moot unless that path is ever needed again.
+
+## 2026-08-28 - Silent aim menu promotion, bindable activation key, prioritized visibility
+
+- **visible-only는 이미 두 모드 공유 경로에 있었다.** `Aimbot::RunFrame`의 타겟 선택 루프가 클래식/사일런트
+  분기보다 앞에 있어서 `aimbot.visibleOnly` 필터는 사일런트 에임에도 그대로 적용되고 있었다(`dd6f530`부터).
+  남아 있던 실제 구멍은 지연이었다: 시야 요청은 게임 메인 틱당 1건만 처리되는데(`kRequestsPerTick = 1`)
+  ESP가 켜져 있으면 화면의 모든 NPC 요청이 같은 64칸 큐를 먼저 채워서, 정작 조준 중인 대상의 가림 판정이
+  최대 1초까지 밀릴 수 있었다.
+  - `Game::Visibility::Query`에 `priority` 인자를 추가해 큐 머리 앞쪽에 넣도록 했다. 큐가 가득 차면 기존과
+    똑같이 버리기 때문에 `pending`으로 영영 남는 항목은 생기지 않는다.
+  - 에임봇은 FOV 서클 안에 있거나 이미 잠긴 대상만 우선 요청으로 넣는다. 화면 거리 계산을 시야 검사보다
+    앞으로 옮겨서 그 판단을 할 수 있게 순서만 바꿨고, 가려진 대상을 후보에서 빼는 동작과 캐시가 비었을 때
+    통과시키는 fail-open은 그대로다.
+- **사일런트 에임을 진단 모드에서 정식 메뉴 항목으로 승격.** 지금까지는 `aimbot.silentAim`이 켜지면
+  `Overlay::OnPresent`가 무조건 headless 경로로 빠져서 오버레이를 한 프레임도 그리지 않았다. 그런데 WndProc
+  훅은 오버레이 초기화 경로에서만 설치되므로, 설정 파일에 `silent_aim=1`이 저장된 상태로 주입하면 메뉴도
+  Insert 키도 죽어서 되돌릴 방법이 없었다(설정 파일 수동 편집 외에는).
+  - headless를 `aimbot.headlessDiagnostics`라는 별도 진단 토글로 분리하고, **오버레이가 한 번 초기화된 뒤,
+    메뉴가 닫혀 있을 때만** 적용하도록 했다. 이제 켜둔 채로도 Insert로 언제든 메뉴를 다시 열 수 있다.
+    DRED page fault 재현/격리가 필요하면 이 토글을 쓰면 된다.
+  - 반대로 사일런트 에임을 켠 상태에서는 이제 오버레이가 정상적으로 그려진다 — 즉 07:26 라이브 검증 때와
+    달리 ESP/FOV 서클 드로우가 같이 돌아간다. 렌더 쪽 크래시가 다시 나오면 먼저 이 토글로 격리할 것.
+- **활성화 키 바인딩.** `VK_RBUTTON` 하드코딩을 `aimbot.activationKey`(가상 키 코드, 기본 0x02 = 마우스 우클릭)로
+  바꾸고 `config.ini`의 `aimbot/activation_key`로 저장한다. 메뉴에는 누르면 다음 키를 잡는 바인딩 버튼을 추가했다.
+  모든 키가 한 번 떼어진 뒤부터 입력을 받아서 버튼을 누른 클릭 자체가 바인딩되지 않고, Escape는 취소,
+  Insert(메뉴)/End(언로드)는 후보에서 제외한다. 키 이름표는 직접 만든 ASCII 표를 쓴다 — `GetKeyNameTextA`는
+  현재 레이아웃의 ANSI 코드페이지(cp949) 문자열을 돌려줘서 UTF-8을 기대하는 ImGui에서 깨진다.
+- **메뉴 정리.** 에임봇 카드에 활성화 키 행과 현재 모드 기준 안내문(잡은 키 이름이 그대로 들어간다)을 넣고,
+  `mutation is disabled` / `mutation off` 같은 사실과 다른 문구를 걷어냈다(크로스헤어 코어 리다이렉트는 이미
+  실동작 중이다). 프로듀서 카운터 덤프는 `Silent aim diagnostics` 접이식 헤더 안으로 넣고, 항상 보이는 줄은
+  시야 캐시 상태(visible/occluded/dropped)와 사일런트 에임 상태(후크 여부/리다이렉트/거부) 두 줄만 남겼다.
+  `DiagnosticsSnapshot`에 `crosshairCoreHookCreated`를 추가해 UI가 후크 성공 여부를 직접 읽는다.
+- Release 빌드는 `/W4`에서 경고 없이 통과했고 `git diff --check`도 깨끗하다. 라이브 검증은 아직 —
+  이전 세션의 PID 2620이 옛 DLL을 물고 있어 `build/bin/Release/cp2077_trainer.dll` 링크가 막혀 있었고
+  (`build-next`로 빌드해 확인), 메뉴/키 바인딩/사일런트 조준은 사람이 직접 조작해야 확인되는 항목이다.
+  다음 세션에서 `--unload` 후 재빌드·재주입해 (1) 사일런트 에임 켠 상태로 메뉴가 뜨는지, (2) 바인딩한 키로
+  조준이 걸리는지, (3) visible-only를 켰을 때 엄폐 중인 적이 후보에서 빠지는지 확인할 것.

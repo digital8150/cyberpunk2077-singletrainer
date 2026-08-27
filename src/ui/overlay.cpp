@@ -515,8 +515,7 @@ namespace
         if (!g_headlessSilentAim)
         {
             g_headlessSilentAim = true;
-            g_swapChain = swapChain;
-            Diagnostics::Log("headless silent-aim diagnostics enabled: no D3D12 overlay submissions");
+            Diagnostics::Log("headless diagnostics frame active: no D3D12 overlay submissions");
         }
         Features::UpdateHeadless(static_cast<float>(desc.BufferDesc.Width),
                                  static_cast<float>(desc.BufferDesc.Height));
@@ -529,13 +528,22 @@ namespace Overlay
     {
         std::lock_guard<std::mutex> renderGuard(g_renderMutex);
 
-        // DRED twice reported a page fault in a freed game resource while this injected overlay was submitting on
-        // a queue inferred after swap-chain creation. Keep silent-aim target selection alive on the CPU, but make
-        // no GPU submissions until the owning presentation queue can be captured authoritatively.
-        if (swapChain && Features::GetSettings().aimbot.silentAim)
+        // DRED가 두 번, 스왑체인 생성 뒤에 추론한 큐로 제출하던 중 해제된 게임 리소스에서 page fault를
+        // 보고했다. 그 경로를 격리해 재현/검증할 수 있도록, GPU 제출 없이 타겟 선택만 CPU에서 돌리는 진단
+        // 모드를 남겨둔다. 예전에는 사일런트 에임을 켜기만 하면 무조건 이 경로로 빠져 메뉴가 통째로
+        // 사라졌고, WndProc 훅이 오버레이 초기화 경로에서만 걸리므로 Insert까지 죽어서 설정을 되돌릴
+        // 방법이 없었다. 이제는 별도 진단 토글로 분리하고, 오버레이가 한 번 초기화된 뒤 메뉴가 닫혀 있을
+        // 때만 적용한다.
+        if (swapChain && g_initialized && swapChain == g_swapChain && !g_visible &&
+            Features::GetSettings().aimbot.headlessDiagnostics)
         {
             RunHeadlessSilentAimFrame(swapChain);
             return;
+        }
+        if (g_headlessSilentAim)
+        {
+            g_headlessSilentAim = false;
+            Diagnostics::Log("headless diagnostics frame ended: overlay submissions resumed");
         }
 
         // 렌더 큐를 아직 못 잡았으면(ExecuteCommandLists가 이번 세션에서 아직 한 번도 안 불렸으면) 초기화도

@@ -24,12 +24,18 @@ namespace Features
     struct AimbotSettings
     {
         bool enabled = false;
-        // Selects a target for the observation-gated fire/effect path without moving the camera/controller.
+        // 카메라/컨트롤러를 움직이지 않고, 게임 자체 크로스헤어 코어의 direction만 타겟 쪽으로 바꾼다.
         bool silentAim = false;
+        // 에임을 걸어둘 키의 가상 키 코드. 기본값 0x02는 VK_RBUTTON(마우스 오른쪽 버튼).
+        unsigned int activationKey = 0x02;
+        // 진단용: 오버레이 GPU 제출을 멈추고 타겟 선택만 CPU에서 돌린다. 메뉴가 닫혀 있고 오버레이가 이미
+        // 한 번 초기화된 뒤에만 적용되므로, 켜둔 채로도 Insert로 메뉴를 다시 열 수 있다.
+        bool headlessDiagnostics = false;
         bool drawFovCircle = true;
         bool targetEnemies = true;
         bool targetPolice = false;
-        // ESP의 visibilityCheck와 같은 게임 메인 틱 쿼리를 사용하므로 기본값도 같이 꺼둔다.
+        // ESP의 visibilityCheck와 같은 게임 메인 틱 시야 캐시를 쓴다. 켜면 벽 뒤 대상은 클래식/사일런트
+        // 양쪽 모두에서 타겟 후보에서 빠진다. 기본값은 ESP 쪽과 같이 꺼둔다.
         bool visibleOnly = false;
         float fovRadiusPixels = 180.0f;
         float smoothing = 8.0f;

@@ -8,6 +8,8 @@ namespace Game::SilentAim
     {
         bool hookCreated = false;
         bool queueHookCreated = false;
+        // The only mutation path: the native crosshair core's caller-visible direction out-parameter.
+        bool crosshairCoreHookCreated = false;
         std::uint32_t listenerHooks = 0;
         std::uint32_t producerHooks = 0;
         std::uint64_t callbacks = 0;
@@ -27,12 +29,13 @@ namespace Game::SilentAim
         std::uint64_t nativeCrosshairCoreRedirects = 0;
     };
 
-    // Resolves observation-only effect/attack/crosshair native handlers plus projectile ShootEvent listeners.
-    // All mutation remains separately gated off until live call-path and payload validation succeeds.
+    // Resolves the native crosshair core (the single mutation path) plus observation-only effect/attack/crosshair
+    // native handlers and projectile ShootEvent listeners. Projectile and effect mutation stay gated off.
     // Call after MH_Initialize and before MH_EnableHook(MH_ALL_HOOKS).
     bool CreateHook();
 
-    // Present publishes only plain coordinates. Native observation callbacks use freshness as an early filter.
+    // Present publishes only plain coordinates. Native callbacks use freshness as an early filter, so a target
+    // that stops being published (out of FOV, dead, or occluded while visibleOnly is on) stops being redirected.
     void PublishTarget(const float worldTarget[3], bool active);
     void ClearTarget();
     DiagnosticsSnapshot GetDiagnostics();

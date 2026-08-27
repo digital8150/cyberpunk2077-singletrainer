@@ -108,7 +108,9 @@ namespace Aimbot
         Game::Projection::ScreenPoint lockedPoint;
         float lockedWorld[3]{};
         bool lockedTargetAvailable = false;
-        const bool activationHeld = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        const int activationKey = static_cast<int>(settings.activationKey);
+        const bool activationHeld =
+            activationKey > 0 && activationKey < 0xFF && (GetAsyncKeyState(activationKey) & 0x8000) != 0;
         float camera[3]{};
         const bool visibleOnly = settings.visibleOnly && Game::Projection::GetCameraPosition(camera);
 
@@ -127,20 +129,25 @@ namespace Aimbot
                 continue;
             }
 
-            // 벽 뒤 대상으로 시점이 끌려가지 않도록, ESP와 같은 시야 캐시로 가려진 대상은 제외한다.
+            const float deltaX = point.x - center.x;
+            const float deltaY = point.y - center.y;
+            const float screenDistance = std::sqrt(deltaX * deltaX + deltaY * deltaY);
+
+            // 클래식 모드에선 시점이, 사일런트 모드에선 탄도가 벽 뒤 대상으로 끌려가지 않도록 ESP와 같은
+            // 시야 캐시로 가려진 대상을 후보에서 뺀다. 캐시가 비어 있으면(Unknown) 통과시키는 fail-open이
+            // 그대로 유지되고, FOV 안이거나 이미 잠긴 대상만 우선 요청으로 넣어 ESP의 대량 요청 뒤로
+            // 밀리지 않게 한다.
             if (visibleOnly)
             {
                 const float torso[3] = {puppet.position[0], puppet.position[1], puppet.position[2] + 1.1f};
-                if (Game::Visibility::Query(puppet.entityId, camera, aimWorld, torso) ==
+                const bool priority =
+                    screenDistance <= settings.fovRadiusPixels || puppet.entityId == g_lockedEntityId;
+                if (Game::Visibility::Query(puppet.entityId, camera, aimWorld, torso, priority) ==
                     Game::Visibility::State::Occluded)
                 {
                     continue;
                 }
             }
-
-            const float deltaX = point.x - center.x;
-            const float deltaY = point.y - center.y;
-            const float screenDistance = std::sqrt(deltaX * deltaX + deltaY * deltaY);
             if (activationHeld && puppet.entityId == g_lockedEntityId)
             {
                 lockedTargetAvailable = true;

@@ -4,6 +4,7 @@
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
 #include "../game/silent_aim.h"
+#include "../game/visibility.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
@@ -21,6 +22,110 @@ namespace Widgets
             const float t = std::clamp(value, 0.0f, 1.0f);
             return t < 0.5f ? 4.0f * t * t * t
                             : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+        }
+
+        // GetKeyNameTextA는 현재 키보드 레이아웃의 ANSI 코드페이지(한글이면 cp949) 문자열을 돌려주는데
+        // ImGui는 UTF-8을 기대해서 깨진다. 그래서 직접 ASCII 이름표를 만든다.
+        const char* KeyName(unsigned int key)
+        {
+            static char text[16]{};
+            switch (key)
+            {
+            case VK_LBUTTON: return "Mouse L";
+            case VK_RBUTTON: return "Mouse R";
+            case VK_MBUTTON: return "Mouse M";
+            case VK_XBUTTON1: return "Mouse 4";
+            case VK_XBUTTON2: return "Mouse 5";
+            case VK_BACK: return "Backspace";
+            case VK_TAB: return "Tab";
+            case VK_RETURN: return "Enter";
+            case VK_SHIFT: case VK_LSHIFT: return "Shift";
+            case VK_RSHIFT: return "R shift";
+            case VK_CONTROL: case VK_LCONTROL: return "Ctrl";
+            case VK_RCONTROL: return "R ctrl";
+            case VK_MENU: case VK_LMENU: return "Alt";
+            case VK_RMENU: return "R alt";
+            case VK_CAPITAL: return "Caps lock";
+            case VK_SPACE: return "Space";
+            case VK_PRIOR: return "Page up";
+            case VK_NEXT: return "Page down";
+            case VK_HOME: return "Home";
+            case VK_LEFT: return "Left";
+            case VK_UP: return "Up";
+            case VK_RIGHT: return "Right";
+            case VK_DOWN: return "Down";
+            case VK_DELETE: return "Delete";
+            default: break;
+            }
+            if ((key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z'))
+            {
+                text[0] = static_cast<char>(key);
+                text[1] = '\0';
+                return text;
+            }
+            if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9)
+            {
+                snprintf(text, sizeof(text), "Numpad %u", key - VK_NUMPAD0);
+                return text;
+            }
+            if (key >= VK_F1 && key <= VK_F24)
+            {
+                snprintf(text, sizeof(text), "F%u", key - VK_F1 + 1);
+                return text;
+            }
+            snprintf(text, sizeof(text), "0x%02X", key);
+            return text;
+        }
+
+        // 키 바인딩 버튼. 버튼을 누른 그 클릭이 그대로 바인딩되지 않도록 모든 키가 한 번 떼어진 뒤부터
+        // 입력을 받는다. Escape는 취소, Insert(메뉴)와 End(언로드)는 트레이너가 이미 쓰는 키라 제외한다.
+        bool KeyBindButton(unsigned int* key)
+        {
+            static bool capturing = false;
+            static bool armed = false;
+
+            const char* label = capturing ? (armed ? "Press a key..." : "Release keys...") : KeyName(*key);
+            // 라벨이 상태에 따라 바뀌므로 ID는 라벨과 분리해 고정한다.
+            ImGui::PushID("aimbot_activation_key");
+            const bool pressed = ImGui::Button(label, ImVec2(140.0f, 0.0f));
+            ImGui::PopID();
+            if (pressed && !capturing)
+            {
+                capturing = true;
+                armed = false;
+            }
+            if (!capturing)
+                return false;
+
+            bool changed = false;
+            bool anyDown = false;
+            for (int virtualKey = 0x01; virtualKey <= 0xFE; ++virtualKey)
+            {
+                if (virtualKey == VK_INSERT || virtualKey == VK_END)
+                    continue;
+                if ((GetAsyncKeyState(virtualKey) & 0x8000) == 0)
+                    continue;
+                anyDown = true;
+                if (!armed)
+                    break;
+                if (virtualKey != VK_ESCAPE)
+                {
+                    *key = static_cast<unsigned int>(virtualKey);
+                    changed = true;
+                }
+                capturing = false;
+                break;
+            }
+            if (!anyDown)
+                armed = true;
+            return changed;
+        }
+
+        void Hint(const char* text)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("%s", text);
+            ImGui::PopStyleColor();
         }
     }
 
@@ -316,6 +421,9 @@ namespace Widgets
         ImGui::TextUnformatted("Silent aim");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_silent", &settings.aimbot.silentAim);
+        ImGui::TextUnformatted("Activation key");
+        ImGui::SameLine(330.0f);
+        KeyBindButton(&settings.aimbot.activationKey);
         ImGui::TextUnformatted("Draw FOV circle");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_fov_circle", &settings.aimbot.drawFovCircle);
@@ -332,20 +440,53 @@ namespace Widgets
         if (!settings.aimbot.silentAim)
             FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
-        ImGui::TextDisabled(settings.aimbot.silentAim
-                                ? "Hold right mouse to arm producer diagnostics; mutation is disabled."
-                                : "Hold right mouse for direct camera rotation. Smoothing 0 has no easing.");
-        ImGui::TextDisabled("Silent path: %s | producer hooks %u | projectile hooks %u | mutation off",
-                            silentStats.producerHooks > 0 ? "observing" : "unavailable",
-                            silentStats.producerHooks, silentStats.listenerHooks);
-        ImGui::TextDisabled("Calls: effect %llu | start %llu | prepare %llu | crosshair %llu/%llu | projectile %llu/%llu",
-                            static_cast<unsigned long long>(silentStats.effectRuns),
-                            static_cast<unsigned long long>(silentStats.attackStarts),
-                            static_cast<unsigned long long>(silentStats.attackPrepares),
-                            static_cast<unsigned long long>(silentStats.crosshairCalls),
-                            static_cast<unsigned long long>(silentStats.defaultCrosshairCalls),
-                            static_cast<unsigned long long>(silentStats.projectileEvents),
-                            static_cast<unsigned long long>(silentStats.localPlayerEvents));
+
+        char activationHint[128]{};
+        snprintf(activationHint, sizeof(activationHint),
+                 settings.aimbot.silentAim
+                     ? "Hold %s: the shot follows the target while the camera stays where you point it."
+                     : "Hold %s to rotate the camera onto the target. Smoothing 0 has no easing.",
+                 KeyName(settings.aimbot.activationKey));
+        Hint(activationHint);
+        if (settings.aimbot.visibleOnly)
+        {
+            Hint("Only visible targets shares the ESP visibility cache, so targets behind cover are skipped in "
+                 "both modes. An entity with no cached result yet is still allowed through.");
+        }
+
+        const Game::Visibility::Stats visibilityStats = Game::Visibility::GetStats();
+        ImGui::TextDisabled("Visibility cache: %s | visible %llu | occluded %llu | dropped %llu",
+                            visibilityStats.available ? "ready" : "unavailable",
+                            static_cast<unsigned long long>(visibilityStats.visible),
+                            static_cast<unsigned long long>(visibilityStats.occluded),
+                            static_cast<unsigned long long>(visibilityStats.dropped));
+        ImGui::TextDisabled("Silent aim: %s | redirects %llu | rejected %llu",
+                            silentStats.crosshairCoreHookCreated ? "crosshair core hooked" : "unavailable",
+                            static_cast<unsigned long long>(silentStats.nativeCrosshairCoreRedirects),
+                            static_cast<unsigned long long>(silentStats.rejectedShots));
+
+        if (ImGui::CollapsingHeader("Silent aim diagnostics"))
+        {
+            ImGui::TextUnformatted("Headless (skip overlay draw)");
+            ImGui::SameLine(430.0f);
+            ToggleSwitch("##aimbot_headless", &settings.aimbot.headlessDiagnostics);
+            Hint("Diagnostics only: stops every overlay GPU submission while the menu is closed, so a render-side "
+                 "crash can be ruled out without losing target selection. Insert still reopens the menu.");
+            ImGui::TextDisabled("Crosshair core: calls %llu | redirects %llu",
+                                static_cast<unsigned long long>(silentStats.nativeCrosshairCoreCalls),
+                                static_cast<unsigned long long>(silentStats.nativeCrosshairCoreRedirects));
+            ImGui::TextDisabled("Observation hooks: producer %u | projectile %u",
+                                silentStats.producerHooks, silentStats.listenerHooks);
+            ImGui::TextDisabled("Calls: effect %llu | start %llu | prepare %llu | crosshair %llu/%llu | "
+                                "projectile %llu/%llu",
+                                static_cast<unsigned long long>(silentStats.effectRuns),
+                                static_cast<unsigned long long>(silentStats.attackStarts),
+                                static_cast<unsigned long long>(silentStats.attackPrepares),
+                                static_cast<unsigned long long>(silentStats.crosshairCalls),
+                                static_cast<unsigned long long>(silentStats.defaultCrosshairCalls),
+                                static_cast<unsigned long long>(silentStats.projectileEvents),
+                                static_cast<unsigned long long>(silentStats.localPlayerEvents));
+        }
         ImGui::Unindent(14.0f);
 
         ImGui::Separator();
