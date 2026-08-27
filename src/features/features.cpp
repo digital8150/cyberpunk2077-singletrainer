@@ -3,6 +3,7 @@
 #include "esp.h"
 #include "fps_counter.h"
 #include "../config.h"
+#include "../game/visibility.h"
 
 namespace
 {
@@ -19,6 +20,8 @@ namespace Features
     void DrawOverlay()
     {
         Config::Update();
+        // ESP와 에임봇이 같은 시야 캐시를 공유하므로 프레임 예산은 여기서 한 번만 초기화한다.
+        Game::Visibility::BeginFrame();
         Esp::DrawOverlay(g_settings.esp);
         Aimbot::DrawOverlay(g_settings.aimbot);
         FpsCounter::Draw(g_settings.showFps);

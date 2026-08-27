@@ -460,6 +460,13 @@ namespace
         memcpy(segment.end, end, sizeof(segment.end));
     }
 
+    void AddPosePoint(Game::AnimationData::VisualData& visual, const float position[3])
+    {
+        if (visual.posePointCount >= Game::AnimationData::kMaxPosePoints)
+            return;
+        memcpy(visual.posePoints[visual.posePointCount++], position, sizeof(visual.posePoints[0]));
+    }
+
     void ReadCurrentPoseSlots(const EntityLayout* entity, Game::AnimationData::VisualData& visual)
     {
         struct PosePoint
@@ -479,6 +486,13 @@ namespace
         visual.hasHeadPosition = head.valid;
         if (head.valid)
             memcpy(visual.headPosition, head.position, sizeof(visual.headPosition));
+        visual.posePointCount = 0;
+        const PosePoint* const ordered[] = {&head, &chest, &hips, &rightHand, &leftLeg, &rightLeg};
+        for (const PosePoint* point : ordered)
+        {
+            if (point->valid)
+                AddPosePoint(visual, point->position);
+        }
         visual.skeletonSegmentCount = 0;
         if (hips.valid && chest.valid)
             AddSkeletonSegment(visual, hips.position, chest.position);
@@ -840,6 +854,30 @@ namespace Game::EntityTracker
     void UpdateNativeHighlights(bool enabled, bool showCivilians, bool showEnemies, bool showPolice,
                                 bool showUnclassified, bool hideDead)
     {
+        // 2026-08-27 실측: 카테고리를 켜서 shouldHighlight가 처음 true가 되는 순간 게임이 크래시했다.
+        // 이 경로는 추정 오프셋(0x1E0/0x1E8)으로 얻은 render proxy를 Present(렌더) 스레드에서 직접
+        // 조작한다. off 파라미터로는 20초 넘게 무사했고 on 파라미터에서 죽었으며, per-entity SEH로도
+        // 잡히지 않았으므로 렌더 상태를 망가뜨리는 지연 크래시로 보인다.
+        //
+        // 올바른 방법은 RedHotTools가 엔티티에 대해 쓰는 방식 - `entRenderHighlightEvent`를 만들어
+        // 엔티티의 `QueueEvent`에 넣고 게임 스레드가 처리하게 하는 것 - 이다. 그 재구현 전까지는
+        // 이 경로를 실행하지 않는다.
+        static bool loggedDisabled = false;
+        if (!loggedDisabled)
+        {
+            Diagnostics::Log("native highlight disabled: render-proxy path crashed when first enabled; "
+                             "needs the entRenderHighlightEvent/QueueEvent rework");
+            loggedDisabled = true;
+        }
+        (void)enabled;
+        (void)showCivilians;
+        (void)showEnemies;
+        (void)showPolice;
+        (void)showUnclassified;
+        (void)hideDead;
+        return;
+
+#if 0
         if (!enabled && !g_nativeHighlightActive)
             return;
         if (!ResolveHighlightFunctions())
@@ -897,5 +935,6 @@ namespace Game::EntityTracker
             Diagnostics::Log("native highlight %s: entities=%zu", enabled ? "enabled" : "disabled", touched);
             g_nativeHighlightActive = enabled;
         }
+#endif
     }
 }

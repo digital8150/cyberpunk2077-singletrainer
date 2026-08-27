@@ -257,3 +257,74 @@
   - 조사 중 Present 경로에서 런타임 타입명을 추가로 문자열화한 일회성 진단은 게임을 하드 프리즈시켜 즉시
     전부 제거했고, 재시작 후에는 숫자/포인터만 기록하는 최소 진단으로 검증함. `build-next` 후보와 정식
     `build/bin/Release` 전체 빌드, `git diff --check`, 게임 응답을 모두 통과함.
+- **ESP 박스 축소(카메라 정면 박스)와 시야(가림) 검사 도입, 그리고 동기 physics 쿼리 프리즈 사고**:
+  - 사용자가 (1) AABB 박스가 실루엣보다 크고 (2) visible check가 필요하다고 지적함.
+  - 박스: 기존에는 애니메이션 시스템 AABB의 8꼭짓점을 투영해 화면 min/max를 잡았는데, 이 AABB는 무기·
+    모션까지 감싸는 데다 월드 축 정렬이라 대상이 축과 어긋나면 항상 실루엣보다 넓어졌다. 이미 읽고 있던
+    라이브 슬롯 포즈(Head/Chest/Hips/RightHand/LegLeft/LegRight)를 `VisualData::posePoints`로 보관하고,
+    엔티티 중심 기준 수평 반경(+0.16m, 0.26~1.10m clamp)과 발밑~머리+0.14m 높이로 실린더를 만든 다음
+    카메라-대상 방향에 수직인 축으로만 폭을 잡는 4점 투영으로 화면 사각형을 만들도록 교체함. 애니메이션
+    AABB는 포즈 슬롯이 없을 때의 fallback으로만 남기고 수평 반경도 사람 크기로 제한함. PID 31280 라이브
+    로그에서 화면 안 대상 전부가 포즈 기반(`poseBounds=10/10`)으로 잡히는 것을 확인함.
+  - 카메라 월드 좌표: RedHotTools가 쓰는 `gameICameraSystem` vtable +0x218 `GetCameraPosition(Vector3&)`을
+    1순위로 하고, 실패 시 RTTI `GetActiveCameraWorldTransform`을 대체 경로로 둠. 카메라 지점을 다시
+    투영하면 전방 깊이가 0에 가까워야 한다는 성질로 자체 검증함. 2.31 실측에서 vtable 경로가 통과
+    (`camera position source: virtual slot`).
+  - 시야 검사: 게임 스크립트가 NPC 시야 판정에 쓰는 `gameISpatialQueriesSystem::SyncRaycastByQueryPreset`
+    + `'Sight Blocker'` preset을 그대로 사용. RTTI 파라미터 수(6개)를 실행 시 검증해 시그니처가 다르면
+    스스로 비활성화하도록 함. 라이브에서 `raycast=00007FF75614FDB0 params=6 preset=Sight Blocker`로
+    해석되고 실제로 가림/비가림이 갈리는 것까지 확인함.
+  - **사고**: 이 동기 레이캐스트를 Present(렌더) 스레드에서 호출했더니 약 19초/1,158캐스트 뒤 게임이 하드
+    프리즈했다. 게임 스레드의 물리 스텝과 렌더 스레드가 서로를 기다리는 교착으로 보이며, `--unload`도
+    콜백이 빠져나오지 못해 실패했다(프로세스 강제 종료 필요). **동기 physics/씬 쿼리는 Present 경로에서
+    절대 호출하지 않는다**를 규칙으로 삼는다.
+  - 재설계: 시야 검사를 전용 워커 스레드로 옮기고 `Query()`는 절대 블로킹하지 않도록 함. 렌더 스레드는
+    캐시된 결과(없으면 Unknown=보이는 것으로 취급)를 즉시 쓰고 갱신 요청만 링버퍼에 넣는다. 워커는 wake
+    이벤트당 최대 8회 캐스트, idle 10ms. 워커가 게임 호출 안에서 빠져나오지 못하면 `Shutdown()`이 false를
+    반환하고 훅 종료를 중단해 코드가 언로드되지 않게 함.
+  - 자기 몸 오탐 대응: 조준점이 대상 몸 안쪽이라 preset에 NPC 콜라이더가 있으면 자기 자신을 맞는다.
+    고정 pull-back 대신 `physicsTraceResult.position`까지의 거리를 대상 거리와 비교해 0.55m 이내면
+    가려지지 않은 것으로 판정하도록 바꿈.
+  - 프리즈 이력 때문에 `esp.visibility_check`와 `aimbot.visible_only` 기본값은 꺼짐으로 두고 메뉴에서
+    켜도록 함. 가려진 대상은 지우지 않고 알파를 낮춰 그리며, `hide_occluded`를 켜면 완전히 숨긴다.
+  - 정식 `build/bin/Release` 전체 Release 빌드가 `/W4`에서도 경고 없이 통과. 재설계본의 라이브 검증은
+    게임 재시작 후로 남아 있다.
+  - **두 번째 사고 — 네이티브 하이라이트 크래시**: 위 재설계본을 주입한 뒤 사용자가 메뉴에서 `Civilians`를
+    켜자마자 게임이 크래시했다. 원인은 오늘 작업분이 아니라 기존 `native highlight` 기능이었다.
+    저장된 설정이 `native_highlight=1`, `show_civilians=0`이었고 해당 세션에 enemy/police가 0명이어서
+    `shouldHighlight=true`가 된 적이 한 번도 없었다. 즉 시빌리언을 켠 그 프레임이 하이라이트 on 경로의
+    최초 실행이었다. off 파라미터로는 20초 넘게 멀쩡했고 on 파라미터에서 죽었으며, 엔티티별 SEH로도
+    잡히지 않아 렌더 상태를 깨뜨리는 지연 크래시로 보인다. 이 경로는 추정 오프셋(0x1E0/0x1E8)으로 얻은
+    render proxy를 Present(렌더) 스레드에서 직접 조작한다.
+  - RedHotTools를 다시 확인하니 **엔티티에 대해서는 render proxy를 직접 건드리지 않는다**:
+    `entRenderHighlightEvent`를 만들어 `entity->QueueEvent(...)`로 넣고 게임 스레드가 처리하게 한다
+    (`WorldInspector::SetEntityHighlightEffect`). proxy 직접 조작은 world node instance 전용이며
+    노드 타입마다 오프셋이 다르다. 재구현 전까지 `UpdateNativeHighlights`는 진입 즉시 로그 한 줄만 남기고
+    아무 것도 하지 않도록 막았고(`#if 0`으로 기존 경로 보존), 메뉴 라벨에도 비활성 상태를 표시했다.
+    사용자 config는 임의로 고치지 않았다.
+  - 정리된 규칙: **Present(렌더) 스레드에서 게임 서브시스템(physics 쿼리, render proxy)을 직접 호출하지
+    않는다.** 필요한 일은 워커 스레드로 비동기화하거나 게임 자체 이벤트 큐에 넣는다.
+- **Visibility 동기 physics 호출을 게임 메인 틱으로 이전하고 라이브 안정화 확인**:
+  - 전용 워커 버전도 게임이 소유하지 않은 임의 스레드에서 REDengine의 동기 spatial query를 호출한다는
+    근본 위험이 남아 있었다. 실제 워커 버전 세션은 약 4,561캐스트 뒤 `CrashInfo.json`을 남겼으므로,
+    네이티브 LookAt 에임을 원인으로 단정하지 않고 visibility 실행 컨텍스트를 다시 조사했다.
+  - CET/RED4ext의 실제 구현을 기준으로 CET가 `red::GameAppRunningState::OnTick` 주소 해시
+    `3592689218`을 훅해 Lua `onUpdate`를 실행한다는 점을 확인했다. 같은 OnTick을 MinHook으로 체인 훅하고,
+    visibility의 `SyncRaycastByQueryPreset`은 이 게임 메인 틱에서만 호출하도록 Luna worker가 구현했다.
+    기존 worker/event/join 경로는 제거했다.
+  - Present의 `Query()`는 캐시 조회와 bounded queue 등록만 수행한다. OnTick은 틱당 요청 1개를 꺼내
+    1차 레이캐스트를 실행하고, 가려졌을 때만 보조 지점으로 최대 1회 더 검사한다. 캐시 갱신 간격은 500ms,
+    큐 용량은 64이며, 게임 함수를 호출하는 동안 내부 mutex를 잡지 않는다. 종료 시 전체 훅을 먼저 끄고
+    진입 중 콜백이 빠져나온 다음 visibility 상태를 정리한다.
+  - PID 10908 라이브 검증에서 OnTick 주소 `0x00007FF7526233C4`, 원본 trampoline
+    `0x00007FF751BB0F80`, 메인 틱 thread id `22364`를 확인했고 spatial query resolver가 같은 틱에서
+    성공했다. 이동 중 snapshot이 18~32개로 갱신되고 enemy/police/civilian 등 새 대상이 계속 들어왔으며,
+    visibility의 clear/blocked 카운터가 모두 증가하고 ESP와 native LookAt 에임이 동시에 작동했다.
+    사용자가 실제 이동 및 안정화를 확인했고 프로세스는 계속 응답했으며, `CrashInfo.json` 시각도 이전
+    크래시인 19:23:29에서 바뀌지 않았다.
+  - 대상 변동이 큰 구간에는 bounded queue의 drop 누계가 약 95,939까지 증가했지만 큐는 이후 0까지
+    정상적으로 소진됐고 프리즈나 크래시는 발생하지 않았다. 이는 안전한 backpressure로 동작하지만,
+    중복 요청 제거와 갱신 스케줄 최적화는 후속 성능 개선 후보로 남긴다.
+  - 최종적으로 `inject.py --unload` 안전 종료도 통과했다. 로그에서 훅 비활성화 뒤 visibility 상태가
+    `casts=25423 visible=4541 occluded=10279 dropped=95939`로 정리되고 `hook shutdown finished`,
+    `safe unload checks passed` 순서가 기록됐으며, DLL 모듈이 빠진 뒤에도 게임 프로세스는 응답 상태였다.

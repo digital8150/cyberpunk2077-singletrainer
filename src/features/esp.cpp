@@ -3,6 +3,7 @@
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
 #include "../game/projection.h"
+#include "../game/visibility.h"
 
 #include <imgui.h>
 
@@ -40,62 +41,129 @@ namespace Esp
             }
         }
 
-        bool ProjectBounds(const Game::AnimationData::VisualData& visual, const ImGuiIO& io, ImVec2& minimum,
-                           ImVec2& maximum, float& depth)
+        // 실제 사람 실루엣에 맞춘 값. 애니메이션 시스템 AABB는 무기/모션까지 감싸느라 눈에 띄게 크다.
+        constexpr float kHorizontalMarginMeters = 0.16f;
+        constexpr float kMinimumRadiusMeters = 0.26f;
+        constexpr float kMaximumRadiusMeters = 1.10f;
+        constexpr float kHeadClearanceMeters = 0.14f;
+        constexpr float kFootClearanceMeters = 0.04f;
+        constexpr float kFallbackHeightMeters = 1.80f;
+
+        // 월드 공간에서의 대상 실린더. 화면 사각형은 여기서 만든다.
+        struct WorldExtent
         {
-            if (!visual.hasBounds)
-                return false;
+            float centerX = 0.0f;
+            float centerY = 0.0f;
+            float bottomZ = 0.0f;
+            float topZ = 0.0f;
+            float radius = kMinimumRadiusMeters;
+            bool fromPose = false;
+        };
+
+        WorldExtent BuildWorldExtent(const Game::EntityTracker::PuppetSnapshot& puppet)
+        {
+            const Game::AnimationData::VisualData& visual = puppet.visual;
+            WorldExtent extent;
+            extent.centerX = puppet.position[0];
+            extent.centerY = puppet.position[1];
+            extent.bottomZ = puppet.position[2];
+            extent.topZ = puppet.position[2] + kFallbackHeightMeters;
+
+            if (visual.posePointCount > 0)
+            {
+                extent.fromPose = true;
+                float radius = 0.0f;
+                float lowest = puppet.position[2];
+                float highest = puppet.position[2];
+                for (std::size_t i = 0; i < visual.posePointCount; ++i)
+                {
+                    const float* point = visual.posePoints[i];
+                    const float offsetX = point[0] - extent.centerX;
+                    const float offsetY = point[1] - extent.centerY;
+                    radius = (std::max)(radius, std::sqrt(offsetX * offsetX + offsetY * offsetY));
+                    lowest = (std::min)(lowest, point[2]);
+                    highest = (std::max)(highest, point[2]);
+                }
+                extent.radius = std::clamp(radius + kHorizontalMarginMeters, kMinimumRadiusMeters,
+                                           kMaximumRadiusMeters);
+                extent.bottomZ = lowest - kFootClearanceMeters;
+                extent.topZ = (visual.hasHeadPosition ? visual.headPosition[2] : highest) + kHeadClearanceMeters;
+            }
+            else if (visual.hasBounds)
+            {
+                // 포즈 슬롯이 없을 때만 애니메이션 AABB를 쓰되, 수평 반경은 사람 크기로 제한한다.
+                const float halfX = (visual.boundsMaximum[0] - visual.boundsMinimum[0]) * 0.5f;
+                const float halfY = (visual.boundsMaximum[1] - visual.boundsMinimum[1]) * 0.5f;
+                extent.centerX = (visual.boundsMinimum[0] + visual.boundsMaximum[0]) * 0.5f;
+                extent.centerY = (visual.boundsMinimum[1] + visual.boundsMaximum[1]) * 0.5f;
+                extent.radius = std::clamp((std::min)(halfX, halfY), kMinimumRadiusMeters, kMaximumRadiusMeters);
+                extent.bottomZ = visual.boundsMinimum[2];
+                extent.topZ = visual.boundsMaximum[2];
+            }
+
+            if (!(extent.topZ > extent.bottomZ))
+                extent.topZ = extent.bottomZ + kFallbackHeightMeters;
+            return extent;
+        }
+
+        // 카메라를 향한 사각형을 만든다. 월드 AABB의 8꼭짓점을 투영하면 대상이 월드 축과 어긋나 있을 때
+        // 항상 실루엣보다 넓어지므로, 카메라-대상 방향에 수직인 축으로만 폭을 잡는다.
+        bool ProjectFacingBox(const WorldExtent& extent, const float camera[3], bool hasCamera,
+                              const ImGuiIO& io, ImVec2& minimum, ImVec2& maximum, float& depth, bool& behind)
+        {
+            float rightX = 1.0f;
+            float rightY = 0.0f;
+            if (hasCamera)
+            {
+                const float toTargetX = extent.centerX - camera[0];
+                const float toTargetY = extent.centerY - camera[1];
+                const float length = std::sqrt(toTargetX * toTargetX + toTargetY * toTargetY);
+                if (length > 0.05f)
+                {
+                    rightX = -toTargetY / length;
+                    rightY = toTargetX / length;
+                }
+            }
+
+            const float middleZ = (extent.bottomZ + extent.topZ) * 0.5f;
+            const float samples[4][3] = {
+                {extent.centerX, extent.centerY, extent.bottomZ},
+                {extent.centerX, extent.centerY, extent.topZ},
+                {extent.centerX + rightX * extent.radius, extent.centerY + rightY * extent.radius, middleZ},
+                {extent.centerX - rightX * extent.radius, extent.centerY - rightY * extent.radius, middleZ},
+            };
 
             minimum = ImVec2((std::numeric_limits<float>::max)(), (std::numeric_limits<float>::max)());
             maximum = ImVec2(-(std::numeric_limits<float>::max)(), -(std::numeric_limits<float>::max)());
             depth = 0.0f;
-            for (unsigned corner = 0; corner < 8; ++corner)
+            behind = false;
+            for (const auto& sample : samples)
             {
-                const float world[3] = {
-                    (corner & 1) ? visual.boundsMaximum[0] : visual.boundsMinimum[0],
-                    (corner & 2) ? visual.boundsMaximum[1] : visual.boundsMinimum[1],
-                    (corner & 4) ? visual.boundsMaximum[2] : visual.boundsMinimum[2],
-                };
                 Game::Projection::ScreenPoint point;
-                if (!Game::Projection::WorldToScreen(world, io.DisplaySize.x, io.DisplaySize.y, point) ||
-                    point.behind)
-                {
+                if (!Game::Projection::WorldToScreen(sample, io.DisplaySize.x, io.DisplaySize.y, point))
                     return false;
+                if (point.behind)
+                {
+                    behind = true;
+                    depth = point.depth;
+                    return true;
                 }
                 minimum.x = (std::min)(minimum.x, point.x);
                 minimum.y = (std::min)(minimum.y, point.y);
                 maximum.x = (std::max)(maximum.x, point.x);
                 maximum.y = (std::max)(maximum.y, point.y);
-                depth += point.depth;
+                depth += point.depth * 0.25f;
             }
-            depth /= 8.0f;
-            return maximum.x > minimum.x && maximum.y > minimum.y;
+
+            const float height = maximum.y - minimum.y;
+            return height >= 2.0f && height <= io.DisplaySize.y * 4.0f && maximum.x > minimum.x;
         }
 
-        bool ProjectFallbackBox(const Game::EntityTracker::PuppetSnapshot& puppet, const ImGuiIO& io,
-                                ImVec2& minimum, ImVec2& maximum, float& depth, bool& behind)
+        ImU32 Fade(ImU32 color, float factor)
         {
-            const float headWorld[3] = {puppet.position[0], puppet.position[1], puppet.position[2] + 1.8f};
-            Game::Projection::ScreenPoint feet;
-            Game::Projection::ScreenPoint head;
-            if (!Game::Projection::WorldToScreen(puppet.position, io.DisplaySize.x, io.DisplaySize.y, feet) ||
-                !Game::Projection::WorldToScreen(headWorld, io.DisplaySize.x, io.DisplaySize.y, head))
-            {
-                return false;
-            }
-            behind = feet.behind || head.behind;
-            depth = feet.depth;
-            if (behind)
-                return true;
-
-            const float height = std::abs(feet.y - head.y);
-            if (height < 3.0f || height > io.DisplaySize.y * 2.0f)
-                return false;
-            const float centerX = (feet.x + head.x) * 0.5f;
-            const float width = height * 0.42f;
-            minimum = ImVec2(centerX - width * 0.5f, (std::min)(feet.y, head.y));
-            maximum = ImVec2(centerX + width * 0.5f, (std::max)(feet.y, head.y));
-            return true;
+            const float alpha = static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFF) * factor;
+            return (color & ~IM_COL32_A_MASK) |
+                   (static_cast<ImU32>(std::clamp(alpha, 0.0f, 255.0f)) << IM_COL32_A_SHIFT);
         }
 
         std::size_t DrawSkeleton(const Game::AnimationData::VisualData& visual, const ImGuiIO& io,
@@ -149,6 +217,11 @@ namespace Esp
         const ImGuiIO& io = ImGui::GetIO();
         ImDrawList* drawList = ImGui::GetBackgroundDrawList();
         constexpr ImU32 outline = IM_COL32(0, 0, 0, 220);
+        float camera[3]{};
+        const bool hasCamera = Game::Projection::GetCameraPosition(camera);
+        const bool visibilityCheck = settings.visibilityCheck && hasCamera;
+        std::size_t occludedCount = 0;
+        std::size_t unknownVisibilityCount = 0;
         std::size_t categorizedCount = 0;
         std::size_t civilianCount = 0;
         std::size_t enemyCount = 0;
@@ -184,14 +257,14 @@ namespace Esp
             ImVec2 maximum;
             float distance = 0.0f;
             bool behind = false;
-            const bool usedRealBounds = ProjectBounds(puppet.visual, io, minimum, maximum, distance);
-            if (!usedRealBounds && !ProjectFallbackBox(puppet, io, minimum, maximum, distance, behind))
+            const WorldExtent extent = BuildWorldExtent(puppet);
+            if (!ProjectFacingBox(extent, camera, hasCamera, io, minimum, maximum, distance, behind))
                 continue;
             ++projectedCount;
             if (behind)
                 continue;
             ++frontCount;
-            realBoundsCount += usedRealBounds ? 1u : 0u;
+            realBoundsCount += extent.fromPose ? 1u : 0u;
             distance = (std::max)(0.0f, distance);
             minimumForwardDepth = (std::min)(minimumForwardDepth, distance);
             maximumForwardDepth = (std::max)(maximumForwardDepth, distance);
@@ -209,39 +282,65 @@ namespace Esp
             {
                 continue;
             }
+
+            Game::Visibility::State visibility = Game::Visibility::State::Unknown;
+            if (visibilityCheck)
+            {
+                const float* head = puppet.visual.hasHeadPosition ? puppet.visual.headPosition : nullptr;
+                const float body[3] = {extent.centerX, extent.centerY,
+                                       (extent.bottomZ + extent.topZ) * 0.5f};
+                visibility = Game::Visibility::Query(puppet.entityId, camera, body, head);
+                occludedCount += visibility == Game::Visibility::State::Occluded ? 1u : 0u;
+                unknownVisibilityCount += visibility == Game::Visibility::State::Unknown ? 1u : 0u;
+            }
+            const bool occluded = visibility == Game::Visibility::State::Occluded;
+            if (occluded && settings.hideOccluded)
+                continue;
             ++drawnCount;
+
+            // 가려진 대상은 지우지 않고 흐리게 그려서 "벽 뒤"임을 바로 구분할 수 있게 한다.
+            const float fade = occluded ? 0.42f : 1.0f;
+            const ImU32 color = Fade(style.color, fade);
+            const ImU32 shadow = Fade(outline, fade);
 
             if (settings.boundingBoxes)
             {
                 drawList->AddRect(ImVec2(minimum.x - 1.0f, minimum.y - 1.0f),
-                                  ImVec2(maximum.x + 1.0f, maximum.y + 1.0f), outline, 2.0f, 3.0f,
+                                  ImVec2(maximum.x + 1.0f, maximum.y + 1.0f), shadow, 2.0f, 3.0f,
                                   ImDrawFlags_None);
-                drawList->AddRect(minimum, maximum, style.color, 2.0f, 1.4f, ImDrawFlags_None);
+                drawList->AddRect(minimum, maximum, color, 2.0f, 1.4f, ImDrawFlags_None);
             }
             if (settings.skeleton && puppet.visual.skeletonSegmentCount > 0)
-                skeletonLineCount += DrawSkeleton(puppet.visual, io, drawList, style.color, outline);
+                skeletonLineCount += DrawSkeleton(puppet.visual, io, drawList, color, shadow);
 
             char label[64]{};
             snprintf(label, sizeof(label), "%s  %.0fm%s", style.label, distance,
                      puppet.isDead ? "  DEAD" : "");
-            drawList->AddText(ImVec2(minimum.x, minimum.y - ImGui::GetFontSize() - 2.0f), outline, label);
-            drawList->AddText(ImVec2(minimum.x + 1.0f, minimum.y - ImGui::GetFontSize() - 3.0f), style.color,
-                              label);
+            drawList->AddText(ImVec2(minimum.x, minimum.y - ImGui::GetFontSize() - 2.0f), shadow, label);
+            drawList->AddText(ImVec2(minimum.x + 1.0f, minimum.y - ImGui::GetFontSize() - 3.0f), color, label);
         }
 
         const ULONGLONG now = GetTickCount64();
         if ((settings.enabled || diagnosticsWindows < 3) && now - lastDiagnosticsTick >= 3000)
         {
             const float minimumDepth = frontCount > 0 ? minimumForwardDepth : 0.0f;
+            const Game::Visibility::Stats visibilityStats = Game::Visibility::GetStats();
             Diagnostics::Log(
                 "ESP diagnostics: snapshots=%zu categories[civilian=%zu enemy=%zu police=%zu other=%zu] "
-                "dead=%zu categorized=%zu categoryEnabled=%zu projected=%zu front=%zu realBounds=%zu "
+                "dead=%zu categorized=%zu categoryEnabled=%zu projected=%zu front=%zu poseBounds=%zu "
                 "skeletonLines=%zu depthRange=[%.2f,%.2f] maxDistance=%.1f distanceRejected=%zu "
-                "withinDistance=%zu drawn=%zu enabled=%d",
+                "withinDistance=%zu drawn=%zu enabled=%d camera=%d "
+                "visibility[on=%d available=%d occluded=%zu unknown=%zu casts=%llu clear=%llu blocked=%llu "
+                "dropped=%llu]",
                 count, civilianCount, enemyCount, policeCount, unclassifiedCount, deadCount, categorizedCount,
                 categoryEnabledCount, projectedCount, frontCount, realBoundsCount, skeletonLineCount, minimumDepth,
                 maximumForwardDepth, settings.maxDistanceMeters, distanceRejectedCount, withinDistanceCount,
-                drawnCount, settings.enabled ? 1 : 0);
+                drawnCount, settings.enabled ? 1 : 0, hasCamera ? 1 : 0, visibilityCheck ? 1 : 0,
+                visibilityStats.available ? 1 : 0, occludedCount, unknownVisibilityCount,
+                static_cast<unsigned long long>(visibilityStats.casts),
+                static_cast<unsigned long long>(visibilityStats.visible),
+                static_cast<unsigned long long>(visibilityStats.occluded),
+                static_cast<unsigned long long>(visibilityStats.dropped));
             lastDiagnosticsTick = now;
             ++diagnosticsWindows;
         }

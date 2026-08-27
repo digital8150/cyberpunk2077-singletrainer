@@ -131,6 +131,14 @@ namespace Game::Rtti
         return nullptr;
     }
 
+    std::size_t ParameterCount(const Function* opaqueFunction)
+    {
+        const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
+        if (!function || function->params.size > function->params.capacity || function->params.size > 24)
+            return 0;
+        return function->params.size;
+    }
+
     bool Invoke(Function* opaqueFunction, void* context, const Argument* arguments, std::size_t argumentCount,
                 void* result)
     {

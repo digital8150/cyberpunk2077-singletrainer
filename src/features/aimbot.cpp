@@ -5,6 +5,7 @@
 #include "../game/aim_assist.h"
 #include "../game/entity_tracker.h"
 #include "../game/projection.h"
+#include "../game/visibility.h"
 #include "../ui/overlay.h"
 
 #include <imgui.h>
@@ -104,6 +105,8 @@ namespace Aimbot
         float lockedWorld[3]{};
         bool lockedTargetAvailable = false;
         const bool activationHeld = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        float camera[3]{};
+        const bool visibleOnly = settings.visibleOnly && Game::Projection::GetCameraPosition(camera);
 
         for (std::size_t i = 0; i < count; ++i)
         {
@@ -118,6 +121,17 @@ namespace Aimbot
                 point.behind || point.depth <= 0.0f || point.depth > settings.maxDistanceMeters)
             {
                 continue;
+            }
+
+            // 벽 뒤 대상으로 시점이 끌려가지 않도록, ESP와 같은 시야 캐시로 가려진 대상은 제외한다.
+            if (visibleOnly)
+            {
+                const float torso[3] = {puppet.position[0], puppet.position[1], puppet.position[2] + 1.1f};
+                if (Game::Visibility::Query(puppet.entityId, camera, aimWorld, torso) ==
+                    Game::Visibility::State::Occluded)
+                {
+                    continue;
+                }
             }
 
             const float deltaX = point.x - center.x;

@@ -12,6 +12,7 @@
 #include "../framework.h"
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
+#include "../game/visibility.h"
 #include "../features/aimbot.h"
 #include "../ui/overlay.h"
 
@@ -244,6 +245,8 @@ namespace Hooks
 
         // 게임 주소 훅은 선택 사항이다. 실패해도 렌더 오버레이는 계속 사용할 수 있다.
         Game::EntityTracker::CreateHook();
+        // Visibility is optional: its synchronous physics work is drained from the game-main-tick hook.
+        Game::Visibility::CreateHook();
         CursorHook::CreateHooks();
 
         status = MH_EnableHook(MH_ALL_HOOKS);
@@ -276,6 +279,13 @@ namespace Hooks
         if (!HookLifecycle::WaitForCallbacks(5000))
         {
             Diagnostics::Log("hook shutdown aborted: detour callbacks did not drain within 5000 ms");
+            return false;
+        }
+
+        // All hooks are disabled and drained before clearing main-tick visibility state.
+        if (!Game::Visibility::Shutdown())
+        {
+            Diagnostics::Log("hook shutdown aborted: visibility callbacks did not drain");
             return false;
         }
 

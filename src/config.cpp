@@ -27,6 +27,8 @@ namespace
                lhs.esp.healthBars == rhs.esp.healthBars &&
                lhs.esp.nativeHighlight == rhs.esp.nativeHighlight &&
                lhs.esp.hideDead == rhs.esp.hideDead &&
+               lhs.esp.visibilityCheck == rhs.esp.visibilityCheck &&
+               lhs.esp.hideOccluded == rhs.esp.hideOccluded &&
                lhs.esp.showCivilians == rhs.esp.showCivilians &&
                lhs.esp.showEnemies == rhs.esp.showEnemies &&
                lhs.esp.showPolice == rhs.esp.showPolice &&
@@ -36,6 +38,7 @@ namespace
                lhs.aimbot.drawFovCircle == rhs.aimbot.drawFovCircle &&
                lhs.aimbot.targetEnemies == rhs.aimbot.targetEnemies &&
                lhs.aimbot.targetPolice == rhs.aimbot.targetPolice &&
+               lhs.aimbot.visibleOnly == rhs.aimbot.visibleOnly &&
                lhs.aimbot.fovRadiusPixels == rhs.aimbot.fovRadiusPixels &&
                lhs.aimbot.smoothing == rhs.aimbot.smoothing &&
                lhs.aimbot.maxDistanceMeters == rhs.aimbot.maxDistanceMeters;
@@ -90,6 +93,8 @@ namespace
         ok &= WriteBool(L"esp", L"health_bars", settings.esp.healthBars);
         ok &= WriteBool(L"esp", L"native_highlight", settings.esp.nativeHighlight);
         ok &= WriteBool(L"esp", L"hide_dead", settings.esp.hideDead);
+        ok &= WriteBool(L"esp", L"visibility_check", settings.esp.visibilityCheck);
+        ok &= WriteBool(L"esp", L"hide_occluded", settings.esp.hideOccluded);
         ok &= WriteBool(L"esp", L"show_civilians", settings.esp.showCivilians);
         ok &= WriteBool(L"esp", L"show_enemies", settings.esp.showEnemies);
         ok &= WriteBool(L"esp", L"show_police", settings.esp.showPolice);
@@ -100,6 +105,7 @@ namespace
         ok &= WriteBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         ok &= WriteBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         ok &= WriteBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
+        ok &= WriteBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
         ok &= WriteFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels);
         ok &= WriteFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing);
         ok &= WriteFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters);
@@ -150,6 +156,8 @@ namespace Config
         settings.esp.healthBars = ReadBool(L"esp", L"health_bars", settings.esp.healthBars);
         settings.esp.nativeHighlight = ReadBool(L"esp", L"native_highlight", settings.esp.nativeHighlight);
         settings.esp.hideDead = ReadBool(L"esp", L"hide_dead", settings.esp.hideDead);
+        settings.esp.visibilityCheck = ReadBool(L"esp", L"visibility_check", settings.esp.visibilityCheck);
+        settings.esp.hideOccluded = ReadBool(L"esp", L"hide_occluded", settings.esp.hideOccluded);
         settings.esp.showCivilians = ReadBool(L"esp", L"show_civilians", settings.esp.showCivilians);
         settings.esp.showEnemies = ReadBool(L"esp", L"show_enemies", settings.esp.showEnemies);
         settings.esp.showPolice = ReadBool(L"esp", L"show_police", settings.esp.showPolice);
@@ -162,6 +170,7 @@ namespace Config
             ReadBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
         settings.aimbot.targetEnemies = ReadBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
         settings.aimbot.targetPolice = ReadBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
+        settings.aimbot.visibleOnly = ReadBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
         settings.aimbot.fovRadiusPixels =
             ReadFloat(L"aimbot", L"fov_radius_pixels", settings.aimbot.fovRadiusPixels, 40.0f, 600.0f);
         settings.aimbot.smoothing = ReadFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing, 0.0f, 30.0f);

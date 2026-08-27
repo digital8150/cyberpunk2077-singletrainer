@@ -28,6 +28,10 @@ namespace Game::Rtti
     bool IsClassOrDerived(const Class* type, std::uint64_t nameHash);
     Function* FindFunction(const Class* type, std::uint64_t functionNameHash);
 
+    // Reflected parameter count, including optional and out parameters. Invoke() requires an exact match, so
+    // callers that hardcode a signature can verify it against the running build first.
+    std::size_t ParameterCount(const Function* function);
+
     // Invokes a reflected REDengine function using its own parameter type descriptors.
     // The caller owns argument/result storage and must keep it alive for the duration of the call.
     bool Invoke(Function* function, void* context, const Argument* arguments, std::size_t argumentCount,

@@ -245,12 +245,18 @@ namespace Widgets
         ImGui::TextUnformatted("Health bars");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_health", &settings.esp.healthBars);
-        ImGui::TextUnformatted("Native highlight");
+        ImGui::TextDisabled("Native highlight (disabled - crashes)");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_native", &settings.esp.nativeHighlight);
         ImGui::TextUnformatted("Hide dead NPCs");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##esp_hide_dead", &settings.esp.hideDead);
+        ImGui::TextUnformatted("Visibility check");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_visibility", &settings.esp.visibilityCheck);
+        ImGui::TextUnformatted("Hide occluded NPCs");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_hide_occluded", &settings.esp.hideOccluded);
         ImGui::Spacing();
         ImGui::TextUnformatted("Civilians");
         ImGui::SameLine(430.0f);
@@ -294,6 +300,9 @@ namespace Widgets
         ImGui::TextUnformatted("Target police");
         ImGui::SameLine(430.0f);
         ToggleSwitch("##aimbot_target_police", &settings.aimbot.targetPolice);
+        ImGui::TextUnformatted("Only visible targets");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_visible_only", &settings.aimbot.visibleOnly);
         FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
         FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
@@ -303,8 +312,11 @@ namespace Widgets
         ImGui::Separator();
         ImGui::TextWrapped(
             "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
-            "Distance uses camera-forward depth. Animation-system AABB and live SlotComponent pose points are "
-            "used when available; health values and dynamic hostility are still pending.");
+            "Distance uses camera-forward depth. Boxes are built from live SlotComponent pose points and face "
+            "the camera; the animation-system AABB is only a fallback. Visibility check raycasts the game's own "
+            "'Sight Blocker' preset from the camera on a worker thread and dims occluded targets - it is off by "
+            "default because those physics queries share locks with the game's own physics step. Health values "
+            "and dynamic hostility are still pending.");
 
         ImGui::End();
     }
