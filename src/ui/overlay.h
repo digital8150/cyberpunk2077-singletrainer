@@ -12,6 +12,8 @@ namespace Overlay
     // ResizeBuffers 훅에서 호출 — 다음 OnPresent에서 렌더 타겟을 다시 만들도록 상태를 리셋한다.
     void OnResizeBuffers(IDXGISwapChain3* swapChain);
 
+    // Stop new WndProc callbacks before the hook lifecycle waits for in-flight callbacks to drain.
+    bool BeginShutdown();
     void Shutdown();
 
     bool IsVisible();

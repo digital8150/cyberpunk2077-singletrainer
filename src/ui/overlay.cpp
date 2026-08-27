@@ -9,6 +9,8 @@
 #include "widgets.h"
 #include "../framework.h"
 #include "../diagnostics.h"
+#include "../features/features.h"
+#include "../hooks/hook_lifecycle.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
@@ -38,6 +40,7 @@ namespace
     HWND g_hwnd = nullptr;
     IDXGISwapChain3* g_swapChain = nullptr;  // 이 인스턴스 외의 보조 스왑체인 Present는 무시한다.
     WNDPROC g_originalWndProc = nullptr;
+    bool g_wndProcRestored = false;
     bool g_imguiContextCreated = false;
     bool g_win32BackendInitialized = false;
     bool g_dx12BackendInitialized = false;
@@ -142,6 +145,11 @@ namespace
 
     LRESULT CALLBACK WndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
+        HookLifecycle::CallbackGuard callback;
+        WNDPROC originalWndProc = g_originalWndProc;
+        if (HookLifecycle::IsShuttingDown())
+            return CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam);
+
         if (msg == WM_KEYDOWN && wParam == VK_INSERT)
         {
             g_visible = !g_visible;
@@ -162,7 +170,7 @@ namespace
                 return true;
         }
 
-        return CallWindowProcW(g_originalWndProc, hwnd, msg, wParam, lParam);
+        return CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam);
     }
 
     bool CreateRenderTargets(IDXGISwapChain3* swapChain)
@@ -188,9 +196,10 @@ namespace
 
     void ReleaseOverlayResources(bool waitForGpu)
     {
-        if (g_hwnd && g_originalWndProc)
+        if (g_hwnd && g_originalWndProc && !g_wndProcRestored)
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
         g_originalWndProc = nullptr;
+        g_wndProcRestored = false;
 
         if (waitForGpu && g_fence && g_fenceEvent && g_fenceLastSignaled > 0)
         {
@@ -410,6 +419,7 @@ namespace
             Diagnostics::Log("SetWindowLongPtrW(WndProc) failed: error=%lu", GetLastError());
             return false;
         }
+        g_wndProcRestored = false;
 
         g_swapChain = swapChain;
         Diagnostics::Log("overlay initialization completed");
@@ -441,14 +451,13 @@ namespace Overlay
             g_initialized = true;
         }
 
-        if (!g_visible)
-            return;
-
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        Widgets::DrawMainMenu();
+        Features::DrawOverlay();
+        if (g_visible)
+            Widgets::DrawMainMenu();
 
         ImGui::Render();
 
@@ -548,6 +557,26 @@ namespace Overlay
         Diagnostics::Log("ResizeBuffers intercepted; releasing overlay resources");
         ReleaseOverlayResources(true);
         g_renderingDisabled = false;
+    }
+
+    bool BeginShutdown()
+    {
+        // WndProc is not a MinHook detour. Restore the window callback separately, but keep the saved function
+        // pointer alive until HookLifecycle confirms that callbacks which already entered this DLL have returned.
+        if (g_hwnd && g_originalWndProc && !g_wndProcRestored)
+        {
+            SetLastError(ERROR_SUCCESS);
+            const LONG_PTR previous =
+                SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
+            if (previous == 0 && GetLastError() != ERROR_SUCCESS)
+            {
+                Diagnostics::Log("failed to restore WndProc during shutdown: error=%lu", GetLastError());
+                return false;
+            }
+            g_wndProcRestored = true;
+        }
+        g_visible = false;
+        return true;
     }
 
     void Shutdown()

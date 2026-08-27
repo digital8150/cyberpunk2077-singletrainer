@@ -6,17 +6,50 @@
 #include "diagnostics.h"
 #include "hooks/d3d12_hook.h"
 
+#include <cstdio>
+
 namespace
 {
     HMODULE g_hModule = nullptr;
 
     DWORD WINAPI MainThread(LPVOID parameter)
     {
-        Diagnostics::Initialize(static_cast<HMODULE>(parameter));
+        const HMODULE module = static_cast<HMODULE>(parameter);
+        Diagnostics::Initialize(module);
         Diagnostics::Log("initialization thread started");
         Hooks::Initialize();
-        Diagnostics::Log("initialization thread finished");
-        return 0;
+
+        wchar_t unloadEventName[96]{};
+        swprintf_s(unloadEventName, L"Local\\cp2077_trainer_unload_%lu", GetCurrentProcessId());
+        HANDLE unloadEvent = CreateEventW(nullptr, TRUE, FALSE, unloadEventName);
+        if (unloadEvent)
+            Diagnostics::Log("initialization finished; press End or signal the unload event to unload safely");
+        else
+            Diagnostics::Log("CreateEventW(unload) failed: error=%lu; End hotkey remains available", GetLastError());
+
+        bool endWasDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+        for (;;)
+        {
+            const bool endIsDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+            const bool eventSignaled = unloadEvent && WaitForSingleObject(unloadEvent, 0) == WAIT_OBJECT_0;
+            if ((endIsDown && !endWasDown) || eventSignaled)
+                break;
+            endWasDown = endIsDown;
+            Sleep(50);
+        }
+
+        Diagnostics::Log("safe unload requested");
+        while (!Hooks::Shutdown())
+        {
+            Diagnostics::Log("safe unload is waiting for hook cleanup; retrying in 1000 ms");
+            Sleep(1000);
+        }
+
+        Diagnostics::Log("safe unload checks passed; releasing DLL");
+        if (unloadEvent)
+            CloseHandle(unloadEvent);
+        Diagnostics::Shutdown();
+        FreeLibraryAndExitThread(module, 0);
     }
 }
 
@@ -32,8 +65,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/)
         break;
 
     case DLL_PROCESS_DETACH:
-        Hooks::Shutdown();
-        Diagnostics::Shutdown();
+        // Explicit unload is cleaned up by MainThread before FreeLibraryAndExitThread. During process shutdown,
+        // doing MinHook/ImGui/D3D work here would run under the loader lock and is intentionally avoided.
         break;
     }
     return TRUE;

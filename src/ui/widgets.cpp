@@ -1,8 +1,13 @@
 #include "widgets.h"
 #include "../framework.h"  // GetFileAttributesW/INVALID_FILE_ATTRIBUTES
+#include "../features/features.h"
+#include "../game/entity_tracker.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>  // ImGuiWindow/ItemAdd/ButtonBehavior 등 저수준 위젯 제작용 API
+
+#include <algorithm>
+#include <cstdio>
 
 namespace Widgets
 {
@@ -90,29 +95,103 @@ namespace Widgets
         return pressed;
     }
 
+    bool FilledSliderFloat(const char* label, float* value, float minimum, float maximum, const char* format)
+    {
+        if (!value || maximum <= minimum)
+            return false;
+
+        ImGui::PushID(label);
+
+        char valueText[64]{};
+        snprintf(valueText, sizeof(valueText), format, *value);
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        const float valueWidth = ImGui::CalcTextSize(valueText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - valueWidth);
+        ImGui::TextDisabled("%s", valueText);
+
+        const float height = 16.0f;
+        const float width = (std::max)(160.0f, ImGui::GetContentRegionAvail().x);
+        ImGui::InvisibleButton("##track", ImVec2(width, height));
+
+        bool changed = false;
+        if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        {
+            const ImVec2 min = ImGui::GetItemRectMin();
+            const ImVec2 max = ImGui::GetItemRectMax();
+            const float normalized = std::clamp((ImGui::GetIO().MousePos.x - min.x) / (max.x - min.x), 0.0f, 1.0f);
+            const float newValue = minimum + normalized * (maximum - minimum);
+            changed = newValue != *value;
+            *value = newValue;
+        }
+
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 max = ImGui::GetItemRectMax();
+        const float normalized = std::clamp((*value - minimum) / (maximum - minimum), 0.0f, 1.0f);
+        const float radius = height * 0.5f;
+        const float grabX = min.x + normalized * (max.x - min.x);
+
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(min, max, IM_COL32(48, 49, 57, 255), radius);
+        if (grabX > min.x)
+            drawList->AddRectFilled(min, ImVec2(grabX, max.y), IM_COL32(51, 140, 242, 255), radius);
+        drawList->AddCircleFilled(ImVec2(grabX, min.y + radius), radius - 2.0f, IM_COL32(238, 243, 250, 255));
+
+        ImGui::PopID();
+        return changed;
+    }
+
     void DrawMainMenu()
     {
-        ImGui::SetNextWindowSize(ImVec2(420.0f, 260.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 500.0f), ImGuiCond_FirstUseEver);
         ImGui::Begin("Cyberpunk 2077 Trainer");
 
-        ImGui::TextDisabled("SCAFFOLD - Insert로 토글");
+        Features::Settings& settings = Features::GetSettings();
+        const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
+
+        ImGui::TextDisabled("Cyberpunk 2077 2.31  |  Insert: menu  |  End: unload");
         ImGui::Separator();
 
-        static bool espEnabled = false;
-        static bool aimbotEnabled = false;
-
         ImGui::TextUnformatted("ESP");
-        ImGui::SameLine(200.0f);
-        ToggleSwitch("##esp_toggle", &espEnabled);
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_toggle", &settings.esp.enabled);
 
+        ImGui::Indent(14.0f);
+        ImGui::TextUnformatted("Bounding boxes");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_boxes", &settings.esp.boundingBoxes);
+        ImGui::TextUnformatted("Skeleton");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_skeleton", &settings.esp.skeleton);
+        ImGui::TextUnformatted("Health bars");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##esp_health", &settings.esp.healthBars);
+        ImGui::Unindent(14.0f);
+
+        ImGui::TextDisabled("Entity feed: %s | registered %llu | positioned %llu | puppets %llu",
+                            entityStats.hookCreated ? "hooked" : "unavailable",
+                            static_cast<unsigned long long>(entityStats.registered),
+                            static_cast<unsigned long long>(entityStats.positioned),
+                            static_cast<unsigned long long>(entityStats.puppets));
+
+        ImGui::Spacing();
+        ImGui::Separator();
         ImGui::TextUnformatted("Aimbot");
-        ImGui::SameLine(200.0f);
-        ToggleSwitch("##aimbot_toggle", &aimbotEnabled);
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_toggle", &settings.aimbot.enabled);
+
+        ImGui::Indent(14.0f);
+        ImGui::TextUnformatted("Draw FOV circle");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##aimbot_fov_circle", &settings.aimbot.drawFovCircle);
+        FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 600.0f, "%.0f px");
+        FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 1.0f, 30.0f, "%.1f");
+        ImGui::Unindent(14.0f);
 
         ImGui::Separator();
         ImGui::TextWrapped(
-            "ESP/Aimbot 실제 로직은 아직 없음 - 오프셋을 리버싱으로 확보한 뒤 채울 것 "
-            "(AGENTS.md 기능 스펙 절 참고).");
+            "FOV circle rendering is active. Entity registration is captured from REDengine; "
+            "projection, target filtering, boxes, bones and health are the next integration stage.");
 
         ImGui::End();
     }

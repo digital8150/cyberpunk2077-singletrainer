@@ -7,8 +7,10 @@
 // vtable 인덱스는 DXGI/D3D12 공개 헤더의 COM 인터페이스 상속 순서로 고정되어 있다 (IUnknown 3개 +
 // 이후 선언 순서). 이 프로젝트에서 새로 알아낸 게 아니라 DX12 오버레이 후킹의 표준 관례값이다.
 #include "d3d12_hook.h"
+#include "hook_lifecycle.h"
 #include "../framework.h"
 #include "../diagnostics.h"
+#include "../game/entity_tracker.h"
 #include "../ui/overlay.h"
 
 #include <MinHook.h>
@@ -38,9 +40,15 @@ namespace
     // Direct 큐(업로드/보조 렌더 등)를 "첫 큐"라는 이유만으로 쓰지 않는다.
     thread_local ID3D12CommandQueue* t_lastDirectQueue = nullptr;
     std::atomic_bool g_loggedFirstPresent{false};
+    bool g_minHookInitialized = false;
+    bool g_hooksEnabled = false;
 
     HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain3* swapChain, UINT syncInterval, UINT flags)
     {
+        HookLifecycle::CallbackGuard callback;
+        if (HookLifecycle::IsShuttingDown())
+            return oPresent(swapChain, syncInterval, flags);
+
         ID3D12CommandQueue* commandQueue = t_lastDirectQueue;
         if (!g_loggedFirstPresent.exchange(true))
             Diagnostics::Log("first Present intercepted: swapChain=%p sameThreadDirectQueue=%p firstDirectQueue=%p",
@@ -53,6 +61,10 @@ namespace
     HRESULT STDMETHODCALLTYPE hkResizeBuffers(IDXGISwapChain3* swapChain, UINT bufferCount, UINT width,
                                                UINT height, DXGI_FORMAT newFormat, UINT swapChainFlags)
     {
+        HookLifecycle::CallbackGuard callback;
+        if (HookLifecycle::IsShuttingDown())
+            return oResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
+
         Overlay::OnResizeBuffers(swapChain);
         return oResizeBuffers(swapChain, bufferCount, width, height, newFormat, swapChainFlags);
     }
@@ -60,6 +72,13 @@ namespace
     void STDMETHODCALLTYPE hkExecuteCommandLists(ID3D12CommandQueue* queue, UINT numCommandLists,
                                                   ID3D12CommandList* const* commandLists)
     {
+        HookLifecycle::CallbackGuard callback;
+        if (HookLifecycle::IsShuttingDown())
+        {
+            oExecuteCommandLists(queue, numCommandLists, commandLists);
+            return;
+        }
+
         // 엔진은 보통 큐를 여러 개(Direct/Compute/Copy) 굴린다. RTV를 건드리는 ImGui 커맨드리스트는
         // Direct 큐로만 제출할 수 있으므로 그게 아니면 절대 캡처하면 안 된다 — 예전엔 이 필터가 없어서
         // "그냥 처음 관측된 큐"를 렌더 큐로 오인해 캡처했고, 그게 Compute/Copy 큐였을 경우 그 큐로
@@ -188,6 +207,7 @@ namespace Hooks
             Diagnostics::Log("MH_Initialize failed: %s (%d)", MH_StatusToString(status), status);
             return;
         }
+        g_minHookInitialized = true;
 
         void* presentAddr = nullptr;
         void* resizeBuffersAddr = nullptr;
@@ -220,23 +240,67 @@ namespace Hooks
             return;
         }
 
+        // 게임 주소 훅은 선택 사항이다. 실패해도 렌더 오버레이는 계속 사용할 수 있다.
+        Game::EntityTracker::CreateHook();
+
         status = MH_EnableHook(MH_ALL_HOOKS);
         if (status != MH_OK)
         {
             Diagnostics::Log("MH_EnableHook failed: %s (%d)", MH_StatusToString(status), status);
             return;
         }
+        g_hooksEnabled = true;
 
         Diagnostics::Log("all hooks enabled");
     }
 
-    void Shutdown()
+    bool Shutdown()
     {
         Diagnostics::Log("hook shutdown started");
+        HookLifecycle::BeginShutdown();
+
+        if (g_hooksEnabled)
+        {
+            const MH_STATUS disableStatus = MH_DisableHook(MH_ALL_HOOKS);
+            if (disableStatus != MH_OK)
+            {
+                Diagnostics::Log("MH_DisableHook failed: %s (%d)", MH_StatusToString(disableStatus), disableStatus);
+                return false;
+            }
+            g_hooksEnabled = false;
+        }
+
+        if (!HookLifecycle::WaitForCallbacks(5000))
+        {
+            Diagnostics::Log("hook shutdown aborted: detour callbacks did not drain within 5000 ms");
+            return false;
+        }
+
+        // Present/Resize callbacks can mutate overlay state, so drain them before restoring the separately hooked
+        // WndProc. A second drain closes the small window in which a WndProc callback could already be entering.
+        if (!Overlay::BeginShutdown())
+            return false;
+        if (!HookLifecycle::WaitForCallbacks(5000))
+        {
+            Diagnostics::Log("hook shutdown aborted: WndProc callbacks did not drain within 5000 ms");
+            return false;
+        }
+
         Overlay::Shutdown();
-        MH_DisableHook(MH_ALL_HOOKS);
-        MH_Uninitialize();
+        Game::EntityTracker::Shutdown();
+        if (g_minHookInitialized)
+        {
+            const MH_STATUS uninitializeStatus = MH_Uninitialize();
+            if (uninitializeStatus != MH_OK)
+            {
+                Diagnostics::Log("MH_Uninitialize failed: %s (%d)", MH_StatusToString(uninitializeStatus),
+                                 uninitializeStatus);
+                return false;
+            }
+            g_minHookInitialized = false;
+        }
         g_firstDirectQueue.store(nullptr, std::memory_order_release);
         Diagnostics::Log("hook shutdown finished");
+        return true;
     }
 }

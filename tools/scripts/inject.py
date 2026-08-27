@@ -57,6 +57,12 @@ kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_char_p]
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.GetExitCodeThread.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+kernel32.OpenEventW.restype = wintypes.HANDLE
+kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+kernel32.SetEvent.restype = wintypes.BOOL
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+
+EVENT_MODIFY_STATE = 0x0002
 
 
 def resolve_pid(args) -> int:
@@ -135,32 +141,71 @@ def inject(pid: int, dll_path: str) -> bool:
     return False
 
 
+def request_unload(pid: int, dll_basename: str, timeout_seconds: float = 10.0) -> bool:
+    """Ask a compatible trainer build to perform its own hook-safe shutdown."""
+    if not is_dll_loaded(pid, dll_basename):
+        print(f"{dll_basename} is not loaded in pid={pid}, nothing to do")
+        return True
+
+    event_name = f"Local\\cp2077_trainer_unload_{pid}"
+    event = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, event_name)
+    if not event:
+        raise OSError(
+            "safe unload event was not found; the loaded DLL predates unload support. "
+            "Restart the game once instead of forcing FreeLibrary"
+        )
+
+    try:
+        if not kernel32.SetEvent(event):
+            raise OSError(f"SetEvent failed (err={ctypes.get_last_error()})")
+    finally:
+        kernel32.CloseHandle(event)
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not is_dll_loaded(pid, dll_basename):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def main(argv=None) -> int:
     if sys.platform != "win32":
         print("this tool is Windows-only.", file=sys.stderr)
         return 1
 
     # Keep runtime/help output ASCII-only so this remains usable from cp949 and other legacy Windows consoles.
-    parser = argparse.ArgumentParser(
-        description="Inject a DLL with LoadLibraryW and CreateRemoteThread."
-    )
+    parser = argparse.ArgumentParser(description="Safely unload or inject the trainer DLL.")
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--pid", type=int)
     target.add_argument("--name", help="process executable name, e.g. Cyberpunk2077.exe")
-    parser.add_argument("--dll", required=True, help="path to the DLL to inject")
+    parser.add_argument("--dll", help="path to the DLL to inject")
+    parser.add_argument("--unload", action="store_true", help="request hook-safe unload instead of injection")
     args = parser.parse_args(argv)
 
     pid = resolve_pid(args)
     try:
-        ok = inject(pid, args.dll)
+        if args.unload:
+            dll_basename = os.path.basename(args.dll) if args.dll else "cp2077_trainer.dll"
+            ok = request_unload(pid, dll_basename)
+        else:
+            if not args.dll:
+                parser.error("--dll is required unless --unload is used")
+            ok = inject(pid, args.dll)
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if ok:
-        print(f"success: {os.path.basename(args.dll)} loaded into pid={pid}")
+        if args.unload:
+            print(f"success: trainer unloaded from pid={pid}")
+        else:
+            print(f"success: {os.path.basename(args.dll)} loaded into pid={pid}")
         return 0
-    print(f"failed: {os.path.basename(args.dll)} did not appear in pid={pid}'s module list", file=sys.stderr)
+    if args.unload:
+        print(f"failed: trainer remained loaded in pid={pid} after the timeout", file=sys.stderr)
+    else:
+        print(f"failed: {os.path.basename(args.dll)} did not appear in pid={pid}'s module list", file=sys.stderr)
     return 1
 
 

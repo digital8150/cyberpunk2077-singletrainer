@@ -424,52 +424,53 @@ def auto_int(text: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # Keep runtime/help output ASCII-only so this works in cp949 and other legacy Windows consoles.
+    parser = argparse.ArgumentParser(description="Read, write, scan, and inspect Windows process memory.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_list = sub.add_parser("list", help="실행 중인 프로세스 목록")
-    p_list.add_argument("--filter", help="이름에 포함된 문자열로 필터링")
+    p_list = sub.add_parser("list", help="list running processes")
+    p_list.add_argument("--filter", help="filter by a substring in the process name")
     p_list.set_defaults(func=cmd_list)
 
-    p_mod = sub.add_parser("modules", help="프로세스의 로드된 모듈 목록")
+    p_mod = sub.add_parser("modules", help="list modules loaded by a process")
     p_mod.add_argument("--pid", type=int, required=True)
     p_mod.set_defaults(func=cmd_modules)
 
-    p_scan = sub.add_parser("scan", help="값으로 첫 스캔 (세션 시작)")
+    p_scan = sub.add_parser("scan", help="start a value scan session")
     p_scan.add_argument("--pid", type=int, required=True)
     p_scan.add_argument("--type", choices=list(TYPE_FORMATS) + ["string", "bytes"], required=True)
-    p_scan.add_argument("--all", action="store_true", help="쓰기 가능 영역뿐 아니라 전체(읽기전용 포함) 스캔")
+    p_scan.add_argument("--all", action="store_true", help="scan all readable regions, not only writable regions")
     p_scan.add_argument("value")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_rescan = sub.add_parser("rescan", help="이전 스캔 결과를 조건으로 좁히기")
+    p_rescan = sub.add_parser("rescan", help="narrow the previous scan results")
     p_rescan.add_argument("--pid", type=int, required=True)
     group = p_rescan.add_mutually_exclusive_group()
     group.add_argument("--changed", action="store_true")
     group.add_argument("--unchanged", action="store_true")
     group.add_argument("--increased", action="store_true")
     group.add_argument("--decreased", action="store_true")
-    p_rescan.add_argument("value", nargs="?", default=None, help="정확한 새 값으로 좁히기 (조건 플래그 대신 사용)")
+    p_rescan.add_argument("value", nargs="?", default=None, help="filter by an exact new value")
     p_rescan.set_defaults(func=cmd_rescan)
 
-    p_read = sub.add_parser("read", help="주소 하나 읽기")
+    p_read = sub.add_parser("read", help="read one address")
     p_read.add_argument("--pid", type=int, required=True)
     p_read.add_argument("--address", type=auto_int, required=True)
     p_read.add_argument("--type", choices=list(TYPE_FORMATS) + ["string", "bytes"], required=True)
-    p_read.add_argument("--size", type=int, default=64, help="string/bytes 타입일 때 읽을 바이트 수")
+    p_read.add_argument("--size", type=int, default=64, help="byte count for string/bytes reads")
     p_read.set_defaults(func=cmd_read)
 
-    p_write = sub.add_parser("write", help="주소 하나 쓰기")
+    p_write = sub.add_parser("write", help="write one address")
     p_write.add_argument("--pid", type=int, required=True)
     p_write.add_argument("--address", type=auto_int, required=True)
     p_write.add_argument("--type", choices=list(TYPE_FORMATS) + ["string", "bytes"], required=True)
     p_write.add_argument("value")
     p_write.set_defaults(func=cmd_write)
 
-    p_aob = sub.add_parser("aobscan", help="AOB(바이트 패턴) 스캔, ??는 와일드카드")
+    p_aob = sub.add_parser("aobscan", help="scan an AOB pattern; ?? is a wildcard")
     p_aob.add_argument("--pid", type=int, required=True)
-    p_aob.add_argument("--module", help="특정 모듈로 범위 제한 (예: GameCore.dll)")
-    p_aob.add_argument("--pattern", required=True, help='예: "48 8B 05 ?? ?? ?? ?? 89"')
+    p_aob.add_argument("--module", help="limit the scan to one module, e.g. GameCore.dll")
+    p_aob.add_argument("--pattern", required=True, help='example: "48 8B 05 ?? ?? ?? ?? 89"')
     p_aob.set_defaults(func=cmd_aobscan)
 
     return parser

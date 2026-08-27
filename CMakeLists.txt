@@ -30,6 +30,11 @@ target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
 add_library(cp2077_trainer SHARED
     src/dllmain.cpp
     src/diagnostics.cpp
+    src/features/features.cpp
+    src/features/aimbot.cpp
+    src/game/signature_scanner.cpp
+    src/game/entity_tracker.cpp
+    src/hooks/hook_lifecycle.cpp
     src/hooks/d3d12_hook.cpp
     src/ui/overlay.cpp
     src/ui/widgets.cpp

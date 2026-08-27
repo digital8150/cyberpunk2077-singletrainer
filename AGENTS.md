@@ -59,6 +59,11 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
     사용자와 상의할 것.
 - **메뉴 토글**: **Insert 키**로 오버레이 on/off. 훅된 프로세스 내부에서 `GetAsyncKeyState` 또는 raw input으로
   감지하고, Present 훅 콜백 지점에서 토글 상태에 따라 ImGui 프레임을 그리거나 스킵합니다.
+- **안전한 언로드**: **End 키**로 전용 작업 스레드에 언로드를 요청합니다. 모든 훅을 먼저 비활성화하고 이미
+  진입한 콜백이 빠져나온 것을 확인한 뒤 ImGui/D3D 자원을 정리하고 `FreeLibraryAndExitThread`를 호출합니다.
+  `DllMain(DLL_PROCESS_DETACH)`에서는 로더 락 때문에 훅/UI 정리를 수행하지 않습니다.
+  개발 자동화에서는 `python tools/scripts/inject.py --name Cyberpunk2077.exe --unload`로 같은 안전 종료
+  경로를 요청할 수 있습니다. 외부 원격 스레드에서 `FreeLibrary`를 직접 호출해 강제 언로드하지 않습니다.
 
 ## 아키텍처 (계획)
 

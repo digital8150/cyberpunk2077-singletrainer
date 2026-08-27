@@ -4,5 +4,6 @@
 namespace Hooks
 {
     void Initialize();
-    void Shutdown();
+    // Returns true only when every detour callback has drained and the DLL can safely be unloaded.
+    bool Shutdown();
 }

@@ -1,5 +1,6 @@
 # 빌드 산출물 (트레이너 DLL 스캐폴딩 추가 시 확장)
 build/
+build-*/
 out/
 bin/
 obj/
