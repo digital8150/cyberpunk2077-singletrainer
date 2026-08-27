@@ -1,6 +1,7 @@
 #include "features.h"
 #include "aimbot.h"
 #include "esp.h"
+#include "fps_counter.h"
 
 namespace
 {
@@ -18,5 +19,6 @@ namespace Features
     {
         Esp::DrawOverlay(g_settings.esp);
         Aimbot::DrawOverlay(g_settings.aimbot);
+        FpsCounter::Draw(g_settings.showFps);
     }
 }

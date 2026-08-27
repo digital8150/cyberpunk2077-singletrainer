@@ -143,13 +143,18 @@ namespace Widgets
 
     void DrawMainMenu()
     {
-        ImGui::SetNextWindowSize(ImVec2(520.0f, 500.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(520.0f, 550.0f), ImGuiCond_FirstUseEver);
         ImGui::Begin("Cyberpunk 2077 Trainer");
 
         Features::Settings& settings = Features::GetSettings();
         const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
 
         ImGui::TextDisabled("Cyberpunk 2077 2.31  |  Insert: menu  |  End: unload");
+        ImGui::Separator();
+
+        ImGui::TextUnformatted("Show FPS");
+        ImGui::SameLine(430.0f);
+        ToggleSwitch("##show_fps", &settings.showFps);
         ImGui::Separator();
 
         ImGui::TextUnformatted("ESP");
@@ -168,11 +173,12 @@ namespace Widgets
         ToggleSwitch("##esp_health", &settings.esp.healthBars);
         ImGui::Unindent(14.0f);
 
-        ImGui::TextDisabled("Entity feed: %s | registered %llu | positioned %llu | puppets %llu",
+        ImGui::TextDisabled("Entity feed: %s | registered %llu | positioned %llu | NPCs %llu | live %llu",
                             entityStats.hookCreated ? "hooked" : "unavailable",
                             static_cast<unsigned long long>(entityStats.registered),
                             static_cast<unsigned long long>(entityStats.positioned),
-                            static_cast<unsigned long long>(entityStats.puppets));
+                            static_cast<unsigned long long>(entityStats.puppets),
+                            static_cast<unsigned long long>(entityStats.trackedPuppets));
 
         ImGui::Spacing();
         ImGui::Separator();
@@ -190,8 +196,8 @@ namespace Widgets
 
         ImGui::Separator();
         ImGui::TextWrapped(
-            "ESP currently projects the latest registered NPC position as a green diagnostic marker. "
-            "Persistent target filtering, boxes, bones and health are the next integration stage.");
+            "ESP tracks registered NPC positions and draws projected prototype boxes. "
+            "Verified bone and health access are still pending; those toggles currently draw nothing.");
 
         ImGui::End();
     }

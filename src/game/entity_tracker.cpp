@@ -7,6 +7,8 @@
 #include <MinHook.h>
 
 #include <atomic>
+#include <array>
+#include <cmath>
 #include <cstddef>
 
 namespace
@@ -75,6 +77,22 @@ namespace
     static_assert(offsetof(EntityLayout, entityId) == 0x48);
     static_assert(offsetof(EntityLayout, transformComponent) == 0xB0);
 
+    enum class PuppetKind
+    {
+        None,
+        Npc,
+        Player,
+    };
+
+    struct TrackedPuppet
+    {
+        EntityLayout* entity = nullptr;
+        std::uint64_t entityId = 0;
+        std::uint64_t sequence = 0;
+    };
+
+    constexpr std::size_t kMaxTrackedPuppets = 256;
+
     using RegisterEntityFn = void (*)(void* registry, EntityLayout* entity);
     RegisterEntityFn g_originalRegisterEntity = nullptr;
 
@@ -82,33 +100,122 @@ namespace
     std::atomic_uint64_t g_registered{0};
     std::atomic_uint64_t g_positioned{0};
     std::atomic_uint64_t g_puppets{0};
+    std::atomic_uint64_t g_trackedPuppets{0};
     SRWLOCK g_lastEntityLock = SRWLOCK_INIT;
     std::uint64_t g_lastEntityId = 0;
     float g_lastPosition[3]{};
     bool g_hasLastPuppet = false;
     std::uint64_t g_lastPuppetId = 0;
     float g_lastPuppetPosition[3]{};
+    SRWLOCK g_puppetListLock = SRWLOCK_INIT;
+    std::array<TrackedPuppet, kMaxTrackedPuppets> g_puppetList{};
+    std::uint64_t g_puppetSequence = 0;
 
-    bool IsPuppetClass(const ClassLayout* type)
+    PuppetKind ClassifyPuppet(const ClassLayout* type)
     {
+        constexpr std::uint64_t playerTypes[] = {
+            Fnv1a64("PlayerPuppet"),
+            Fnv1a64("gamePlayerPuppet"),
+        };
         constexpr std::uint64_t puppetTypes[] = {
             Fnv1a64("gamePuppet"),
             Fnv1a64("gamePuppetBase"),
             Fnv1a64("gameNPCPuppet"),
             Fnv1a64("NPCPuppet"),
             Fnv1a64("ScriptedPuppet"),
-            Fnv1a64("PlayerPuppet"),
         };
 
+        bool isPuppet = false;
         for (unsigned depth = 0; type && depth < 24; ++depth, type = type->parent)
         {
+            for (const std::uint64_t hash : playerTypes)
+            {
+                if (type->nameHash == hash)
+                    return PuppetKind::Player;
+            }
             for (const std::uint64_t hash : puppetTypes)
             {
                 if (type->nameHash == hash)
-                    return true;
+                    isPuppet = true;
             }
         }
-        return false;
+        return isPuppet ? PuppetKind::Npc : PuppetKind::None;
+    }
+
+    bool ReadPosition(const EntityLayout* entity, float position[3])
+    {
+        if (!entity || !entity->transformComponent)
+            return false;
+
+        constexpr float kFixedPointScale = 1.0f / static_cast<float>(2 << 16);
+        const WorldTransformLayout& transform = entity->transformComponent->worldTransform;
+        position[0] = static_cast<float>(transform.x) * kFixedPointScale;
+        position[1] = static_cast<float>(transform.y) * kFixedPointScale;
+        position[2] = static_cast<float>(transform.z) * kFixedPointScale;
+        return std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]) &&
+               std::abs(position[0]) < 1000000.0f && std::abs(position[1]) < 1000000.0f &&
+               std::abs(position[2]) < 1000000.0f;
+    }
+
+    void TrackPuppet(EntityLayout* entity)
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+
+        TrackedPuppet* target = nullptr;
+        TrackedPuppet* oldest = &g_puppetList[0];
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (tracked.entityId == entity->entityId)
+            {
+                target = &tracked;
+                break;
+            }
+            if (!tracked.entity && !target)
+                target = &tracked;
+            if (tracked.sequence < oldest->sequence)
+                oldest = &tracked;
+        }
+
+        if (!target)
+            target = oldest;
+        target->entity = entity;
+        target->entityId = entity->entityId;
+        target->sequence = ++g_puppetSequence;
+
+        std::uint64_t count = 0;
+        for (const TrackedPuppet& tracked : g_puppetList)
+            count += tracked.entity != nullptr ? 1u : 0u;
+        g_trackedPuppets.store(count, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+    }
+
+    bool TrySnapshot(const TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
+    {
+        // Game streaming can free/reuse an entity independently of our list. Validate all identity data at the
+        // point of use and contain a stale-pointer access; no raw pointer leaves this function.
+        __try
+        {
+            EntityLayout* entity = tracked.entity;
+            if (!entity || entity->entityId != tracked.entityId ||
+                ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
+            {
+                return false;
+            }
+
+            float position[3]{};
+            if (!ReadPosition(entity, position))
+                return false;
+
+            snapshot.entityId = tracked.entityId;
+            snapshot.position[0] = position[0];
+            snapshot.position[1] = position[1];
+            snapshot.position[2] = position[2];
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     void CaptureEntity(EntityLayout* entity)
@@ -119,22 +226,21 @@ namespace
         const std::uint64_t total = g_registered.fetch_add(1, std::memory_order_relaxed) + 1;
         const ClassLayout* nativeType = entity->nativeType;
         const std::uint64_t typeHash = nativeType ? nativeType->nameHash : 0;
-        const bool puppet = IsPuppetClass(nativeType);
+        const PuppetKind puppetKind = ClassifyPuppet(nativeType);
+        const bool puppet = puppetKind == PuppetKind::Npc;
         if (puppet)
             g_puppets.fetch_add(1, std::memory_order_relaxed);
 
         float position[3]{};
         bool hasPosition = false;
-        if (entity->transformComponent)
+        if (ReadPosition(entity, position))
         {
-            constexpr float kFixedPointScale = 1.0f / static_cast<float>(2 << 16);
-            const WorldTransformLayout& transform = entity->transformComponent->worldTransform;
-            position[0] = static_cast<float>(transform.x) * kFixedPointScale;
-            position[1] = static_cast<float>(transform.y) * kFixedPointScale;
-            position[2] = static_cast<float>(transform.z) * kFixedPointScale;
             hasPosition = true;
             g_positioned.fetch_add(1, std::memory_order_relaxed);
         }
+
+        if (puppet && hasPosition)
+            TrackPuppet(entity);
 
         AcquireSRWLockExclusive(&g_lastEntityLock);
         g_lastEntityId = entity->entityId;
@@ -230,6 +336,7 @@ namespace Game::EntityTracker
         result.registered = g_registered.load(std::memory_order_relaxed);
         result.positioned = g_positioned.load(std::memory_order_relaxed);
         result.puppets = g_puppets.load(std::memory_order_relaxed);
+        result.trackedPuppets = g_trackedPuppets.load(std::memory_order_acquire);
 
         AcquireSRWLockShared(&g_lastEntityLock);
         result.lastEntityId = g_lastEntityId;
@@ -243,5 +350,34 @@ namespace Game::EntityTracker
         result.lastPuppetPosition[2] = g_lastPuppetPosition[2];
         ReleaseSRWLockShared(&g_lastEntityLock);
         return result;
+    }
+
+    std::size_t GetPuppetSnapshots(PuppetSnapshot* output, std::size_t capacity)
+    {
+        if (!output || capacity == 0)
+            return 0;
+
+        std::size_t count = 0;
+        std::uint64_t trackedCount = 0;
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+
+            PuppetSnapshot snapshot;
+            if (!TrySnapshot(tracked, snapshot))
+            {
+                tracked = {};
+                continue;
+            }
+
+            ++trackedCount;
+            if (count < capacity)
+                output[count++] = snapshot;
+        }
+        g_trackedPuppets.store(trackedCount, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        return count;
     }
 }

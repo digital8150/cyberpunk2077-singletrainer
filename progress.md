@@ -162,3 +162,19 @@
   - 미완료 allocator는 절대 Reset하지 않되 Present 스레드를 기다리게 하지 않고 해당 오버레이 프레임만
     즉시 건너뛰도록 변경. 수정본에서 `wanted=3, completed=2` 지연이 다시 발생했지만 다음 프레임들 및 Insert
     토글이 계속 정상 동작했고 영구 비활성화/device error가 없음을 확인함.
+- **메뉴 커서 고정 해제, FPS 카운터, 지속 NPC 박스 프로토타입 구현**:
+  - 게임이 플레이 중 `ClipCursor`와 `SetCursorPos` 계열 API로 커서를 중앙에 다시 고정하는 동작을 메뉴가
+    열린 동안만 억제하는 MinHook 기반 cursor hook을 추가. 메뉴를 열 때 기존 clip을 즉시 풀고, 닫거나
+    언로드할 때 억제를 해제해 게임이 다음 프레임부터 원래 커서 제어를 복구할 수 있게 함. 현재 Windows의
+    `SetCursorPos`/`SetPhysicalCursorPos` export가 같은 주소를 공유해 두 번째 훅 생성이
+    `MH_ERROR_ALREADY_CREATED`가 되는 것도 실주입 로그로 발견해 별칭으로 명시 처리함.
+  - ImGui 측 평균 프레임률을 사용하는 우상단 FPS 배지를 추가하고 메뉴에서 표시 여부를 바꿀 수 있게 함.
+  - 등록된 NPC를 최대 256개까지 ID와 포인터로 추적하고, 매 프레임 사용할 때 ID/클래스/위치를 다시
+    검증한 값 스냅샷만 렌더러에 전달하도록 구현. 스트리밍으로 해제된 포인터 접근은 SEH 경계에서 격리하고
+    목록에서 제거하며 PlayerPuppet은 제외함. 최대 128개 스냅샷을 월드→스크린 투영해 현재는 1.8m 가상
+    높이를 쓰는 근사 박스와 ID 라벨을 그린다. 실제 AABB/본/체력 접근은 아직 리버싱되지 않아 UI에도
+    프로토타입임을 명시함.
+  - `build-next`와 정식 `build/bin/Release` 모두 전체 Release 빌드 통과. PID 21768에 실주입해 cursor hooks
+    `complete=1`, 메뉴 capture on/off, 첫 오버레이 프레임, 정상 GPU 지연 시 프레임 skip, NPC 등록 및
+    월드 투영이 모두 로그에 나타나고 게임이 계속 응답함을 확인. 실제 커서 조작성/FPS 배지/박스의 시각적
+    최종 확인은 사용자 인게임 확인을 기다리는 중.

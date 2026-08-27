@@ -20,6 +20,7 @@ namespace Features
 
     struct Settings
     {
+        bool showFps = true;
         EspSettings esp;
         AimbotSettings aimbot;
     };

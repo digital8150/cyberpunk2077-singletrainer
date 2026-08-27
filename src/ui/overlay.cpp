@@ -11,6 +11,7 @@
 #include "../diagnostics.h"
 #include "../features/features.h"
 #include "../hooks/hook_lifecycle.h"
+#include "../hooks/cursor_hook.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
@@ -153,6 +154,7 @@ namespace
             g_visible = !g_visible;
             Diagnostics::Log("overlay visibility toggled: visible=%d", g_visible ? 1 : 0);
             ImGui::GetIO().MouseDrawCursor = g_visible;
+            CursorHook::SetMenuCapture(g_visible);
             // 게임이 매 프레임 마우스를 창 중앙에 클립/고정해서 커서가 안 보이는 경우가 많다 (raw input
             // 카메라 조작) — 메뉴를 열 때 클립을 풀어서 커서가 창 안에서 자유롭게 움직이게 한다.
             if (g_visible)
@@ -198,6 +200,7 @@ namespace
             SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_originalWndProc));
         g_originalWndProc = nullptr;
         g_wndProcRestored = false;
+        CursorHook::SetMenuCapture(false);
 
         if (waitForGpu && g_fence && g_fenceEvent && g_fenceLastSignaled > 0)
         {
@@ -419,6 +422,7 @@ namespace
             return false;
         }
         g_wndProcRestored = false;
+        CursorHook::SetMenuCapture(g_visible);
 
         g_swapChain = swapChain;
         Diagnostics::Log("overlay initialization completed");
@@ -578,6 +582,7 @@ namespace Overlay
             g_wndProcRestored = true;
         }
         g_visible = false;
+        CursorHook::SetMenuCapture(false);
         return true;
     }
 

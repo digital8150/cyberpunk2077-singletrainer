@@ -7,6 +7,7 @@
 // vtable 인덱스는 DXGI/D3D12 공개 헤더의 COM 인터페이스 상속 순서로 고정되어 있다 (IUnknown 3개 +
 // 이후 선언 순서). 이 프로젝트에서 새로 알아낸 게 아니라 DX12 오버레이 후킹의 표준 관례값이다.
 #include "d3d12_hook.h"
+#include "cursor_hook.h"
 #include "hook_lifecycle.h"
 #include "../framework.h"
 #include "../diagnostics.h"
@@ -242,6 +243,7 @@ namespace Hooks
 
         // 게임 주소 훅은 선택 사항이다. 실패해도 렌더 오버레이는 계속 사용할 수 있다.
         Game::EntityTracker::CreateHook();
+        CursorHook::CreateHooks();
 
         status = MH_EnableHook(MH_ALL_HOOKS);
         if (status != MH_OK)
@@ -287,6 +289,7 @@ namespace Hooks
         }
 
         Overlay::Shutdown();
+        CursorHook::Shutdown();
         Game::EntityTracker::Shutdown();
         if (g_minHookInitialized)
         {
