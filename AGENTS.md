@@ -162,6 +162,12 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
   고정할 것** (업스트림 `requirements.txt`가 상한 없이 열려 있어 최신 `mcp` 2.x를 깔면 깨짐). 새 MCP
   서버/CE 브릿지를 후보로 고를 때는 DBVM·하이퍼바이저 기능이 내장된 것은 배제할 것 (위 절대 금지
   규정과 같은 이유).
+- **트레이너 로그와 미니덤프 위치**: 기본값은 `%LOCALAPPDATA%\cp2077_trainer\`이며 DLL 옆이 아니다
+  (개발 트리가 있는 `E:`는 기계식 HDD라 로그 flush가 줄당 20 ms였다). 환경 변수로 조절한다:
+  `CBPK_LOG_DIR`(디렉터리 지정), `CBPK_LOG=0`(진단 로그 전체 off), `CBPK_DBGOUT=1`
+  (`OutputDebugStringA` on, 기본 off — 줄마다 SEH 예외가 든다), `CBPK_VEH=1`(예외 관측 VEH 등록).
+  `Diagnostics::Log`는 링 버퍼에 넣고 즉시 반환하고 실제 쓰기는 writer 스레드가 한다. **게임
+  스레드에서 로그를 이유로 디스크를 동기 대기하는 코드를 다시 넣지 말 것** — 그게 원래 문제였다.
 - **Cheat Engine 7.7 / IDA Free 8.4**: 개발 머신에 설치되어 있음 (`C:\Program Files\Cheat Engine`,
   `C:\Program Files\IDA Freeware 8.4`). 둘 다 GUI 애플리케이션이라 에이전트가 자동화할 수 없음 — 사용자가
   직접 조작하는 수동 RE 용도.

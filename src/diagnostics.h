@@ -2,13 +2,24 @@
 
 #include "framework.h"
 
-// 크래시 직전까지 살아남는 최소 진단 로그 및 예외/크래시 핸들러(VEH). 파일과 OutputDebugStringA에 동시에 기록한다.
+// 크래시 직전까지 살아남는 최소 진단 로그 및 예외/크래시 핸들러(VEH).
+//
+// Log()는 호출자 스레드에서 포맷만 하고 링 버퍼에 넣은 뒤 즉시 반환한다. 파일 쓰기와
+// FlushFileBuffers는 전용 writer 스레드가 배치로 처리하므로 Present 스레드나 게임 메인 틱이
+// 디스크를 기다리지 않는다. 환경 변수:
+//   CBPK_LOG=0      진단 로그를 통째로 끈다 (Log()가 원자 로드 하나로 반환).
+//   CBPK_LOG_DIR    로그/덤프 디렉터리 지정. 기본값은 %LOCALAPPDATA%\cp2077_trainer\.
+//   CBPK_DBGOUT=1   OutputDebugStringA 출력을 켠다 (기본 off: 줄마다 SEH 예외가 든다).
+//   CBPK_VEH=1      예외 관측용 VEH를 등록한다.
 namespace Diagnostics
 {
     void Initialize(HMODULE module);
     void Shutdown();
 
     void Log(const char* format, ...);
+    // 큐에 쌓인 줄을 디스크까지 밀어낸다. 평소에는 부를 필요가 없다 (writer 스레드가 1초
+    // cadence로 알아서 한다). 덤프 직전, 종료 직전처럼 이 다음이 없을지도 모르는 지점에서만 쓴다.
+    void Flush();
     void LogHr(const char* operation, HRESULT hr);
     void LogDeviceRemovedData(ID3D12Device* device, const char* trigger);
 
