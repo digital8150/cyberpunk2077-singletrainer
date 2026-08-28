@@ -820,3 +820,59 @@
   적대 전환 후 `categories[civilian=2 ...] attitude[hostile=2 ...]`가 안정적으로 유지됐다 — 스폰
   아키타입이 civilian인 NPC 2명이 런타임 적대로 잡힌 것으로, 원래 보고된 실패 케이스 그대로다.
   프리즈 없이 게임 응답 정상 유지.
+
+## 2026-08-28 - 10:12 크래시 / 10:16 프리즈: 원인은 게임이 올라간 USB 외장 SSD의 I/O 행
+
+### 증상
+
+- 10:12:23 게임이 하드 크래시. 트레이너 로그는 오류·DRED·device removed 없이 그냥 끊겼다.
+- 10:14:03 재실행 → 10:16:32 인젝션 → 약 11초 뒤 프리즈. 마지막 트레이너 로그는 10:16:43.253.
+
+### 실측
+
+프리즈 상태의 프로세스(PID 9084)가 살아 있어서 미니덤프를 7분 간격으로 두 번 떴다
+(`E:\cp2077_freeze_9084.dmp`, `..._b.dmp`). 심볼 없이도 모듈 귀속이 가능하도록
+`tools/scripts/dumpwalk.py`를 새로 작성했다 (미니덤프의 모듈/스레드/메모리 스트림을 파싱하고
+스택을 스캔해 모듈 내부를 가리키는 qword를 유사 콜스택으로 뽑는다).
+
+- 게임 메인 틱 스레드(tid 2840)는 두 덤프에서 **RSP와 프레임이 완전히 동일**했고 RIP만
+  `RtlQueryPerformanceCounter` 안에서 움직였다. 코어 하나를 100% 태우며 스핀 중이다
+  (6초에 CPU 6.03초). 안쪽 프레임 `Cyberpunk2077.exe+0x14AC7B` / `+0x14AF14`의 바이트를 직접
+  읽어보니 `lock cmpxchg` + 역방향 점프, 그리고 함수 포인터 predicate를 호출하는 재시도 루프였다.
+  즉 게임 자체의 스핀 대기 프리미티브다.
+- 파일 읽기 스레드(tid 33240)는 두 덤프 모두 `ZwReadFile+0x14`에서 **스택이 완전히 동일**했고
+  스레드 CPU 시간이 3.219초에서 전혀 증가하지 않았다. 7분 넘게 반환되지 않은 동기 읽기다.
+- 그 스레드의 R10(=NtReadFile의 HANDLE 인자) 0x1784를 살아 있는 프로세스에서
+  `DuplicateHandle` + `GetFinalPathNameByHandle`로 풀었더니:
+  `G:\CYBERPUNK_ARK_PACK_MO2\mods\Rogue_Rework 2K\archive\pc\mod\roguedowngrade.archive`
+- G: 는 **USB(UASP) 외장 케이스에 든 WD SN740** (Get-Disk 기준 BusType=USB, 디스크 4번)이며
+  게임과 MO2가 모두 여기 있다. 시스템 이벤트 로그에 10:13:05 UASPStor 이벤트 129(장치 리셋) +
+  disk 이벤트 153(I/O 재시도) 12건이 찍혔다. 이 리셋은 최근 이틀간 8회 반복됐다.
+- 같은 파일을 다른 프로세스에서 통째로 읽어보면 490 MB를 1.85초(265 MB/s)에 정상 읽는다.
+  파일 손상이 아니라 in-flight IRP가 유실된 것이다.
+
+### 결론
+
+메인 틱이 스트리밍 잡을 스핀 대기하는데 그 잡이 의존하는 동기 읽기가 커널에서 영영 완료되지 않아
+전체가 멈춘다. 유저 모드 훅은 syscall 안쪽을 붙잡을 수 없으므로 **트레이너도 모드도 원인이 아니다**.
+10:12 크래시는 덤프가 없어 단정할 수 없지만, 42초 뒤 같은 디스크의 컨트롤러 리셋이 기록됐고
+게임 텔레메트리(`%LOCALAPPDATA%\CD Projekt Red\Cyberpunk 2077\CrashInfo.json`)는
+`isOom=false`, patch 2.31, LittleChina 로 남았다. 같은 스토리지 원인일 가능성이 높다.
+
+### 조치
+
+- 근본 대책은 게임과 MO2를 내장 드라이브로 옮기는 것. 그때까지는 케이블/포트/케이스 교체,
+  USB 선택적 절전 해제 정도가 완화책이다.
+- 다음 하드 크래시 때 덤프를 남기려면 관리자 PowerShell에서 WER LocalDumps를 켤 것:
+  `New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Cyberpunk2077.exe' -Force`
+  뒤에 `DumpFolder`(ExpandString), `DumpCount`(DWord), `DumpType=2`(DWord, full) 설정.
+- 트레이너 쪽 미비점: 예외 핸들러가 없어서 트레이너 안에서 폴트가 나도 로그에 아무 흔적이 남지
+  않는다. 이번엔 트레이너가 원인이 아니었지만, 폴트 주소와 소유 모듈을 남기는 vectored exception
+  handler를 붙여두면 다음 사고 때 귀속이 즉시 끝난다. 아직 구현하지 않았다.
+
+### 부수 기록
+
+- 덤프에서 확인한 OnTick 훅 체인 순서: 게임 → RED4ext → cp2077_trainer → CET → 게임 본체.
+  트레이너 detour는 자기 작업(entity tracker / player modifiers / visibility)을 먼저 끝내고
+  원본을 호출하므로, 프리즈 시점에 트레이너 작업은 이미 끝난 상태였다.
+- 트레이너 스레드는 3개뿐이며 전부 정상 대기 중이었다(언로드 이벤트 대기, 메시지 대기).
