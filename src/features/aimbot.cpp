@@ -13,7 +13,6 @@
 #include <imgui.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <limits>
 
@@ -85,8 +84,8 @@ namespace Aimbot
         }
     }
 
-    void RunFrame(const Features::AimbotSettings& settings, float displayWidth, float displayHeight,
-                  ImDrawList* drawList)
+    void RunFrame(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame,
+                  float displayWidth, float displayHeight, ImDrawList* drawList)
     {
         Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::AimbotFrame);
 
@@ -110,8 +109,9 @@ namespace Aimbot
         }
 
         g_stats = Stats{};
-        static std::array<Game::EntityTracker::PuppetSnapshot, 128> puppets{};
-        const std::size_t count = Game::EntityTracker::GetPuppetSnapshots(puppets.data(), puppets.size());
+        // 스냅샷 패스는 호출자가 프레임당 한 번 돌린다 — ESP와 같은 배열을 읽으므로 여기선 순회만 한다.
+        const Game::EntityTracker::PuppetSnapshot* const puppets = frame.puppets;
+        const std::size_t count = frame.count;
         float bestScreenDistance = (std::numeric_limits<float>::max)();
         Game::Projection::ScreenPoint bestPoint;
         float bestWorld[3]{};
@@ -292,15 +292,16 @@ namespace Aimbot
         return g_stats;
     }
 
-    void DrawOverlay(const Features::AimbotSettings& settings)
+    void DrawOverlay(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame)
     {
         const ImGuiIO& io = ImGui::GetIO();
-        RunFrame(settings, io.DisplaySize.x, io.DisplaySize.y, ImGui::GetBackgroundDrawList());
+        RunFrame(settings, frame, io.DisplaySize.x, io.DisplaySize.y, ImGui::GetBackgroundDrawList());
     }
 
-    void UpdateHeadless(const Features::AimbotSettings& settings, float displayWidth, float displayHeight)
+    void UpdateHeadless(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame,
+                        float displayWidth, float displayHeight)
     {
-        RunFrame(settings, displayWidth, displayHeight, nullptr);
+        RunFrame(settings, frame, displayWidth, displayHeight, nullptr);
     }
 
     void Shutdown()

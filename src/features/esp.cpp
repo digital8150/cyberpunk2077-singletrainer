@@ -9,7 +9,6 @@
 #include <imgui.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -196,7 +195,7 @@ namespace Esp
         }
     }
 
-    void DrawOverlay(const Features::EspSettings& settings)
+    void DrawOverlay(const Features::EspSettings& settings, const Features::FrameSnapshots& frame)
     {
         Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::EspFrame);
 
@@ -204,9 +203,9 @@ namespace Esp
             settings.enabled && settings.nativeHighlight, settings.showCivilians, settings.showEnemies,
             settings.showPolice, settings.showUnclassified, settings.hideDead);
 
-        static std::array<Game::EntityTracker::PuppetSnapshot, 128> puppets{};
+        // 스냅샷 패스는 호출자가 프레임당 한 번 돌린 뒤라, EspFrame 슬롯에는 더 이상 그 비용이 안 들어간다.
         const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
-        const std::size_t count = Game::EntityTracker::GetPuppetSnapshots(puppets.data(), puppets.size());
+        const std::size_t count = frame.count;
         static ULONGLONG lastDiagnosticsTick = 0;
         static unsigned diagnosticsWindows = 0;
         if (count == 0)
@@ -260,7 +259,7 @@ namespace Esp
 
         for (std::size_t i = 0; i < count; ++i)
         {
-            const Game::EntityTracker::PuppetSnapshot& puppet = puppets[i];
+            const Game::EntityTracker::PuppetSnapshot& puppet = frame.puppets[i];
             const CategoryStyle style = GetCategoryStyle(puppet.category, puppet.hostility, settings);
             categorizedCount += puppet.category != Game::EntityTracker::NpcCategory::Other ? 1u : 0u;
             civilianCount += puppet.category == Game::EntityTracker::NpcCategory::Civilian ? 1u : 0u;

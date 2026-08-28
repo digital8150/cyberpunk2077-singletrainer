@@ -1606,3 +1606,41 @@ attitude 수치는 포인터 캐시 revert(`4319ab7`) 이후 첫 실전 검증�
    재측정으로 판단.
 
 각 단계는 이번과 동일한 프로토콜(전체 계측 온 + 인텐스 배틀)로 전후 비교한다.
+
+## 2026-08-28 - Phase 1: 스냅샷 패스를 프레임당 1회로 통합
+
+`Esp::DrawOverlay`와 `Aimbot::RunFrame`이 각자 `GetPuppetSnapshots`를 부르던 것을 없애고,
+`Features::DrawOverlay`가 프레임당 한 번 패스를 돈 뒤 결과 배열을 두 기능에 넘기도록 바꿨다.
+헤드리스 진단 경로(`Features::UpdateHeadless`)도 같은 방식으로 한 번만 돈다.
+
+- `Features::FrameSnapshots`(포인터 + 개수)를 `features.h`에 두고, 128칸 배열의 소유자는
+  `features.cpp`로 옮겼다. 예전엔 esp.cpp와 aimbot.cpp에 128칸짜리 static 배열이 각각 있었다.
+- `Esp::DrawOverlay(settings, frame)`, `Aimbot::DrawOverlay(settings, frame)`,
+  `Aimbot::UpdateHeadless(settings, frame, w, h)`로 시그니처가 바뀌었다.
+- 배열은 Present 스레드 전용이다. `Overlay::OnPresent`가 `g_renderMutex`를 잡은 뒤에만 이 경로로
+  들어오므로 프레임당 한 번 채워지고 같은 프레임 안에서만 읽힌다.
+- `UpdateNativeHighlights`는 원자 변수만 건드리므로(엔티티 리스트를 안 만짐) 스냅샷보다 뒤로 밀려도
+  동작이 달라지지 않는다. `GetStats()`가 이제 직전 프레임이 아니라 이번 패스의 카운터를 읽는 것만 차이.
+
+### 계측 슬롯 의미 변화 (전후 비교할 때 주의)
+
+- `SnapshotPass` / `SnapshotLockWait` / `SnapshotPuppets`의 표본 수가 **`esp`의 2배에서 1배로**
+  떨어져야 한다. 이게 Phase 1이 실제로 먹혔는지 보는 1차 지표다.
+- `esp` 슬롯에는 더 이상 스냅샷 비용이 포함되지 않는다. 직전 세션의 esp 108~194 us는 스냅샷
+  48~108 us를 품은 값이었으므로, 새 세션의 esp는 그만큼 낮게 찍히는 게 정상이다. 프레임 총량을
+  비교하려면 `snapshot + esp + aimbot`을 합쳐서 봐야 한다.
+- 기대 절감은 싼 쪽 패스 ~30 us/frame. `poseSlots`는 여전히 스냅샷 안에 있으므로 프레임당 호출
+  횟수(~9.6회)도 절반 아래로 떨어질 수 있다 — 그건 Phase 2/3 판단에 쓴다.
+
+빌드는 통과했다(`cmake --build build --config Release`, 경고 없음). 실측은 다음 세션에서 동일
+프로토콜(전체 계측 온 + 인텐스 배틀)로 한다.
+
+### 개발 환경 메모
+
+`cmake`가 PATH에 없다. winget으로 깔린 실체는
+`C:\Users\admin\AppData\Local\Microsoft\WinGet\Packages\Kitware.CMake_Microsoft.Winget.Source_8wekyb3d8bbwe\cmake-4.4.2-windows-x86_64\bin\cmake.exe`
+이며, 이 절대 경로로 부르면 그대로 빌드된다 (`build/CMakeCache.txt`의 `CMAKE_COMMAND`와 동일).
+
+### 프리징 인스턴스 정리
+
+14:53 프리징 상태로 남아 있던 게임 프로세스(PID 26508)는 진단 데이터를 다 뽑은 뒤 종료했다.

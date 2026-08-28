@@ -5,6 +5,7 @@
 namespace Features
 {
     struct AimbotSettings;
+    struct FrameSnapshots;
 }
 
 namespace Aimbot
@@ -24,7 +25,9 @@ namespace Aimbot
     };
 
     Stats GetStats();
-    void DrawOverlay(const Features::AimbotSettings& settings);
-    void UpdateHeadless(const Features::AimbotSettings& settings, float displayWidth, float displayHeight);
+    // 스냅샷 패스는 호출자(Features::DrawOverlay/UpdateHeadless)가 프레임당 한 번만 돌리고 그 결과를 넘긴다.
+    void DrawOverlay(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame);
+    void UpdateHeadless(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame,
+                        float displayWidth, float displayHeight);
     void Shutdown();
 }

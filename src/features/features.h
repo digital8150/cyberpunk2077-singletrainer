@@ -1,7 +1,23 @@
 #pragma once
 
+#include <cstddef>
+
+namespace Game::EntityTracker
+{
+    struct PuppetSnapshot;
+}
+
 namespace Features
 {
+    // 한 프레임에 한 번만 뜨는 퍼펫 스냅샷 배열. ESP와 에임봇이 같은 배열을 공유한다 — 예전에는 두 기능이
+    // 각자 GetPuppetSnapshots를 불러 프레임마다 트래킹 리스트를 두 번 순회했다. 배열의 수명은 이 프레임의
+    // Present 콜백 안으로 한정되며, 소유자는 features.cpp다.
+    struct FrameSnapshots
+    {
+        const Game::EntityTracker::PuppetSnapshot* puppets = nullptr;
+        std::size_t count = 0;
+    };
+
     struct EspSettings
     {
         bool enabled = false;

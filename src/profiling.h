@@ -10,11 +10,11 @@ namespace Diagnostics::Profile
     enum class Slot : unsigned
     {
         // Present 스레드 경로.
-        SnapshotPass,      // GetPuppetSnapshots 전체 (락 대기 포함)
+        SnapshotPass,      // GetPuppetSnapshots 전체 (락 대기 포함). 프레임당 1회 — esp/aimbot과 형제 슬롯이다.
         SnapshotLockWait,  // 그중 g_puppetListLock 배타 획득 대기
         SnapshotPuppets,   // 패스당 복사된 스냅샷 개수 (시간이 아니라 개수)
         PoseSlots,         // ReadCurrentPoseSlots 1회 (퍼펫당, 33 ms 주기)
-        EspFrame,          // Esp::DrawOverlay 전체
+        EspFrame,          // Esp::DrawOverlay 전체 (스냅샷 패스는 제외 — 호출자가 먼저 돌린다)
         AimbotFrame,       // Aimbot::RunFrame 전체
 
         // 게임 메인 틱 경로. TickTotal이 트레이너가 게임 틱에 얹는 총 지연이다.
