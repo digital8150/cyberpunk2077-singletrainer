@@ -165,6 +165,9 @@ namespace
         Game::EntityTracker::NpcCategory category = Game::EntityTracker::NpcCategory::Other;
         Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
         ULONGLONG hostilityUpdatedAt = 0;
+        // This puppet's gameAttitudeAgent component. Located once and reused; cleared whenever a reflected call
+        // through it fails, so a swapped or freed component self-heals on the next pass.
+        void* attitudeAgent = nullptr;
         bool isDead = false;
         bool healthValid = false;
         float healthCurrent = 0.0f;
@@ -212,6 +215,27 @@ namespace
     float g_lastPuppetPosition[3]{};
     SRWLOCK g_puppetListLock = SRWLOCK_INIT;
     std::array<TrackedPuppet, kMaxTrackedPuppets> g_puppetList{};
+    // Occupancy bits for the slots above. The main-tick round-robins scan this instead of striding the list
+    // itself: a TrackedPuppet is over a kilobyte, so touching all 256 slots cost one cache miss per slot and
+    // dominated the health pass even with two NPCs on screen (measured 26 us with 2 puppets, 22 us with 45).
+    // TrackedPuppet::entity stays the source of truth; this is maintained beside it under g_puppetListLock and
+    // every scan still validates the entry it lands on.
+    constexpr std::size_t kPuppetOccupancyWords = kMaxTrackedPuppets / 64;
+    std::array<std::uint64_t, kPuppetOccupancyWords> g_puppetOccupancy{};
+
+    void SetPuppetOccupied(std::size_t slot, bool occupied)
+    {
+        const std::uint64_t bit = 1ull << (slot % 64);
+        if (occupied)
+            g_puppetOccupancy[slot / 64] |= bit;
+        else
+            g_puppetOccupancy[slot / 64] &= ~bit;
+    }
+
+    bool IsPuppetOccupied(std::size_t slot)
+    {
+        return (g_puppetOccupancy[slot / 64] & (1ull << (slot % 64))) != 0;
+    }
     std::uint64_t g_puppetSequence = 0;
     ClassificationLayout g_classificationLayout;
     using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
@@ -660,6 +684,7 @@ namespace
         target->sequence = ++g_puppetSequence;
         target->category = ClassifyNpc(entity);
         target->isDead = false;
+        SetPuppetOccupied(static_cast<std::size_t>(target - g_puppetList.data()), true);
 
         std::uint64_t count = 0;
         for (const TrackedPuppet& tracked : g_puppetList)
@@ -1005,9 +1030,13 @@ namespace
         std::size_t workCount = 0;
         bool anyDesired = false;
 
+        const std::int64_t collectStart = Diagnostics::Profile::Now();
         AcquireSRWLockShared(&g_puppetListLock);
-        for (const TrackedPuppet& tracked : g_puppetList)
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
         {
+            if (!IsPuppetOccupied(slot))
+                continue;
+            const TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity)
                 continue;
             const bool desired = enabled && IsCategoryEnabled(tracked.category, tracked.hostility, settings) &&
@@ -1021,6 +1050,8 @@ namespace
                 workItems[workCount++] = {tracked.entity, tracked.entityId, desired};
         }
         ReleaseSRWLockShared(&g_puppetListLock);
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HighlightCollect,
+                                     Diagnostics::Profile::Now() - collectStart);
 
         // Keep mode enabled while a clear transition is pending. This prevents a failed clear from being hidden by
         // an eager mode=0 call and lets the next main tick retry the same transition.
@@ -1122,30 +1153,39 @@ namespace
     {
         EntityLayout* entity = nullptr;
         std::uint64_t entityId = 0;
+        std::size_t slot = 0;
+        bool valid = false;
+        float current = 0.0f;
+        float maximum = 0.0f;
+        float ratio = 0.0f;
+        bool reachedMin = false;
     };
 
-    void PublishHealth(const HealthWork& work, bool valid, float current, float maximum, float ratio,
-                       bool reachedMin)
+    // One exclusive lock for the whole batch, and each entry is written at its known slot. A slot can be recycled
+    // between collection and publication, so identity is still validated; it is now one comparison rather than a
+    // scan of all 256 entries per published value.
+    void PublishHealthBatch(const HealthWork* items, std::size_t count)
     {
+        std::uint64_t validCount = 0;
         AcquireSRWLockExclusive(&g_puppetListLock);
-        for (TrackedPuppet& tracked : g_puppetList)
+        for (std::size_t i = 0; i < count; ++i)
         {
+            const HealthWork& work = items[i];
+            validCount += work.valid ? 1u : 0u;
+            TrackedPuppet& tracked = g_puppetList[work.slot];
             if (tracked.entity != work.entity || tracked.entityId != work.entityId)
                 continue;
-            tracked.healthValid = valid;
-            tracked.healthCurrent = valid ? current : 0.0f;
-            tracked.healthMax = valid ? maximum : 0.0f;
-            tracked.healthRatio = valid ? ratio : 0.0f;
-            tracked.healthReachedMin = valid && reachedMin;
-            if (valid)
-                tracked.isDead = reachedMin || current <= 0.001f;
-            break;
+            tracked.healthValid = work.valid;
+            tracked.healthCurrent = work.valid ? work.current : 0.0f;
+            tracked.healthMax = work.valid ? work.maximum : 0.0f;
+            tracked.healthRatio = work.valid ? work.ratio : 0.0f;
+            tracked.healthReachedMin = work.valid && work.reachedMin;
+            if (work.valid)
+                tracked.isDead = work.reachedMin || work.current <= 0.001f;
         }
         ReleaseSRWLockExclusive(&g_puppetListLock);
-        if (valid)
-            g_healthValid.fetch_add(1, std::memory_order_relaxed);
-        else
-            g_healthInvalid.fetch_add(1, std::memory_order_relaxed);
+        g_healthValid.fetch_add(validCount, std::memory_order_relaxed);
+        g_healthInvalid.fetch_add(count - validCount, std::memory_order_relaxed);
     }
 
     void ProcessHealthOnMainTick()
@@ -1155,19 +1195,31 @@ namespace
         std::size_t workCount = 0;
         const std::size_t start = static_cast<std::size_t>(g_healthRoundRobin % kMaxTrackedPuppets);
         std::size_t scanned = 0;
+        const std::int64_t collectStart = Diagnostics::Profile::Now();
         AcquireSRWLockShared(&g_puppetListLock);
         for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
         {
-            const TrackedPuppet& tracked = g_puppetList[(start + scanned) % kMaxTrackedPuppets];
+            const std::size_t slot = (start + scanned) % kMaxTrackedPuppets;
+            if (!IsPuppetOccupied(slot))
+                continue;
+            const TrackedPuppet& tracked = g_puppetList[slot];
             if (tracked.entity && tracked.entityId != 0)
-                workItems[workCount++] = {tracked.entity, tracked.entityId};
+            {
+                HealthWork& work = workItems[workCount++];
+                work.entity = tracked.entity;
+                work.entityId = tracked.entityId;
+                work.slot = slot;
+            }
         }
         ReleaseSRWLockShared(&g_puppetListLock);
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HealthCollect,
+                                     Diagnostics::Profile::Now() - collectStart);
         g_healthRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
         if (workCount == 0)
             return;
 
         const bool resolved = ResolveHealthOnMainTick();
+        const std::int64_t invokeStart = Diagnostics::Profile::Now();
         for (std::size_t i = 0; i < workCount; ++i)
         {
             bool valid = false;
@@ -1206,8 +1258,15 @@ namespace
                     valid = false;
                 }
             }
-            PublishHealth(workItems[i], valid, current, maximum, ratio, reachedMin);
+            workItems[i].valid = valid;
+            workItems[i].current = current;
+            workItems[i].maximum = maximum;
+            workItems[i].ratio = ratio;
+            workItems[i].reachedMin = reachedMin;
         }
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HealthInvoke,
+                                     Diagnostics::Profile::Now() - invokeStart);
+        PublishHealthBatch(workItems.data(), workCount);
     }
 
     struct AttitudeRuntime
@@ -1330,18 +1389,22 @@ namespace
         return resolved;
     }
 
-    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, Game::Rtti::Handle& playerAgent)
+    // agent is this puppet's cached gameAttitudeAgent: located on first use and reused afterwards, since the
+    // component search walks every component of the entity and was running once per NPC per pass.
+    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, void*& agent,
+                                                 Game::Rtti::Handle& playerAgent)
     {
         using Game::EntityTracker::Hostility;
         std::int32_t attitude = -1;
         bool called = false;
         __try
         {
-            void* npcAgent = FindAttitudeAgent(entity);
-            if (npcAgent)
+            if (!agent)
+                agent = FindAttitudeAgent(entity);
+            if (agent)
             {
                 Game::Rtti::Argument arguments[] = {{&playerAgent}};
-                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, npcAgent, arguments, 1,
+                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, agent, arguments, 1,
                                             &attitude);
             }
         }
@@ -1350,7 +1413,11 @@ namespace
             called = false;
         }
         if (!called)
+        {
+            // Drop the cache so a component that was swapped out is looked up again instead of retried forever.
+            agent = nullptr;
             return Hostility::Unknown;
+        }
 
         // EAIAttitude: AIA_Friendly = 0, AIA_Neutral = 1, AIA_Hostile = 2.
         switch (attitude)
@@ -1366,22 +1433,36 @@ namespace
         }
     }
 
-    void PublishHostility(const HealthWork& work, Game::EntityTracker::Hostility hostility)
+    struct AttitudeWork
     {
+        EntityLayout* entity = nullptr;
+        std::uint64_t entityId = 0;
+        std::size_t slot = 0;
+        void* attitudeAgent = nullptr;
+        Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
+    };
+
+    // Same shape as PublishHealthBatch: one exclusive lock, one identity comparison at a known slot. The agent
+    // pointer resolved during the pass is written back so the next pass skips the component search.
+    void PublishHostilityBatch(const AttitudeWork* items, std::size_t count)
+    {
+        const ULONGLONG now = GetTickCount64();
+        std::uint64_t validCount = 0;
         AcquireSRWLockExclusive(&g_puppetListLock);
-        for (TrackedPuppet& tracked : g_puppetList)
+        for (std::size_t i = 0; i < count; ++i)
         {
+            const AttitudeWork& work = items[i];
+            validCount += work.hostility != Game::EntityTracker::Hostility::Unknown ? 1u : 0u;
+            TrackedPuppet& tracked = g_puppetList[work.slot];
             if (tracked.entity != work.entity || tracked.entityId != work.entityId)
                 continue;
-            tracked.hostility = hostility;
-            tracked.hostilityUpdatedAt = GetTickCount64();
-            break;
+            tracked.hostility = work.hostility;
+            tracked.hostilityUpdatedAt = now;
+            tracked.attitudeAgent = work.attitudeAgent;
         }
         ReleaseSRWLockExclusive(&g_puppetListLock);
-        if (hostility == Game::EntityTracker::Hostility::Unknown)
-            g_attitudeInvalid.fetch_add(1, std::memory_order_relaxed);
-        else
-            g_attitudeValid.fetch_add(1, std::memory_order_relaxed);
+        g_attitudeValid.fetch_add(validCount, std::memory_order_relaxed);
+        g_attitudeInvalid.fetch_add(count - validCount, std::memory_order_relaxed);
     }
 
     void ProcessAttitudeOnMainTick()
@@ -1390,28 +1471,33 @@ namespace
         // tick never spends more than a handful of reflected calls on it.
         constexpr std::size_t kAttitudePerTick = 4;
         constexpr ULONGLONG kAttitudeIntervalMs = 250;
-        struct AttitudeWork
-        {
-            EntityLayout* entity = nullptr;
-            std::uint64_t entityId = 0;
-        };
 
         const ULONGLONG now = GetTickCount64();
         std::array<AttitudeWork, kAttitudePerTick> workItems{};
         std::size_t workCount = 0;
         const std::size_t start = static_cast<std::size_t>(g_attitudeRoundRobin % kMaxTrackedPuppets);
         std::size_t scanned = 0;
+        const std::int64_t collectStart = Diagnostics::Profile::Now();
         AcquireSRWLockShared(&g_puppetListLock);
         for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
         {
-            const TrackedPuppet& tracked = g_puppetList[(start + scanned) % kMaxTrackedPuppets];
+            const std::size_t slot = (start + scanned) % kMaxTrackedPuppets;
+            if (!IsPuppetOccupied(slot))
+                continue;
+            const TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity || tracked.entityId == 0 || tracked.isDead)
                 continue;
             if (tracked.hostilityUpdatedAt != 0 && now - tracked.hostilityUpdatedAt < kAttitudeIntervalMs)
                 continue;
-            workItems[workCount++] = {tracked.entity, tracked.entityId};
+            AttitudeWork& work = workItems[workCount++];
+            work.entity = tracked.entity;
+            work.entityId = tracked.entityId;
+            work.slot = slot;
+            work.attitudeAgent = tracked.attitudeAgent;
         }
         ReleaseSRWLockShared(&g_puppetListLock);
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeCollect,
+                                     Diagnostics::Profile::Now() - collectStart);
         g_attitudeRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
 
         const bool resolved = ResolveAttitudeOnMainTick();
@@ -1463,9 +1549,15 @@ namespace
         if (!g_attitudeRuntime.playerAgent.instance)
             return;
 
+        const std::int64_t invokeStart = Diagnostics::Profile::Now();
         for (std::size_t i = 0; i < workCount; ++i)
-            PublishHostility({workItems[i].entity, workItems[i].entityId},
-                             ReadHostility(workItems[i].entity, g_attitudeRuntime.playerAgent));
+        {
+            workItems[i].hostility = ReadHostility(workItems[i].entity, workItems[i].attitudeAgent,
+                                                   g_attitudeRuntime.playerAgent);
+        }
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
+                                     Diagnostics::Profile::Now() - invokeStart);
+        PublishHostilityBatch(workItems.data(), workCount);
     }
 
     void HookRegisterEntity(void* registry, EntityLayout* entity)
@@ -1604,8 +1696,9 @@ namespace Game::EntityTracker
         AcquireSRWLockExclusive(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::SnapshotLockWait,
                                      Diagnostics::Profile::Now() - lockWaitStart);
-        for (TrackedPuppet& tracked : g_puppetList)
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
         {
+            TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity)
                 continue;
 
@@ -1614,6 +1707,7 @@ namespace Game::EntityTracker
             if (result == SnapshotResult::Stale)
             {
                 tracked = {};
+                SetPuppetOccupied(slot, false);
                 g_staleRemoved.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }

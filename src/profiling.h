@@ -24,6 +24,13 @@ namespace Diagnostics::Profile
         TickPlayerModifiers,
         TickVisibility,
 
+        // 메인 틱 세부. 슬롯 순회 비용과 리플렉션 호출 비용을 나눠서 어느 쪽이 실제 병목인지 가른다.
+        HealthCollect,
+        HealthInvoke,
+        AttitudeCollect,
+        AttitudeInvoke,
+        HighlightCollect,
+
         Count,
     };
 

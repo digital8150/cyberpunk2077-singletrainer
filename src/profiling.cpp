@@ -43,6 +43,11 @@ namespace
         {"highlight", true},
         {"playerMods", true},
         {"visibility", true},
+        {"healthCollect", true},
+        {"healthInvoke", true},
+        {"attitudeCollect", true},
+        {"attitudeInvoke", true},
+        {"highlightCollect", true},
     };
 
     std::int64_t Frequency()
@@ -174,6 +179,7 @@ namespace Diagnostics::Profile
 
         LogGroup("present", Slot::SnapshotPass, Slot::AimbotFrame, elapsed);
         LogGroup("tick", Slot::TickTotal, Slot::TickVisibility, elapsed);
+        LogGroup("tickdetail", Slot::HealthCollect, Slot::HighlightCollect, elapsed);
     }
 
     void Reset()
