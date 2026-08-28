@@ -392,10 +392,14 @@ namespace Widgets
                             static_cast<unsigned long long>(entityStats.positioned),
                             static_cast<unsigned long long>(entityStats.puppets),
                             static_cast<unsigned long long>(entityStats.trackedPuppets));
-        ImGui::TextDisabled("Classified live: civilian %llu | enemy %llu | police %llu",
+        ImGui::TextDisabled("Classified live: civilian %llu | enemy %llu | police %llu | hostile %llu",
                             static_cast<unsigned long long>(entityStats.trackedCivilians),
                             static_cast<unsigned long long>(entityStats.trackedEnemies),
-                            static_cast<unsigned long long>(entityStats.trackedPolice));
+                            static_cast<unsigned long long>(entityStats.trackedPolice),
+                            static_cast<unsigned long long>(entityStats.trackedHostile));
+        ImGui::TextDisabled("Attitude feed: resolved %llu | unavailable %llu",
+                            static_cast<unsigned long long>(entityStats.attitudeValid),
+                            static_cast<unsigned long long>(entityStats.attitudeInvalid));
         ImGui::TextDisabled("Health feed: valid %llu | fallback/invalid %llu | pending position %llu",
                             static_cast<unsigned long long>(entityStats.healthValid),
                             static_cast<unsigned long long>(entityStats.healthInvalid),
@@ -524,7 +528,10 @@ namespace Widgets
 
         ImGui::Separator();
         ImGui::TextWrapped(
-            "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. "
+            "ESP classifies ScriptedPuppet reaction presets as civilian, enemy (ganger), or police. Those presets "
+            "are fixed at spawn, so runtime attitude toward V is read separately from each NPC's attitude agent "
+            "on the game main tick; anyone currently hostile is drawn and aimed at as an enemy no matter which "
+            "preset they spawned with. Police keep their own toggle even while hostile. "
             "Distance uses camera-forward depth. Boxes are built from live SlotComponent pose points and face "
             "the camera; the animation-system AABB is only a fallback. Visibility check raycasts the game's own "
             "'Sight Blocker' preset from the camera on the game main tick and dims occluded targets - it is off by "

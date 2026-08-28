@@ -162,6 +162,8 @@ namespace
         Game::AnimationData::VisualData visual;
         ULONGLONG visualUpdatedAt = 0;
         Game::EntityTracker::NpcCategory category = Game::EntityTracker::NpcCategory::Other;
+        Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
+        ULONGLONG hostilityUpdatedAt = 0;
         bool isDead = false;
         bool healthValid = false;
         float healthCurrent = 0.0f;
@@ -191,6 +193,9 @@ namespace
     std::atomic_uint64_t g_trackedCivilians{0};
     std::atomic_uint64_t g_trackedEnemies{0};
     std::atomic_uint64_t g_trackedPolice{0};
+    std::atomic_uint64_t g_trackedHostile{0};
+    std::atomic_uint64_t g_attitudeValid{0};
+    std::atomic_uint64_t g_attitudeInvalid{0};
     std::atomic_uint64_t g_pendingPosition{0};
     std::atomic_uint64_t g_staleRemoved{0};
     std::atomic_uint64_t g_healthValid{0};
@@ -219,6 +224,8 @@ namespace
     std::atomic_bool g_cleanupAcknowledged{false};
     std::atomic_uint64_t g_cleanupGeneration{0};
     std::uint64_t g_healthRoundRobin = 0;
+    std::uint64_t g_attitudeRoundRobin = 0;
+    ULONGLONG g_attitudePathLogTick = 0;
 
     struct NativeHighlightRuntime
     {
@@ -694,6 +701,7 @@ namespace
             memcpy(snapshot.orientation, orientation, sizeof(orientation));
             snapshot.category = ClassifyNpc(entity);
             tracked.category = snapshot.category;
+            snapshot.hostility = tracked.hostility;
             if (tracked.healthValid)
                 tracked.isDead = tracked.healthReachedMin || tracked.healthCurrent <= 0.001f;
             else
@@ -790,8 +798,14 @@ namespace
         bool desired = false;
     };
 
-    bool IsCategoryEnabled(Game::EntityTracker::NpcCategory category, std::uint32_t settings)
+    bool IsCategoryEnabled(Game::EntityTracker::NpcCategory category,
+                           Game::EntityTracker::Hostility hostility, std::uint32_t settings)
     {
+        // A hostile NPC follows the enemy toggle whatever its spawn archetype was. Police keep their own toggle so
+        // turning them off still works once a scan or a firefight makes them hostile.
+        if (hostility == Game::EntityTracker::Hostility::Hostile &&
+            category != Game::EntityTracker::NpcCategory::Police)
+            return (settings & kHighlightEnemyBit) != 0;
         switch (category)
         {
         case Game::EntityTracker::NpcCategory::Civilian:
@@ -993,7 +1007,7 @@ namespace
         {
             if (!tracked.entity)
                 continue;
-            const bool desired = enabled && IsCategoryEnabled(tracked.category, settings) &&
+            const bool desired = enabled && IsCategoryEnabled(tracked.category, tracked.hostility, settings) &&
                                  !((settings & kHighlightHideDeadBit) != 0 && tracked.isDead);
             anyDesired = anyDesired || desired;
             // Queue only a state transition: unknown+desired=true is the first enable, while known entries queue
@@ -1193,6 +1207,264 @@ namespace
         }
     }
 
+    struct AttitudeRuntime
+    {
+        bool attempted = false;
+        ULONGLONG lastResolveAttempt = 0;
+        void* playerSystem = nullptr;
+        Game::Rtti::Function* getLocalPlayer = nullptr;
+        Game::Rtti::Function* getAttitudeTowards = nullptr;
+        // Held as a handle rather than a raw pointer so GetAttitudeTowards can take it directly, and refreshed on
+        // an interval so the reference count is not churned once per pass.
+        Game::Rtti::Handle playerAgent;
+        ULONGLONG playerAgentResolvedAt = 0;
+        bool dumped = false;
+        bool logged = false;
+    };
+    AttitudeRuntime g_attitudeRuntime;
+
+    // GetAttitudeAgent is a scripted function. Running script bytecode from the main-tick detour at per-NPC rates
+    // hung the game, so the agent is located as a plain component instead: the attitude agent is an ordinary
+    // entity component, and finding it is pure memory reads. Only GetAttitudeTowards, which is native, is still
+    // invoked.
+    void* FindAttitudeAgent(const EntityLayout* entity)
+    {
+        constexpr std::uint64_t agentName = Fnv1a64("gameAttitudeAgent");
+        void* found = nullptr;
+        ForEachComponent(entity, [&](std::byte* component) {
+            if (found)
+                return;
+            if (Game::Rtti::IsClassOrDerived(Game::Rtti::NativeType(component), agentName))
+                found = component;
+        });
+        return found;
+    }
+
+    // Discovery aid. Reflected names are the one part of this path that cannot be verified offline, so a failed
+    // lookup prints the reflected surface of the type instead of leaving hostility at Unknown with no explanation.
+    void DumpClassFunctions(const char* className, const char* filter, unsigned maxDepth)
+    {
+        const Game::Rtti::Class* type = Game::Rtti::GetClass(Game::Rtti::Hash(className));
+        if (!type)
+        {
+            Diagnostics::Log("attitude rtti dump: class %s not found", className);
+            return;
+        }
+        for (unsigned depth = 0; type && depth < maxDepth; ++depth, type = Game::Rtti::ParentClass(type))
+        {
+            const char* owner = Game::Rtti::ResolveName(Game::Rtti::ClassNameHash(type));
+            const std::size_t count = Game::Rtti::FunctionCount(type);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                Game::Rtti::FunctionInfo info;
+                if (!Game::Rtti::InspectFunction(Game::Rtti::FunctionAt(type, i), info))
+                    continue;
+                const char* name = Game::Rtti::ResolveName(info.shortNameHash);
+                if (filter && (!name || !strstr(name, filter)))
+                    continue;
+                Diagnostics::Log("attitude rtti dump: %s::%s params=%zu return=%d flags=0x%X",
+                                 owner && *owner ? owner : "?", name && *name ? name : "?",
+                                 info.parameterCount, info.hasReturnValue ? 1 : 0, info.flags);
+            }
+        }
+    }
+
+    bool ResolveAttitudeOnMainTick()
+    {
+        if (g_attitudeRuntime.playerSystem && g_attitudeRuntime.getLocalPlayer &&
+            g_attitudeRuntime.getAttitudeTowards)
+            return true;
+
+        const ULONGLONG now = GetTickCount64();
+        if (g_attitudeRuntime.attempted && now - g_attitudeRuntime.lastResolveAttempt < 2000)
+            return false;
+        g_attitudeRuntime.attempted = true;
+        g_attitudeRuntime.lastResolveAttempt = now;
+
+        __try
+        {
+            void* gameInstance = ResolveGameInstanceOnMainTick();
+            g_attitudeRuntime.playerSystem = GetSystemOnMainTick(gameInstance,
+                                                                 Game::Rtti::Hash("gameIPlayerSystem"));
+            g_attitudeRuntime.getLocalPlayer = Game::Rtti::FindFunction(
+                Game::Rtti::NativeType(g_attitudeRuntime.playerSystem),
+                Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
+            g_attitudeRuntime.getAttitudeTowards = Game::Rtti::FindFunction(
+                Game::Rtti::GetClass(Game::Rtti::Hash("gameAttitudeAgent")),
+                Game::Rtti::Hash("GetAttitudeTowards"));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_attitudeRuntime.playerSystem = nullptr;
+            g_attitudeRuntime.getLocalPlayer = nullptr;
+            g_attitudeRuntime.getAttitudeTowards = nullptr;
+            Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
+        }
+
+        // Invoke() requires an exact parameter match, so reject a signature that does not match the one hardcoded
+        // below instead of letting every call fail silently at runtime.
+        if (g_attitudeRuntime.getAttitudeTowards &&
+            (Game::Rtti::ParameterCount(g_attitudeRuntime.getAttitudeTowards) != 1 ||
+             !Game::Rtti::HasReturnValue(g_attitudeRuntime.getAttitudeTowards)))
+            g_attitudeRuntime.getAttitudeTowards = nullptr;
+
+        const bool resolved = g_attitudeRuntime.playerSystem && g_attitudeRuntime.getLocalPlayer &&
+                              g_attitudeRuntime.getAttitudeTowards;
+        if (!g_attitudeRuntime.logged || resolved)
+        {
+            Diagnostics::Log("attitude resolver: playerSystem=%p getLocalPlayer=%p getAttitudeTowards=%p "
+                             "resolved=%d",
+                             g_attitudeRuntime.playerSystem, g_attitudeRuntime.getLocalPlayer,
+                             g_attitudeRuntime.getAttitudeTowards, resolved ? 1 : 0);
+            g_attitudeRuntime.logged = true;
+        }
+        if (!resolved && !g_attitudeRuntime.dumped)
+        {
+            g_attitudeRuntime.dumped = true;
+            DumpClassFunctions("gameObject", "ttitude", 4);
+            DumpClassFunctions("gameAttitudeAgent", nullptr, 1);
+        }
+        return resolved;
+    }
+
+    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, Game::Rtti::Handle& playerAgent)
+    {
+        using Game::EntityTracker::Hostility;
+        std::int32_t attitude = -1;
+        bool called = false;
+        __try
+        {
+            void* npcAgent = FindAttitudeAgent(entity);
+            if (npcAgent)
+            {
+                Game::Rtti::Argument arguments[] = {{&playerAgent}};
+                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, npcAgent, arguments, 1,
+                                            &attitude);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            called = false;
+        }
+        if (!called)
+            return Hostility::Unknown;
+
+        // EAIAttitude: AIA_Friendly = 0, AIA_Neutral = 1, AIA_Hostile = 2.
+        switch (attitude)
+        {
+        case 0:
+            return Hostility::Friendly;
+        case 1:
+            return Hostility::Neutral;
+        case 2:
+            return Hostility::Hostile;
+        default:
+            return Hostility::Unknown;
+        }
+    }
+
+    void PublishHostility(const HealthWork& work, Game::EntityTracker::Hostility hostility)
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (tracked.entity != work.entity || tracked.entityId != work.entityId)
+                continue;
+            tracked.hostility = hostility;
+            tracked.hostilityUpdatedAt = GetTickCount64();
+            break;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        if (hostility == Game::EntityTracker::Hostility::Unknown)
+            g_attitudeInvalid.fetch_add(1, std::memory_order_relaxed);
+        else
+            g_attitudeValid.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void ProcessAttitudeOnMainTick()
+    {
+        // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second and a
+        // tick never spends more than a handful of reflected calls on it.
+        constexpr std::size_t kAttitudePerTick = 4;
+        constexpr ULONGLONG kAttitudeIntervalMs = 250;
+        struct AttitudeWork
+        {
+            EntityLayout* entity = nullptr;
+            std::uint64_t entityId = 0;
+        };
+
+        const ULONGLONG now = GetTickCount64();
+        std::array<AttitudeWork, kAttitudePerTick> workItems{};
+        std::size_t workCount = 0;
+        const std::size_t start = static_cast<std::size_t>(g_attitudeRoundRobin % kMaxTrackedPuppets);
+        std::size_t scanned = 0;
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
+        {
+            const TrackedPuppet& tracked = g_puppetList[(start + scanned) % kMaxTrackedPuppets];
+            if (!tracked.entity || tracked.entityId == 0 || tracked.isDead)
+                continue;
+            if (tracked.hostilityUpdatedAt != 0 && now - tracked.hostilityUpdatedAt < kAttitudeIntervalMs)
+                continue;
+            workItems[workCount++] = {tracked.entity, tracked.entityId};
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+        g_attitudeRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
+
+        const bool resolved = ResolveAttitudeOnMainTick();
+        const bool shouldLog = now - g_attitudePathLogTick >= 3000;
+        if (!resolved || workCount == 0)
+        {
+            if (shouldLog)
+            {
+                g_attitudePathLogTick = now;
+                Diagnostics::Log("attitude path: work=%zu resolved=%d", workCount, resolved ? 1 : 0);
+            }
+            return;
+        }
+
+        // Attitude is directional, so the player's own agent is the required argument. The player object still
+        // needs one reflected call, so its agent is cached briefly rather than fetched for every pass.
+        if (!g_attitudeRuntime.playerAgent.instance || now - g_attitudeRuntime.playerAgentResolvedAt >= 500)
+        {
+            Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
+            Game::Rtti::Handle player;
+            void* agent = nullptr;
+            __try
+            {
+                if (Game::Rtti::Invoke(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, nullptr,
+                                       0, &player) &&
+                    player.instance)
+                {
+                    agent = FindAttitudeAgent(static_cast<const EntityLayout*>(player.instance));
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                agent = nullptr;
+            }
+            Game::Rtti::ReleaseHandle(&player);
+            if (agent)
+                Game::Rtti::ConstructHandle(&g_attitudeRuntime.playerAgent, agent);
+            g_attitudeRuntime.playerAgentResolvedAt = now;
+        }
+
+        if (shouldLog)
+        {
+            g_attitudePathLogTick = now;
+            Diagnostics::Log("attitude path: work=%zu playerAgent=%p", workCount,
+                             g_attitudeRuntime.playerAgent.instance);
+        }
+        // No player during loading screens and menus. Leave the cached values alone instead of flipping every
+        // tracked NPC back to Unknown.
+        if (!g_attitudeRuntime.playerAgent.instance)
+            return;
+
+        for (std::size_t i = 0; i < workCount; ++i)
+            PublishHostility({workItems[i].entity, workItems[i].entityId},
+                             ReadHostility(workItems[i].entity, g_attitudeRuntime.playerAgent));
+    }
+
     void HookRegisterEntity(void* registry, EntityLayout* entity)
     {
         HookLifecycle::CallbackGuard callback;
@@ -1272,6 +1544,8 @@ namespace Game::EntityTracker
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_cleanupGeneration.store(0, std::memory_order_release);
+        Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
+        g_attitudeRuntime.playerAgentResolvedAt = 0;
     }
 
     Stats GetStats()
@@ -1285,6 +1559,9 @@ namespace Game::EntityTracker
         result.trackedCivilians = g_trackedCivilians.load(std::memory_order_acquire);
         result.trackedEnemies = g_trackedEnemies.load(std::memory_order_acquire);
         result.trackedPolice = g_trackedPolice.load(std::memory_order_acquire);
+        result.trackedHostile = g_trackedHostile.load(std::memory_order_acquire);
+        result.attitudeValid = g_attitudeValid.load(std::memory_order_relaxed);
+        result.attitudeInvalid = g_attitudeInvalid.load(std::memory_order_relaxed);
         result.pendingPosition = g_pendingPosition.load(std::memory_order_relaxed);
         result.staleRemoved = g_staleRemoved.load(std::memory_order_relaxed);
         result.healthValid = g_healthValid.load(std::memory_order_relaxed);
@@ -1317,6 +1594,7 @@ namespace Game::EntityTracker
         std::uint64_t civilians = 0;
         std::uint64_t enemies = 0;
         std::uint64_t police = 0;
+        std::uint64_t hostile = 0;
         AcquireSRWLockExclusive(&g_puppetListLock);
         for (TrackedPuppet& tracked : g_puppetList)
         {
@@ -1338,6 +1616,7 @@ namespace Game::EntityTracker
             civilians += snapshot.category == NpcCategory::Civilian ? 1u : 0u;
             enemies += snapshot.category == NpcCategory::Enemy ? 1u : 0u;
             police += snapshot.category == NpcCategory::Police ? 1u : 0u;
+            hostile += snapshot.hostility == Hostility::Hostile ? 1u : 0u;
             if (count < capacity)
                 output[count++] = snapshot;
         }
@@ -1345,6 +1624,7 @@ namespace Game::EntityTracker
         g_trackedCivilians.store(civilians, std::memory_order_release);
         g_trackedEnemies.store(enemies, std::memory_order_release);
         g_trackedPolice.store(police, std::memory_order_release);
+        g_trackedHostile.store(hostile, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
         return count;
     }
@@ -1354,6 +1634,7 @@ namespace Game::EntityTracker
         // Both operations below are intentionally called only from visibility's single game-main-tick detour.
         // Present publishes requests but never enters these RTTI/engine paths.
         ProcessHealthOnMainTick();
+        ProcessAttitudeOnMainTick();
         ProcessNativeHighlightsOnMainTick();
     }
 

@@ -181,6 +181,68 @@ namespace Game::Rtti
         return nullptr;
     }
 
+    const Class* ParentClass(const Class* type)
+    {
+        if (!type)
+            return nullptr;
+        __try
+        {
+            return reinterpret_cast<const Class*>(reinterpret_cast<const ClassLayout*>(type)->parent);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    std::uint64_t ClassNameHash(const Class* type)
+    {
+        if (!type)
+            return 0;
+        __try
+        {
+            return reinterpret_cast<const ClassLayout*>(type)->nameHash;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    std::size_t FunctionCount(const Class* type)
+    {
+        if (!type)
+            return 0;
+        __try
+        {
+            const auto* functions = reinterpret_cast<const DynArrayLayout*>(
+                reinterpret_cast<const std::byte*>(type) + 0x48);
+            if (!functions->entries || functions->size > functions->capacity || functions->size > 8192)
+                return 0;
+            return functions->size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    Function* FunctionAt(const Class* type, std::size_t index)
+    {
+        if (index >= FunctionCount(type))
+            return nullptr;
+        __try
+        {
+            const auto* functions = reinterpret_cast<const DynArrayLayout*>(
+                reinterpret_cast<const std::byte*>(type) + 0x48);
+            return static_cast<Function*>(functions->entries[index]);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
     const char* ResolveName(std::uint64_t nameHash)
     {
         if (nameHash == 0)

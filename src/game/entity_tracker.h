@@ -15,6 +15,16 @@ namespace Game::EntityTracker
         Police,
     };
 
+    // Runtime attitude toward the local player, read from the puppet's attitude agent. NpcCategory is the NPC's
+    // spawn-time archetype and never changes, so a neutral NPC that turns on the player is only visible here.
+    enum class Hostility : std::uint8_t
+    {
+        Unknown,
+        Friendly,
+        Neutral,
+        Hostile,
+    };
+
     struct Stats
     {
         bool hookCreated = false;
@@ -25,6 +35,9 @@ namespace Game::EntityTracker
         std::uint64_t trackedCivilians = 0;
         std::uint64_t trackedEnemies = 0;
         std::uint64_t trackedPolice = 0;
+        std::uint64_t trackedHostile = 0;
+        std::uint64_t attitudeValid = 0;
+        std::uint64_t attitudeInvalid = 0;
         std::uint64_t pendingPosition = 0;
         // Compatibility diagnostic only. UnregisterEntity is not hooked because its ABI is unverified, so this
         // counter is intentionally always zero; stale identity/transform validation is reported separately.
@@ -48,6 +61,7 @@ namespace Game::EntityTracker
         float position[3]{};
         float orientation[4]{0.0f, 0.0f, 0.0f, 1.0f};
         NpcCategory category = NpcCategory::Other;
+        Hostility hostility = Hostility::Unknown;
         bool isDead = false;
         bool healthValid = false;
         float healthCurrent = 0.0f;

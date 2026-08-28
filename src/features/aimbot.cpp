@@ -47,13 +47,19 @@ namespace Aimbot
         bool IsEligible(const Game::EntityTracker::PuppetSnapshot& puppet,
                         const Features::AimbotSettings& settings)
         {
+            using Game::EntityTracker::Hostility;
             using Game::EntityTracker::NpcCategory;
             if (puppet.isDead)
                 return false;
-            if (puppet.category == NpcCategory::Enemy)
-                return settings.targetEnemies;
+            // Police keep their own toggle even after they turn on the player.
             if (puppet.category == NpcCategory::Police)
                 return settings.targetPolice;
+            // Runtime attitude first: an NPC that started neutral and turned hostile keeps its spawn archetype, so
+            // the category alone would leave it untargetable for the whole fight.
+            if (puppet.hostility == Hostility::Hostile)
+                return settings.targetEnemies;
+            if (puppet.category == NpcCategory::Enemy)
+                return settings.targetEnemies;
             return false;
         }
 

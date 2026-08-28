@@ -583,11 +583,6 @@ namespace
         }
     }
 
-    std::uint64_t ClassNameHash(const Game::Rtti::Class* type)
-    {
-        return type ? reinterpret_cast<const ClassLayout*>(type)->nameHash : 0;
-    }
-
     void ObserveProducerCall(ProducerHookKind kind, void* context)
     {
         if (!IsTargetFresh())

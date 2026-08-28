@@ -52,6 +52,14 @@ namespace Game::Rtti
     const char* ResolveName(std::uint64_t nameHash);
     bool InspectFunction(const Function* function, FunctionInfo& output);
 
+    // Walks a single class in the inheritance chain. Discovery diagnostics use these to print the reflected
+    // surface of a type when a name lookup fails, so a wrong guess is reported instead of silently disabling
+    // a feature.
+    const Class* ParentClass(const Class* type);
+    std::uint64_t ClassNameHash(const Class* type);
+    std::size_t FunctionCount(const Class* type);
+    Function* FunctionAt(const Class* type, std::size_t index);
+
     // Minimal wrappers around the engine RTTI services used by main-tick
     // feature code.  These resolve through RED4ext and are safe no-ops when
     // the resolver is unavailable.

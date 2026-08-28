@@ -744,3 +744,79 @@
   `PlayerModifiers::OnGameMainTick`의 정리 경로 — `ResolveRuntimeOnMainTick()`이 계속 실패해
   `g_cleanupAcknowledged`가 영영 안 서는 쪽이다. 아직 측정으로 확인하지 않은 가설이다.
 - 아직 수정하지 않았다. 재현이 쉬우니 다음 작업 기점으로 잡을 것.
+
+## 2026-08-28 - 중립에서 적으로 바뀐 NPC를 잡지 못하던 분류 문제
+
+### 원인
+
+- 기존 분류는 퍼펫에 캐시된 `isPolice` / `isCivilian` / `isGanger` 세 bool만 읽었다. 이 값들은 리액션
+  프리셋 아키타입에서 유래하며 스폰 시점에 고정된다. "이 NPC가 무엇인가"이지 "지금 V를 어떻게
+  대하는가"가 아니다.
+- 스냅샷마다 다시 읽고 있었으므로 갱신 주기 문제는 아니었다. 값 자체가 정적이었다.
+- 결과: 적대화된 시민은 계속 Civilian으로 남아 에임봇이 무시했고, 세 아키타입 어디에도 안 맞는
+  경비·코퍼·퀘스트 NPC·드론은 상태와 무관하게 영구히 Other였다.
+
+### 구현
+
+- `NpcCategory`(스폰 아키타입)와 직교하는 `Hostility`(Unknown/Friendly/Neutral/Hostile) 축을 추가했다.
+  스냅샷에 필드를 넣고 ESP와 에임봇이 둘 다 참조한다.
+- 값은 게임 메인 틱에서만 읽는다. 체력 갱신과 동일하게 틱당 8개 라운드로빈이며,
+  `ProcessAttitudeOnMainTick`이 플레이어의 attitude agent를 틱당 한 번 구한 뒤 NPC마다
+  `GetAttitudeTowards`를 호출한다. Present 스레드는 캐시된 값만 복사한다.
+- `EAIAttitude`는 `AIA_Friendly=0, AIA_Neutral=1, AIA_Hostile=2` (RED4ext.SDK 생성 헤더로 확인).
+- ESP: 적대 상태면 아키타입과 무관하게 빨간색 `HOSTILE` 라벨을 쓰고 enemy 토글을 따른다. 경찰은
+  적대 상태여도 자기 토글을 유지한다. 네이티브 하이라이트 게이팅도 같은 규칙을 쓴다.
+- 에임봇 `IsEligible`: 경찰은 police 토글, 그 외에는 적대 상태이거나 갱 아키타입이면 enemy 토글.
+  중립 갱단원을 미리 잡던 기존 동작은 그대로 남는다.
+
+### 실측으로 잡은 함정: 리플렉션 함수를 베이스 클래스에서 찾으면 오버라이드가 실행되지 않는다
+
+- `gameObject` CClass에서 찾은 `GetAttitudeAgent`를 플레이어 인스턴스로 invoke하면 호출 자체는
+  성공하는데(`agentCalled=1`) 반환 핸들이 항상 null이었다. 스크립트 VM은 넘겨준 함수 객체를 그대로
+  실행하므로 파생 클래스의 오버라이드가 아니라 베이스 선언이 돌아간다.
+- 인스턴스의 실제 native type에서 조회하도록 바꾸니 `PlayerPuppet`과 `NPCPuppet` 모두
+  `function=0x...BE4D7F40`(ScriptedPuppet 오버라이드)로 해석되고 agent가 정상 반환됐다.
+  타입별 8칸 direct-mapped 캐시를 둬서 NPC마다 재조회하지 않는다.
+- `GetAttitudeTowards`는 `gameAttitudeAgent`의 네이티브 함수(flags=0x1, params=1)라 이 문제가 없다.
+- 교훈: 이 코드베이스에서 리플렉션 메서드를 캐시할 때는 선언 클래스가 아니라 호출 대상 인스턴스의
+  타입에서 찾을 것. 안 그러면 "호출은 성공하는데 값이 비어 있는" 형태로 조용히 실패한다.
+
+### 검증 상태
+
+- 게임 2.31 / PID 14136 라이브: `attitude resolver ... resolved=1`,
+  `attitude path: work=8 playerCalled=1 agentCalled=1 playerAgent=0x...B9D23A10 faulted=0`.
+- 33개 퍼펫 추적 상황에서 `attitude[hostile=0 unknown=0 valid=8055 invalid=0]` — 전원 태도 해석 성공,
+  당시 적대 대상이 없어 hostile은 0. 실제 중립→적대 전환 시 hostile이 올라가는지는 사용자 인게임
+  확인 대기 중.
+- `build/bin/Release`와 `build-next` 모두 Release 빌드 통과.
+- 부수 정리: `silent_aim.cpp`의 로컬 `ClassNameHash`를 지우고 `Game::Rtti::ClassNameHash`로 통일했다.
+  RTTI 열거용으로 `ParentClass` / `ClassNameHash` / `FunctionCount` / `FunctionAt`를 공개 API에 추가했다.
+
+### 후속: 첫 구현이 게임을 프리즈시켰다 — 스크립트 함수를 메인 틱에서 돌리면 안 된다
+
+- 위 "인스턴스 타입에서 조회" 수정으로 호출이 실제로 성사된 직후, 게임이 약 90초 만에 응답 없음
+  상태로 멈췄다. `Get-Process ... Responding=False`, 트레이너 로그도 그 시점에 완전히 끊겼고
+  `inject.py --unload`가 타임아웃했다. 프로세스를 강제 종료하는 것 외에 복구 방법이 없었다.
+- 직전까지는 같은 코드가 안 멈췄는데, 그때는 베이스 클래스 함수라 agent가 null로 돌아와 조기 반환하느라
+  `GetAttitudeTowards`까지 간 적이 없었다. 즉 멈춤은 "새로 실제 실행되기 시작한 호출"에서 왔다.
+- 결정적 차이: `GetAttitudeAgent`는 **스크립트 함수**(flags=0xA600, native 아님)다. 체력 경로가 메인
+  틱에서 돌리던 stat-pool 함수들은 전부 네이티브였다. 메인 틱 detour 안에서 스크립트 바이트코드를
+  초당 1000회 규모로 실행한 것이 원인으로 판단된다.
+- 수정:
+  - agent를 스크립트 호출로 얻지 않는다. attitude agent는 그냥 엔티티 컴포넌트이므로 기존
+    `ForEachComponent` + `IsClassOrDerived("gameAttitudeAgent")`로 찾는다. 순수 메모리 읽기다.
+  - 남은 리플렉션 호출은 네이티브인 `GetAttitudeTowards` 하나뿐이다.
+  - 스로틀링: 퍼펫당 250 ms 간격, 틱당 최대 4개, 사망 대상은 건너뛴다. 최악 케이스가 틱당 4회로,
+    이미 검증된 체력 경로(틱당 24회)보다 가볍다.
+  - 플레이어 agent 핸들은 500 ms 캐시한다. 패스마다 `ConstructHandle`/`ReleaseHandle`로 참조 카운트를
+    흔들지 않기 위함이며, `Shutdown()`에서 해제한다.
+- **규칙으로 남길 것**: 메인 틱에서 리플렉션 호출을 추가할 때는 먼저 `InspectFunction`의 flags bit0으로
+  네이티브 여부를 확인한다. 스크립트 함수는 이 경로에서 호출하지 않는다.
+- 재발 방지 차원에서 `tools/scripts/inject.py --auto` 감시 프로세스를 중단했다. 문제 있는 DLL이
+  새 게임 프로세스에 자동으로 다시 들어가는 것을 막기 위함이며, 다시 켜려면 수동으로 재실행할 것.
+- `build/bin/Release`와 `build-next` 모두 재빌드 통과. 수정 후 인게임 검증은 아직 못 했다.
+- **인게임 검증 완료 (PID 8000, 09:4x)**: 살아 있는 퍼펫 20명 전원 태도 해석 성공, 실패 카운터는 18에서
+  멈춘 뒤 증가 없음. Unknown 10개는 사망 대상 수와 정확히 일치했다(사망은 의도적으로 건너뛴다).
+  적대 전환 후 `categories[civilian=2 ...] attitude[hostile=2 ...]`가 안정적으로 유지됐다 — 스폰
+  아키타입이 civilian인 NPC 2명이 런타임 적대로 잡힌 것으로, 원래 보고된 실패 케이스 그대로다.
+  프리즈 없이 게임 응답 정상 유지.

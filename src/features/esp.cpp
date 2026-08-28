@@ -25,9 +25,15 @@ namespace Esp
         };
 
         CategoryStyle GetCategoryStyle(Game::EntityTracker::NpcCategory category,
+                                       Game::EntityTracker::Hostility hostility,
                                        const Features::EspSettings& settings)
         {
+            using Game::EntityTracker::Hostility;
             using Game::EntityTracker::NpcCategory;
+            // The archetype is fixed at spawn, so an NPC that turns on the player is only red because of this.
+            // Police stay under their own toggle even while hostile.
+            if (hostility == Hostility::Hostile && category != NpcCategory::Police)
+                return {"HOSTILE", IM_COL32(255, 82, 96, 245), settings.showEnemies};
             switch (category)
             {
             case NpcCategory::Civilian:
@@ -235,6 +241,8 @@ namespace Esp
         std::size_t enemyCount = 0;
         std::size_t policeCount = 0;
         std::size_t unclassifiedCount = 0;
+        std::size_t hostileCount = 0;
+        std::size_t attitudeUnknownCount = 0;
         std::size_t deadCount = 0;
         std::size_t categoryEnabledCount = 0;
         std::size_t projectedCount = 0;
@@ -250,12 +258,14 @@ namespace Esp
         for (std::size_t i = 0; i < count; ++i)
         {
             const Game::EntityTracker::PuppetSnapshot& puppet = puppets[i];
-            const CategoryStyle style = GetCategoryStyle(puppet.category, settings);
+            const CategoryStyle style = GetCategoryStyle(puppet.category, puppet.hostility, settings);
             categorizedCount += puppet.category != Game::EntityTracker::NpcCategory::Other ? 1u : 0u;
             civilianCount += puppet.category == Game::EntityTracker::NpcCategory::Civilian ? 1u : 0u;
             enemyCount += puppet.category == Game::EntityTracker::NpcCategory::Enemy ? 1u : 0u;
             policeCount += puppet.category == Game::EntityTracker::NpcCategory::Police ? 1u : 0u;
             unclassifiedCount += puppet.category == Game::EntityTracker::NpcCategory::Other ? 1u : 0u;
+            hostileCount += puppet.hostility == Game::EntityTracker::Hostility::Hostile ? 1u : 0u;
+            attitudeUnknownCount += puppet.hostility == Game::EntityTracker::Hostility::Unknown ? 1u : 0u;
             deadCount += puppet.isDead ? 1u : 0u;
             categoryEnabledCount += style.enabled ? 1u : 0u;
             if (settings.hideDead && puppet.isDead)
@@ -355,6 +365,7 @@ namespace Esp
             const Game::Visibility::Stats visibilityStats = Game::Visibility::GetStats();
             Diagnostics::Log(
                 "ESP diagnostics: snapshots=%zu categories[civilian=%zu enemy=%zu police=%zu other=%zu] "
+                "attitude[hostile=%zu unknown=%zu valid=%llu invalid=%llu] "
                 "dead=%zu categorized=%zu categoryEnabled=%zu projected=%zu front=%zu poseBounds=%zu "
                 "skeletonLines=%zu depthRange=[%.2f,%.2f] maxDistance=%.1f distanceRejected=%zu "
                 "withinDistance=%zu drawn=%zu enabled=%d camera=%d "
@@ -362,7 +373,9 @@ namespace Esp
                 "nativeHighlight[queued=%llu cleared=%llu failures=%llu] "
                 "visibility[on=%d available=%d occluded=%zu unknown=%zu casts=%llu clear=%llu blocked=%llu "
                 "dropped=%llu]",
-                count, civilianCount, enemyCount, policeCount, unclassifiedCount, deadCount, categorizedCount,
+                count, civilianCount, enemyCount, policeCount, unclassifiedCount, hostileCount,
+                attitudeUnknownCount, static_cast<unsigned long long>(entityStats.attitudeValid),
+                static_cast<unsigned long long>(entityStats.attitudeInvalid), deadCount, categorizedCount,
                 categoryEnabledCount, projectedCount, frontCount, realBoundsCount, skeletonLineCount, minimumDepth,
                 maximumForwardDepth, settings.maxDistanceMeters, distanceRejectedCount, withinDistanceCount,
                 drawnCount, settings.enabled ? 1 : 0, hasCamera ? 1 : 0,
