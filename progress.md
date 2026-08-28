@@ -1040,3 +1040,27 @@
 4. **Phase 3** 포즈 슬롯 읽기 이전 — 혼잡 구간 41 us/frame으로 절대량은 가장 크지만 유일하게 스레드
    컨텍스트를 옮기는 변경이라 마지막에 단독으로.
 5. **Phase 4** 보류. visible-only를 켠 측정 후 재판단.
+
+## 2026-08-28 - 긴급 수정: VEH 동기 덤프 생성으로 인한 DLSS Frame Gen 데드락 해결
+
+### 배경 및 증상
+
+- 12:52:03경 렌더 스레드(TID `8136`)에서 엔티티 스트리밍 해제로 인한 정상적인 SEH 접근 위반(`0xC0000005`) 발생.
+- 새로 추가되었던 VEH가 이를 하드 크래시로 오인하여 렌더 루프 도중 동기적으로 `MiniDumpWriteDump`를 호출함.
+- MO2 `usvfs_x64.dll`을 거쳐 1.2GB 덤프를 디스크에 쓰는 1.3초 동안 전체 스레드가 강제 일시 정지되면서 NVIDIA Streamline (`sl.interposer.dll` / Frame Generation / Reflex)의 내부 프레임 펜스 동기화가 깨짐.
+- 프로세스 재개 후, 메인 게임 스레드(TID `10204`)가 `sl.interposer.dll`의 펜스 대기에서 무한 대기(Deadlock)에 빠짐.
+
+### 수정 내용
+
+1. **VEH 내부 `MiniDumpWriteDump` 동기 호출 제거 (`src/diagnostics.cpp`)**:
+   - 실시간 150 FPS 렌더 루프 중 전체 스레드를 일시 정지시키는 `MiniDumpWriteDump`를 VEH에서 완전 제거.
+   - 치명적 하드 크래시 풀 덤프는 Windows WER `LocalDumps` (사후 크래시 덤프 엔진)에 전담.
+   - VEH는 가벼운 1줄 로그(`[VEH] Exception ...`)만 남기고 즉시 `EXCEPTION_CONTINUE_SEARCH`를 반환하여 SEH(`__try / __except`)가 즉시 복구되도록 처리 (< 1us).
+2. **엔티티 트래커 포인터 및 SEH 보호 강화 (`src/game/entity_tracker.cpp`)**:
+   - `ReadTransform`: `transformComponent` 포인터가 유효 주소 범위(`0x10000` ~ `0x7FFFFFFFFFFF`) 내에 있는지 검증 추가.
+   - `CaptureEntity`: `__try / __except` 보호 블록으로 감싸 스트리밍 중인 비정상 엔티티 등록 시에도 안전하게 스킵.
+
+### 검증
+
+- `E:/repos/cyberpunk2077-fix-veh` 워크트리에서 Release 빌드 완료 (`build/bin/Release/cp2077_trainer.dll`).
+- SEH 접근 위반 발생 시에도 스레드 중단 없이 즉시 복구됨을 확인.

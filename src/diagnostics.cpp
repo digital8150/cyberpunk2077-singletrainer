@@ -179,80 +179,19 @@ namespace
             }
         }
 
-        Diagnostics::Log("================================================================================");
-        Diagnostics::Log("[CRASH/EXCEPTION VEH INTERCEPTED]");
-        Diagnostics::Log("ExceptionCode   : 0x%08lX (%s)", code, ExceptionCodeToString(code));
-        Diagnostics::Log("FaultAddress    : %p (%s+0x%llX, base=%p)",
-                         faultAddr, modName, static_cast<unsigned long long>(modOffset), reinterpret_cast<void*>(modBase));
+        Diagnostics::Log("[VEH] Exception 0x%08lX (%s) at %p (%s+0x%llX)",
+                         code, ExceptionCodeToString(code), faultAddr, modName,
+                         static_cast<unsigned long long>(modOffset));
 
         if (code == EXCEPTION_ACCESS_VIOLATION && exceptionInfo->ExceptionRecord->NumberParameters >= 2)
         {
             const ULONG_PTR avType = exceptionInfo->ExceptionRecord->ExceptionInformation[0];
             const ULONG_PTR targetAddr = exceptionInfo->ExceptionRecord->ExceptionInformation[1];
             const char* opName = (avType == 0) ? "READ" : ((avType == 1) ? "WRITE" : ((avType == 8) ? "EXECUTE(DEP)" : "UNKNOWN"));
-            Diagnostics::Log("AccessViolation : Attempted to %s invalid address %p", opName, reinterpret_cast<void*>(targetAddr));
+            Diagnostics::Log("[VEH] AccessViolation %s target address %p", opName, reinterpret_cast<void*>(targetAddr));
         }
 
-        PCONTEXT ctx = exceptionInfo->ContextRecord;
-        if (ctx)
-        {
-            Diagnostics::Log("Registers (x64) :");
-            Diagnostics::Log("  RIP=%016llX  RSP=%016llX  RBP=%016llX  EFLAGS=%08lX",
-                             ctx->Rip, ctx->Rsp, ctx->Rbp, ctx->EFlags);
-            Diagnostics::Log("  RAX=%016llX  RBX=%016llX  RCX=%016llX  RDX=%016llX",
-                             ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx);
-            Diagnostics::Log("  RSI=%016llX  RDI=%016llX  R8 =%016llX  R9 =%016llX",
-                             ctx->Rsi, ctx->Rdi, ctx->R8, ctx->R9);
-            Diagnostics::Log("  R10=%016llX  R11=%016llX  R12=%016llX  R13=%016llX",
-                             ctx->R10, ctx->R11, ctx->R12, ctx->R13);
-            Diagnostics::Log("  R14=%016llX  R15=%016llX",
-                             ctx->R14, ctx->R15);
-
-            if (ctx->Rsp)
-            {
-                Diagnostics::Log("Stack Walk / Return Addresses (from RSP=%p):", reinterpret_cast<void*>(ctx->Rsp));
-                uintptr_t* stackPtr = reinterpret_cast<uintptr_t*>(ctx->Rsp);
-                int frameCount = 0;
-                __try
-                {
-                    for (int i = 0; i < 256 && frameCount < 24; ++i)
-                    {
-                        uintptr_t val = stackPtr[i];
-                        if (val < 0x10000)
-                            continue;
-
-                        HMODULE frameMod = nullptr;
-                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                               reinterpret_cast<LPCSTR>(val), &frameMod) && frameMod)
-                        {
-                            char framePath[MAX_PATH] = {};
-                            if (GetModuleFileNameA(frameMod, framePath, MAX_PATH))
-                            {
-                                const char* slash = strrchr(framePath, '\\');
-                                const char* frameModName = slash ? slash + 1 : framePath;
-                                uintptr_t frameOffset = val - reinterpret_cast<uintptr_t>(frameMod);
-                                Diagnostics::Log("  frame[%02d] (RSP+%04X): %s+0x%llX (addr=%p)",
-                                                 frameCount++, i * 8, frameModName,
-                                                 static_cast<unsigned long long>(frameOffset), reinterpret_cast<void*>(val));
-                            }
-                        }
-                    }
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER)
-                {
-                    Diagnostics::Log("  [stack walk terminated due to memory read fault]");
-                }
-            }
-        }
-
-        Diagnostics::Log("================================================================================");
-
-        // Write minidump once for any fatal exception
-        if (!g_dumpWritten.exchange(true))
-        {
-            WriteMiniDumpInternal(exceptionInfo, "veh_fatal");
-        }
-
+        // Return immediately so SEH and OS exception filters continue without freezing render/game pipelines
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
