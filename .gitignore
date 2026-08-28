@@ -13,6 +13,8 @@ obj/
 tools/scripts/temp/*
 !tools/scripts/temp/.gitkeep
 tools/scripts/.memtool_state/
+logs_archive/
+*.dmp
 
 # 파이썬
 __pycache__/

@@ -1157,3 +1157,98 @@
   없는 상태다.
 - **Phase 4 판단 보류**. 12:52 세션에서는 visible-only가 켜져 있었는데도(`visibility[on=1]`)
   75분간 캐스트 24,681회에 `dropped=0`이었다. 예전 로그의 drop 누계는 다른 세션 것이다.
+
+## 2026-08-28 - Phase 5 첫 라이브 투입: 29초 만의 프리즈와 그 스택
+
+### 준비 작업
+
+- `build/`를 Phase 5 머지본(`c027856`)으로 재빌드. 이전 `build/bin/Release`는 11:18 구버전이었다.
+- **Release PDB 생성을 켰다** (`CMakeLists.txt`). 인계 문서의 미해결 항목이었다. Release에
+  `/Zi` + `/DEBUG`를 주되 `/OPT:REF`, `/OPT:ICF`를 함께 지정해 `/DEBUG`가 기본으로 끄는 최적화를
+  되살렸다. 코드 생성은 그대로이고 `cp2077_trainer.pdb`(2.6 MB)가 나온다. 이 세션의 스택 덤프에서
+  실제로 `HookOnTick+0xD5` 같은 이름이 풀린 것으로 효용을 확인했다.
+- 프로세스 감시용 백그라운드 워치독을 붙였다 (20초 주기, 3연속 무응답이면 종료 코드 2로 빠져나와
+  에이전트를 깨운다). 이번 프리즈를 60초 안에 잡아낸 것이 이 워치독이다.
+
+### 무슨 일이 있었나
+
+- 13:16:59 PID 27124(메인 메뉴)에 주입. 훅/오버레이 초기화 전부 정상, 첫 프레임 제출까지 로그 완결.
+- 13:17:14 세이브 로드 완료. 엔티티 512개 등록, ESP 분류/투영/체력 읽기 모두 동작.
+- 13:17:28.832 **메인 틱 스레드(tid 30216)에서 `0xC0000005`, `EXECUTE(DEP) target address 0x0`.**
+  널 함수 포인터를 통한 간접 호출이다. 여기서 로그가 끊긴다.
+- 13:17:35부터 프로세스 무응답. 워치독이 13:18:15에 알림.
+
+### 스택 (디버거 없이 확보)
+
+cdb/procdump이 이 머신에 없어서 `tools/scripts/threadstacks.py`를 새로 만들었다. 살아 있는(멈춰
+있어도 되는) 프로세스의 각 스레드를 잠시 suspend하고 `GetThreadContext`로 RIP/RSP를 읽은 뒤, 스택
+영역의 qword 중 실행 가능 메모리를 가리키는 값을 module+offset으로 환원한다. `dbghelp`로 PDB가 있는
+모듈은 심볼까지 붙인다. 실제 스택 언와인딩이 아니라 후보 스캔이므로 오래된 잔여 값이 섞일 수 있다.
+
+tid 30216의 프레임을 오래된 것부터:
+
+```
+usvfs_x64.dll+0x99230 -> Cyberpunk2077.exe 메인 루프
+Cyberpunk2077.exe+0x9F3994 / +0x9F3A3E / +0x9F3283 / +0x9F32D0   (OnTick 주변)
+RED4ext.dll+0x82020
+cp2077_trainer.dll+0x10175  `anonymous namespace'::HookOnTick+0xD5
+Cyberpunk2077.exe+0x291DF0
+Cyberpunk2077.exe+0x9F33FA        <- 원본 OnTick 이어받는 지점 (훅 타겟은 +0x9F33C4)
+MSVCP140.dll+0x17EAB -> 게임 코드 여러 프레임
+Cyberpunk2077.exe+0x14A218
+ntdll.dll+0x54E00                 <- 예외 디스패치 경계
+Cyberpunk2077.exe+0x14A.../+0x14B.../+0x26C.../+0x245... (엔진 크래시 핸들러)
+ntdll.dll+0x1A90D                 <- 현재 RIP, 여기서 대기 중
+```
+
+**읽어낼 수 있는 것**:
+
+- 폴트는 우리 detour 본문이 아니라 **`g_originalOnTick` 호출 이후의 게임 코드**에서 났다. `HookOnTick`은
+  EntityTracker/PlayerModifiers/Visibility 작업을 먼저 다 끝낸 다음 원본을 호출하므로, 예외 시점에
+  우리 per-tick 코드는 이미 반환한 상태다.
+- 우리 코드의 `__try` 블록 안이었다면 SEH가 잡아서 진행됐을 것이다. 엔진 크래시 핸들러까지 올라간
+  것은 SEH 프레임이 없는 경로였다는 뜻이고, 이는 게임 코드였다는 위 판단과 일치한다.
+- 트레이너 자체 스레드 둘(`MainThread`, `DeviceRemovalWatchdog`)은 프리즈 시점에 각각 언로드 이벤트
+  대기와 sleep 상태로 정상이었다.
+- 프로세스가 종료되지 않고 매달린 이유는 엔진 크래시 핸들러가 `ntdll`에서 대기 중이기 때문이다.
+  그래서 `CrashInfo.json`도 WER 덤프도 생기지 않았다.
+
+### 아직 확정하지 못한 것
+
+트레이너가 원인인지 아닌지. 널 간접 호출은 게임 코드에서 났지만, 그 앞에 우리가 게임 상태를 바꾸는
+동작을 여럿 하고 있었다. `config.ini`가 복원한 상태는 다음과 같았고 전부 세이브 로드 직후에 한꺼번에
+발동했다:
+
+- `native_highlight=1` — 13:17:15에 `braindance mode: 1`을 설정하고 하이라이트 이벤트 8건을 큐잉했다.
+- `no_recoil=1` — 스탯 모디파이어 부착 시도(당시엔 `waiting-for-equipped-weapon`이라 미부착).
+- `silent_aim=1` — 네이티브 크로스헤어 코어 훅 활성(`crosshairCore=1`).
+- `visibility_check=1`, ESP 전체 on.
+
+반대로 무죄 정황도 있다. **같은 기능 조합으로 돌린 직전 세션은 75분간 멀쩡했다.** 이번에 바뀐 변수는
+Phase 5, VEH 머지, entity_tracker의 SEH 보강 셋뿐이다. 또 progress.md 앞쪽의 10:53:44 크래시는 Phase 5
+이전에 이미 같은 형태(엔진 예외 필터가 삼키는 하드 폴트)로 발생했었다.
+
+표본이 1건이라 귀속은 보류한다. 다음 세션에서 상태를 바꾸는 기능(native_highlight / no_recoil /
+silent_aim)을 끄고 읽기 전용 경로만 켠 채 재현을 시도하는 것으로 갈린다. Phase 5가 손댄 health /
+attitude 측정치는 그 구성에서도 그대로 나온다.
+
+### 프리즈 직전까지 얻은 Phase 5 수치 (29초, 표본 부족)
+
+메인 메뉴(퍼펫 0)와 세이브 로드 직후(퍼펫 27) 구간뿐이라 기준선의 "한산(2)/혼잡(45)"과 직접 비교할
+수는 없다. 그래도 방향은 보인다.
+
+| 슬롯 | 기준선 한산(퍼펫 2) | 기준선 혼잡(퍼펫 45) | 이번 퍼펫 0 | 이번 퍼펫 27 |
+|---|---|---|---|---|
+| health | 26.1 us | 22.2 us | 0.4 us | 7.4 ~ 13.6 us |
+| attitude | 17.7 us | 62.5 us | 17.1 us | 29.7 ~ 40.1 us |
+| tickTotal | 82.9 us | 218.1 us | 63.1 us | 90.2 ~ 167.8 us |
+
+- **health의 퍼펫 수 무관 고정 비용은 사라졌다.** 퍼펫 0에서 0.4 us다. 점유 비트맵이 의도대로
+  동작한다는 뜻이다. 새 `tickdetail` 줄이 그 근거를 나눠 보여준다: `healthCollect`는 퍼펫 27에서도
+  0.1 us이고 `healthInvoke`가 6.8~13.0 us다. 즉 **기준선의 26 us는 전부 슬롯 순회였고, 실제 리플렉션
+  호출은 원래도 싸다.**
+- `attitudeCollect`도 0.2~0.3 us, `attitudeInvoke`는 호출당 3.3~3.6 us로 안정적이다. 다만 `attitude`
+  전체(29.7~40.1 us)와 `attitudeInvoke`(n=138~160, 3.6 us) 사이의 차이가 크다. attitude 슬롯에는
+  플레이어 에이전트 재해석과 `ResolveAttitudeOnMainTick`이 포함되므로 그쪽을 따로 봐야 한다.
+- 표본 시간이 29초뿐이고 세이브 로드 직후의 스트리밍 구간이 섞여 있으므로 **이 표는 확정치가 아니다.**
+  재현 세션에서 다시 뜬다.

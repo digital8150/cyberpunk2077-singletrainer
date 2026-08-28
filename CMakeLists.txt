@@ -60,6 +60,15 @@ target_compile_definitions(cp2077_trainer PRIVATE
 if(MSVC)
     # 소스 파일이 UTF-8(한글 주석 포함)이라 MSVC에 소스/실행 문자셋을 명시한다 (C4819 경고 방지).
     target_compile_options(cp2077_trainer PRIVATE /utf-8)
+    # Release 빌드에도 PDB를 남긴다. 크래시 덤프/VEH 로그의 `cp2077_trainer.dll+0xOFFSET`을 함수
+    # 이름으로 풀려면 심볼이 필요하다. /Zi는 코드 생성에 영향이 없고, /OPT:REF,ICF를 함께 유지해
+    # /DEBUG가 기본으로 끄는 최적화를 되살린다 (런타임 성능 동일).
+    target_compile_options(cp2077_trainer PRIVATE $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/Zi>)
+    target_link_options(cp2077_trainer PRIVATE
+        $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/DEBUG>
+        $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/OPT:REF>
+        $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:/OPT:ICF>
+    )
 endif()
 target_link_libraries(cp2077_trainer PRIVATE
     imgui
