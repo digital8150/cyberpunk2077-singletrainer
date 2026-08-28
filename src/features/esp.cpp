@@ -4,6 +4,7 @@
 #include "../game/entity_tracker.h"
 #include "../game/projection.h"
 #include "../game/visibility.h"
+#include "../profiling.h"
 
 #include <imgui.h>
 
@@ -197,6 +198,8 @@ namespace Esp
 
     void DrawOverlay(const Features::EspSettings& settings)
     {
+        Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::EspFrame);
+
         Game::EntityTracker::UpdateNativeHighlights(
             settings.enabled && settings.nativeHighlight, settings.showCivilians, settings.showEnemies,
             settings.showPolice, settings.showUnclassified, settings.hideDead);

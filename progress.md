@@ -876,3 +876,67 @@
   트레이너 detour는 자기 작업(entity tracker / player modifiers / visibility)을 먼저 끝내고
   원본을 호출하므로, 프리즈 시점에 트레이너 작업은 이미 끝난 상태였다.
 - 트레이너 스레드는 3개뿐이며 전부 정상 대기 중이었다(언로드 이벤트 대기, 메시지 대기).
+
+## 2026-08-28 - 성능 최적화 Phase 0: QPC 구간 계측 도입
+
+### 배경: 코드 구조상 비용이 확실한 다섯 지점
+
+측정 데이터 없이 최적화하지 않기로 했다(DRED page fault 건에서 추정이 로그 대조로 뒤집힌 전례).
+아래는 코드 리뷰로만 확인한 후보이며, 이번 커밋은 이것을 재기 위한 계측만 넣는다.
+
+1. **스냅샷 전체 패스가 프레임당 2회 돈다.** `Esp::DrawOverlay`(esp.cpp)와 `Aimbot::RunFrame`(aimbot.cpp)이
+   각각 `GetPuppetSnapshots`를 부른다. 150 FPS면 초당 300회 전체 패스이고, 128칸 static 스냅샷 배열도
+   두 벌(각 ~220 KB) 존재한다.
+2. **`GetPuppetSnapshots`가 배타 락을 잡은 채 무거운 일을 한다**(entity_tracker.cpp). 락 안에서 퍼펫마다
+   `TrySnapshot`이 돌고, 그 안에 `ClassifyPuppet`(상속 체인 24단 x 7해시), `ClassifyNpc`(RTTI property 읽기),
+   `IsCorpseDead`(컴포넌트 최대 512개 순회 x 체인 워크)가 매 호출 실행된다. NPC 카테고리는 스폰 시
+   고정인데도 매번 재계산한다. 같은 락을 메인 틱의 health/attitude/highlight 경로가 기다린다.
+3. **포즈 슬롯 읽기가 Present 스레드에서 reflected Invoke를 한다.** `ReadCurrentPoseSlots`가 33 ms마다
+   퍼펫당 6회 `GetSlotTransform`을 `Rtti::Invoke`로 부르고, 매 호출이 `ForEachComponent` +
+   `FindFunction`(클래스 함수 배열 선형 탐색)을 다시 한다. 성능 문제이자 "Present에서 VM 진입" 규칙과도
+   긴장 관계다.
+4. **시야 검사 처리량 부족.** `kRequestsPerTick = 1`, 갱신 주기 일괄 500 ms(visibility.cpp). 화면에 NPC가
+   많으면 수요가 처리량을 초과한다 — drop 누계 95,939가 실측된 상태다.
+5. **스냅샷 복사량 낭비.** `kMaxSkeletonSegments = 64`인데 MetaRig 제거 후 실제 세그먼트는 최대 5개다.
+   퍼펫당 ~1.7 KB를 매 패스 memcpy하는데 ~85%가 빈 공간이다.
+
+### 단계별 계획 (순서: 확실하고 안전한 것 -> 스레드 컨텍스트를 건드리는 것)
+
+- **Phase 0** 계측 (이번 커밋).
+- **Phase 1** 스냅샷 패스를 프레임당 1회로 통합. Overlay가 한 번 떠서 ESP와 에임봇에 같은 배열을 넘긴다.
+- **Phase 2** `GetPuppetSnapshots` 경량화: 카테고리를 `TrackPuppet` 시점 캐시로, 정체성 검증을
+  entityId + 캐시된 nativeType 포인터 비교로 축소, `IsCorpseDead` 250 ms 주기 제한, 락 구간을
+  "짧은 락으로 식별 정보 복사 -> 락 밖에서 무거운 읽기 -> 짧은 락으로 visual write-back"으로 재구성,
+  `kMaxSkeletonSegments` 64 -> 8.
+- **Phase 3** 포즈 슬롯 읽기를 메인 틱으로 이전(health와 같은 라운드로빈 예산, 잠긴 타겟 우선).
+  컴포넌트/함수 탐색 결과도 `TrackedPuppet`에 캐시. 유일하게 스레드 컨텍스트를 옮기는 변경이므로
+  단독 커밋 + 단독 라이브 검증으로 격리한다.
+- **Phase 4** 시야 검사 스케줄링: 갱신 주기 거리 적응형(근거리 250 ms / 원거리 1000 ms), 틱당 예산
+  1 -> 2~4를 Phase 0 계측(캐스트 1회당 틱 소요)을 보고 단계적으로.
+- **Phase 5** 메인 틱 미세 정리: `PublishHealth`/`PublishHostility`의 건당 O(256) 재탐색을 슬롯 인덱스
+  전달로, 배치당 락 1회로 통합, `FindAttitudeAgent` 결과를 퍼펫별 캐시.
+
+### Phase 0 구현
+
+- `src/profiling.h` / `src/profiling.cpp` 추가 (`Diagnostics::Profile`). QPC 기반 RAII `Scope` +
+  슬롯당 `count`/`total`/`max` relaxed 원자 누적기. 슬롯 하나당 비용은 QPC 2회 + 원자 연산 3회다.
+- 로그는 **게임 메인 틱에서 5초마다 한 번** `LogCadence()`가 찍고 누적값을 리셋한다. Present에서 찍지
+  않는 이유는 오버레이가 꺼져 있어도 계측이 남게 하기 위함이다. 두 줄로 나온다:
+  - `profile present (5000ms): snapshot[...] snapLockWait[...] snapCount[...] poseSlots[...] esp[...] aimbot[...]`
+  - `profile tick (5000ms): tickTotal[...] health[...] attitude[...] highlight[...] playerMods[...] visibility[...]`
+  - 각 항목은 `n=표본수 avg=..us max=..us` 형식이고, `snapCount`만 시간이 아니라 패스당 스냅샷 개수다.
+- 계측 지점:
+  - `GetPuppetSnapshots` 전체 + 그 안의 `AcquireSRWLockExclusive` 대기 시간 분리 + 반환 개수.
+  - `ReadCurrentPoseSlots` 1회(퍼펫당).
+  - `Esp::DrawOverlay`, `Aimbot::RunFrame` 전체.
+  - 메인 틱 detour: `TickTotal`(트레이너가 게임 틱에 얹는 총 지연, 원본 `OnTick` 호출은 제외)과 그 하위
+    health / attitude / highlight / playerModifiers / visibility.
+- **`__try` 제약**: MSVC는 객체 언와인딩이 필요한 함수에서 `__try`를 못 쓴다(C2712). 그래서 `TrySnapshot`,
+  `ProcessHealthOnMainTick`, `ProcessAttitudeOnMainTick`, `ProcessNativeHighlightsOnMainTick`처럼 SEH를
+  쓰는 함수 안에는 `Scope`를 넣지 않고, 그 **호출 지점**(`GetPuppetSnapshots`, `OnGameMainTick`)에서
+  감쌌다. 새 계측을 추가할 때도 같은 규칙을 지킬 것.
+
+### 검증 상태
+
+- `build/bin/Release`, `build-next` 모두 Release 빌드 통과(경고 없음).
+- 인게임 수치는 아직 없다. Phase 1 착수 전에 이 로그로 기준선을 먼저 뜬다.

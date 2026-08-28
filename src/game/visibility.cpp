@@ -5,6 +5,7 @@
 #include "../diagnostics.h"
 #include "../framework.h"
 #include "../hooks/hook_lifecycle.h"
+#include "../profiling.h"
 
 #include <MinHook.h>
 
@@ -331,9 +332,20 @@ namespace
         HookLifecycle::CallbackGuard callback;
         if (!HookLifecycle::IsShuttingDown())
         {
-            Game::EntityTracker::OnGameMainTick();
-            Game::PlayerModifiers::OnGameMainTick();
-            ProcessPendingOnMainTick();
+            {
+                // TickTotal은 트레이너 detour가 게임 틱에 얹는 총 지연이다. 원본 OnTick 호출은 제외한다.
+                Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickTotal);
+                Game::EntityTracker::OnGameMainTick();
+                {
+                    Diagnostics::Profile::Scope playerScope(Diagnostics::Profile::Slot::TickPlayerModifiers);
+                    Game::PlayerModifiers::OnGameMainTick();
+                }
+                {
+                    Diagnostics::Profile::Scope visibilityScope(Diagnostics::Profile::Slot::TickVisibility);
+                    ProcessPendingOnMainTick();
+                }
+            }
+            Diagnostics::Profile::LogCadence();
         }
 
         if (g_originalOnTick)

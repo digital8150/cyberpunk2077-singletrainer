@@ -7,6 +7,7 @@
 #include "../game/projection.h"
 #include "../game/silent_aim.h"
 #include "../game/visibility.h"
+#include "../profiling.h"
 #include "../ui/overlay.h"
 
 #include <imgui.h>
@@ -87,6 +88,8 @@ namespace Aimbot
     void RunFrame(const Features::AimbotSettings& settings, float displayWidth, float displayHeight,
                   ImDrawList* drawList)
     {
+        Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::AimbotFrame);
+
         if (!settings.enabled)
         {
             StopAim();

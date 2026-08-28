@@ -5,6 +5,7 @@
 #include "../diagnostics.h"
 #include "../framework.h"
 #include "../hooks/hook_lifecycle.h"
+#include "../profiling.h"
 
 #include <MinHook.h>
 
@@ -556,6 +557,8 @@ namespace
 
     void ReadCurrentPoseSlots(const EntityLayout* entity, Game::AnimationData::VisualData& visual)
     {
+        Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::PoseSlots);
+
         struct PosePoint
         {
             bool valid = false;
@@ -1589,13 +1592,18 @@ namespace Game::EntityTracker
         if (!output || capacity == 0)
             return 0;
 
+        Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::SnapshotPass);
+
         std::size_t count = 0;
         std::uint64_t trackedCount = 0;
         std::uint64_t civilians = 0;
         std::uint64_t enemies = 0;
         std::uint64_t police = 0;
         std::uint64_t hostile = 0;
+        const std::int64_t lockWaitStart = Diagnostics::Profile::Now();
         AcquireSRWLockExclusive(&g_puppetListLock);
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::SnapshotLockWait,
+                                     Diagnostics::Profile::Now() - lockWaitStart);
         for (TrackedPuppet& tracked : g_puppetList)
         {
             if (!tracked.entity)
@@ -1626,6 +1634,7 @@ namespace Game::EntityTracker
         g_trackedPolice.store(police, std::memory_order_release);
         g_trackedHostile.store(hostile, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
+        Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::SnapshotPuppets, count);
         return count;
     }
 
@@ -1633,9 +1642,18 @@ namespace Game::EntityTracker
     {
         // Both operations below are intentionally called only from visibility's single game-main-tick detour.
         // Present publishes requests but never enters these RTTI/engine paths.
-        ProcessHealthOnMainTick();
-        ProcessAttitudeOnMainTick();
-        ProcessNativeHighlightsOnMainTick();
+        {
+            Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickHealth);
+            ProcessHealthOnMainTick();
+        }
+        {
+            Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickAttitude);
+            ProcessAttitudeOnMainTick();
+        }
+        {
+            Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickHighlight);
+            ProcessNativeHighlightsOnMainTick();
+        }
     }
 
     bool PrepareForShutdown(std::uint32_t timeoutMilliseconds)

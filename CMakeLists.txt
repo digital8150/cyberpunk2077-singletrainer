@@ -31,6 +31,7 @@ add_library(cp2077_trainer SHARED
     src/dllmain.cpp
     src/config.cpp
     src/diagnostics.cpp
+    src/profiling.cpp
     src/features/features.cpp
     src/features/aimbot.cpp
     src/features/esp.cpp
