@@ -940,3 +940,30 @@
 
 - `build/bin/Release`, `build-next` 모두 Release 빌드 통과(경고 없음).
 - 인게임 수치는 아직 없다. Phase 1 착수 전에 이 로그로 기준선을 먼저 뜬다.
+
+## 2026-08-28 - 크래시 원인 규명 시스템: 트레이너 VEH(Vectored Exception Handler) 및 WER LocalDumps 도입
+
+### 배경 및 목적
+
+- 10:53:44 크래시(CityCenter 부두보이즈 전투 중) 분석 결과, 게임 엔진 내부 예외 필터가 동작하여 `CrashInfo.json`만 남기고 프로세스가 즉시 종료됨.
+- 향후 발생하는 모든 돌발 크래시에서 트레이너 DLL, RED4ext 플러그인, CET Lua 브릿지, 게임 엔진 네이티브 코드 중 어느 모듈에서 폴트가 발생했는지 1초 만에 100% 식별하기 위해 실시간 예외 인터셉트 및 미니덤프 자동화 구축.
+
+### 구현 내용
+
+1. **트레이너 VEH (Vectored Exception Handler) 탑재 (`src/diagnostics.h`, `src/diagnostics.cpp`)**:
+   - `AddVectoredExceptionHandler(1, VectoredExceptionHandler)`를 통해 OS 및 엔진 최상단에서 예외 인터셉트.
+   - `IsFatalException(code)` 필터를 적용하여 C++ `throw`, CET 내부 Lua 예외(`0xE24C4A02`), RPC, Debugger print는 패스스루하고, 치명적 폴트(`0xC0000005`, `0xC0000409`, `0xC000001D`, `0xC00000FD`, `0xC0000374` 등)만 캐치.
+   - **상세 진단 로그**:
+     - 폴트 주소 및 소유 모듈명 (`GetModuleHandleExA` + `GetModuleFileNameA`), 모듈 상대 오프셋(`module+0xOFFSET`)
+     - Access Violation 시 메모리 접근 유형(READ / WRITE / DEP) 및 타겟 메모리 주소
+     - x64 전체 레지스터 (`RIP`, `RSP`, `RBP`, `RAX`~`RDX`, `RSI`, `RDI`, `R8`~`R15`, `EFLAGS`)
+     - RSP 스택 역추적(Stack Walk)을 통한 상위 24개 모듈 리턴 주소 프레임 리스트
+   - **자동 미니덤프 생성 (`MiniDumpWriteDump`)**:
+     - `dbghelp.lib` 링크 및 크래시 발생 시 1회 `%LOCALAPPDATA%\cbpk\` 또는 빌드 폴더에 `cp2077_crash_<pid>_<timestamp>.dmp` 자동 저장.
+2. **Windows WER LocalDumps 등록 스크립트 (`tools/scripts/enable_localdumps.ps1`, `tools/scripts/enable_localdumps.bat`)**:
+   - 관리자 권한 1-클릭 실행으로 `HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Cyberpunk2077.exe` 레지스트리를 설정하여 하드 크래시 시 윈도우 차원의 풀 덤프 자동 저장.
+
+### 검증
+
+- `cmake --build build --config Release` 정상 빌드 완료.
+- 실시간 라이브 주입 및 테스트 예외 인터셉트/콜스택 로그 출력 및 덤프 생성 정상 동작 검증 완료.

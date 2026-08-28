@@ -67,6 +67,7 @@ target_link_libraries(cp2077_trainer PRIVATE
     d3d12.lib
     dxgi.lib
     user32.lib
+    dbghelp.lib
 )
 
 set_target_properties(cp2077_trainer PROPERTIES OUTPUT_NAME "cp2077_trainer")
