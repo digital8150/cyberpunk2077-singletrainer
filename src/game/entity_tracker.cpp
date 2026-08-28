@@ -613,11 +613,16 @@ namespace
 
     bool ReadTransform(const EntityLayout* entity, float position[3], float orientation[4])
     {
-        if (!entity || !entity->transformComponent)
+        if (!entity)
+            return false;
+
+        const auto* comp = entity->transformComponent;
+        if (!comp || reinterpret_cast<std::uintptr_t>(comp) < 0x10000 ||
+            reinterpret_cast<std::uintptr_t>(comp) > 0x7FFFFFFFFFFF)
             return false;
 
         constexpr float kFixedPointScale = 1.0f / static_cast<float>(2 << 16);
-        const WorldTransformLayout& transform = entity->transformComponent->worldTransform;
+        const WorldTransformLayout& transform = comp->worldTransform;
         position[0] = static_cast<float>(transform.x) * kFixedPointScale;
         position[1] = static_cast<float>(transform.y) * kFixedPointScale;
         position[2] = static_cast<float>(transform.z) * kFixedPointScale;
@@ -737,53 +742,60 @@ namespace
         if (!entity)
             return;
 
-        const std::uint64_t total = g_registered.fetch_add(1, std::memory_order_relaxed) + 1;
-        const ClassLayout* nativeType = entity->nativeType;
-        const std::uint64_t typeHash = nativeType ? nativeType->nameHash : 0;
-        const PuppetKind puppetKind = ClassifyPuppet(nativeType);
-        const bool puppet = puppetKind == PuppetKind::Npc;
-        if (puppet)
-            g_puppets.fetch_add(1, std::memory_order_relaxed);
-
-        float position[3]{};
-        float orientation[4]{};
-        bool hasPosition = false;
-        if (ReadTransform(entity, position, orientation))
+        __try
         {
-            hasPosition = true;
-            g_positioned.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t total = g_registered.fetch_add(1, std::memory_order_relaxed) + 1;
+            const ClassLayout* nativeType = entity->nativeType;
+            const std::uint64_t typeHash = nativeType ? nativeType->nameHash : 0;
+            const PuppetKind puppetKind = ClassifyPuppet(nativeType);
+            const bool puppet = puppetKind == PuppetKind::Npc;
+            if (puppet)
+                g_puppets.fetch_add(1, std::memory_order_relaxed);
+
+            float position[3]{};
+            float orientation[4]{};
+            bool hasPosition = false;
+            if (ReadTransform(entity, position, orientation))
+            {
+                hasPosition = true;
+                g_positioned.fetch_add(1, std::memory_order_relaxed);
+            }
+            else if (puppet)
+            {
+                g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            if (puppet)
+                TrackPuppet(entity);
+
+            AcquireSRWLockExclusive(&g_lastEntityLock);
+            g_lastEntityId = entity->entityId;
+            g_lastPosition[0] = position[0];
+            g_lastPosition[1] = position[1];
+            g_lastPosition[2] = position[2];
+            if (puppet)
+            {
+                g_hasLastPuppet = true;
+                g_lastPuppetId = entity->entityId;
+                g_lastPuppetPosition[0] = position[0];
+                g_lastPuppetPosition[1] = position[1];
+                g_lastPuppetPosition[2] = position[2];
+            }
+            ReleaseSRWLockExclusive(&g_lastEntityLock);
+
+            if (total <= 5 || (total & (total - 1)) == 0)
+            {
+                Diagnostics::Log("entity registered: total=%llu ptr=%p id=0x%llX typeHash=0x%llX puppet=%d "
+                                 "positioned=%d pos=(%.2f, %.2f, %.2f)",
+                                 static_cast<unsigned long long>(total), entity,
+                                 static_cast<unsigned long long>(entity->entityId),
+                                 static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
+                                 hasPosition ? 1 : 0, position[0], position[1], position[2]);
+            }
         }
-        else if (puppet)
+        __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        if (puppet)
-            TrackPuppet(entity);
-
-        AcquireSRWLockExclusive(&g_lastEntityLock);
-        g_lastEntityId = entity->entityId;
-        g_lastPosition[0] = position[0];
-        g_lastPosition[1] = position[1];
-        g_lastPosition[2] = position[2];
-        if (puppet)
-        {
-            g_hasLastPuppet = true;
-            g_lastPuppetId = entity->entityId;
-            g_lastPuppetPosition[0] = position[0];
-            g_lastPuppetPosition[1] = position[1];
-            g_lastPuppetPosition[2] = position[2];
-        }
-        ReleaseSRWLockExclusive(&g_lastEntityLock);
-
-        if (total <= 5 || (total & (total - 1)) == 0)
-        {
-            Diagnostics::Log("entity registered: total=%llu ptr=%p id=0x%llX typeHash=0x%llX puppet=%d "
-                             "positioned=%d pos=(%.2f, %.2f, %.2f)",
-                             static_cast<unsigned long long>(total), entity,
-                             static_cast<unsigned long long>(entity->entityId),
-                             static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
-                             hasPosition ? 1 : 0, position[0], position[1], position[2]);
+            // Ignore stale/unmapped entity registrations safely
         }
     }
 
