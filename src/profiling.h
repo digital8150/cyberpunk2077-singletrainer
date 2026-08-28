@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 // QPC 기반 구간 계측. 최적화 전/후를 로그로 대조하기 위한 것이며, 슬롯 하나당 비용은 QPC 2회 +
@@ -34,6 +35,12 @@ namespace Diagnostics::Profile
         Count,
     };
 
+    // 계측 마스터 스위치. 끄면 Scope가 QPC조차 부르지 않는다. 성능 최적화가 끝난 뒤 계측 비용을
+    // 완전히 뺀 상태의 프레임을 재기 위한 것으로, config.ini의 [diagnostics] profiling으로 조절한다.
+    inline std::atomic<bool> g_enabled{true};
+    inline bool Enabled() { return g_enabled.load(std::memory_order_relaxed); }
+    void SetEnabled(bool enabled);
+
     std::int64_t Now();
     void Record(Slot slot, std::int64_t ticks);
     // 시간이 아닌 값(개수 등)을 같은 누적기에 넣는다. 로그에서 마이크로초로 환산하지 않는다.
@@ -46,8 +53,13 @@ namespace Diagnostics::Profile
     class Scope
     {
     public:
-        explicit Scope(Slot slot) : slot_(slot), start_(Now()) {}
-        ~Scope() { Record(slot_, Now() - start_); }
+        // 꺼져 있으면 start_가 0으로 남고 소멸자도 아무것도 하지 않는다. QPC 2회가 통째로 빠진다.
+        explicit Scope(Slot slot) : slot_(slot), start_(Enabled() ? Now() : 0) {}
+        ~Scope()
+        {
+            if (start_ != 0)
+                Record(slot_, Now() - start_);
+        }
 
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;

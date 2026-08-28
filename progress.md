@@ -1486,3 +1486,63 @@ fence/device failure` 등)는 조건이 성립하면 매 프레임 찍히므로,
   다음 세션에서 트레이너를 언로드(End 또는 `inject.py --unload`)한 뒤 `build/`를 다시 빌드해
   주입하고, `log sink:` 줄이 `%LOCALAPPDATA%` 경로와 `async=on`을 보고하는지 확인할 것.
 - QPC 계측 마스터 토글(계획 5단계의 나머지 절반).
+
+## 2026-08-28 - 진단 토글을 config.ini로 빼고, 새 로깅 경로를 인게임에서 확인
+
+### 왜 환경 변수만으로는 안 됐나
+
+이미 떠 있는 게임에 나중에 주입하는 것이 이 프로젝트의 기본 워크플로인데, 그 프로세스의 환경
+변수를 밖에서 심을 방법이 없다. `inject.py`는 `CreateRemoteThread` + `LoadLibraryW`라 환경에는
+손을 못 댄다. 그래서 `CBPK_VEH=1`을 켜려면 게임을 그 변수와 함께 재시작해야 했다. 최적화 마무리
+단계에서 로깅·계측을 다 끄고 최고 프레임을 재려면 같은 문제가 반대 방향으로 다시 생긴다.
+
+### 수정 내용
+
+- 진단 토글을 `%LOCALAPPDATA%\cbpk\config.ini`의 `[diagnostics]` 섹션에서도 읽는다. 해석 순서는
+  **환경 변수 > ini > 컴파일 기본값**이다. 환경 변수를 위에 둔 것은 특정 실행에서만 일회성으로
+  덮어쓰는 용도를 남겨두기 위해서다. ini에 키가 없으면 기본값을 한 번 써 넣어 파일만 봐도 어떤
+  스위치가 있는지 알 수 있게 한다.
+  - `logging` / `CBPK_LOG` (기본 1)
+  - `profiling` / `CBPK_PROFILE` (기본 1)
+  - `veh` / `CBPK_VEH` (기본 0)
+  - `debug_output` / `CBPK_DBGOUT` (기본 0)
+  - `Config::Initialize`보다 먼저 필요하므로(로그 파일이 그 전에 열려야 한다) `diagnostics.cpp`가
+    같은 ini를 직접 읽는다. Config 모듈과 파일만 공유하고 코드 의존은 없다.
+- **계측 마스터 토글을 넣었다** (계획 5단계의 나머지 절반). `Profile::Scope`가 꺼져 있으면 QPC를
+  아예 부르지 않는다. 생성자에서 `Enabled()`가 false면 `start_`가 0으로 남고 소멸자가 통째로
+  빠진다. `Record`와 `LogCadence`도 같은 스위치를 본다.
+- 초기화 시 `diagnostics toggles: logging=.. profiling=.. veh=.. dbgout=..` 한 줄을 남긴다. 나중에
+  로그만 보고 그 세션이 어떤 조건이었는지 알 수 있어야 한다.
+
+### 인게임 확인 (PID 26508, 2560x1440)
+
+빌드 후 주입해서 확인한 것:
+
+- 로그가 `C:\Users\admin\AppData\Local\cp2077_trainer\cp2077_trainer.log`에 생기고 `async=on`.
+- `diagnostics toggles: logging=1 profiling=1 veh=1 dbgout=0`, VEH `active`.
+- 훅 전부 활성화, 오버레이 초기화 완료, 첫 프레임 제출까지 정상. 게임 응답 정상.
+- 큐 드롭 0줄, VEH 기록 0건.
+
+한산한 씬(퍼펫 0)의 5초 창 수치. 게임플레이 표본이 아니므로 최적화 판단 근거로 쓰면 안 된다:
+
+| 슬롯 | avg | max |
+|---|---|---|
+| tickTotal | 3.6 us | 17.6 us |
+| esp | 0.8 us | 48.8 us |
+| aimbot | 6.8 us | 95.7 us |
+| snapshot (1회) | 0.4 us | 48.5 us |
+
+- `snapshot` 표본 수가 `esp`의 정확히 2.00배로 다시 확인됐다 (4666 : 2333). **Phase 1의 스냅샷
+  이중 패스는 그대로 남아 있다.**
+- Present 레이트가 초당 약 509회였다.
+
+### 같이 발견한 것 (안 고침)
+
+`%LOCALAPPDATA%\cbpk\config.ini`가 **UTF-8 BOM으로 시작한다.** `GetPrivateProfileIntW`/
+`WritePrivateProfileStringW`는 이 파일을 ANSI로 취급하므로 BOM 3바이트가 첫 줄 앞에 붙어 **맨 처음
+`[trainer]` 섹션 헤더가 섹션으로 인식되지 않는다.** 그래서 예전에 저장이 일어났을 때 파일 끝에
+`[trainer]` 섹션이 한 번 더 붙었고, 지금은 그 두 번째 것만 유효하다 (Win32 API로 직접 읽어서
+확인: `trainer/no_recoil = 1`, 즉 뒤쪽 값). 동작에 지금 당장 문제는 없지만 파일 앞부분 4줄이 죽은
+텍스트다. BOM을 그냥 지우면 앞쪽 죽은 섹션이 되살아나 `no_recoil`이 1에서 0으로 뒤집히므로,
+고칠 때는 **BOM 제거와 죽은 섹션 삭제를 반드시 같이** 해야 한다. 아마 이전 세션에서 PowerShell
+`Set-Content`/`Out-File`(5.1은 UTF8에 BOM을 붙인다)로 이 파일을 만졌던 것이 원인이다.

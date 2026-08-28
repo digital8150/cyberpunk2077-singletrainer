@@ -1,5 +1,7 @@
 #include "diagnostics.h"
 
+#include "profiling.h"
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -308,13 +310,43 @@ namespace
             FlushFileBuffers(g_logFile);
     }
 
-    bool ReadEnvironmentFlag(const wchar_t* name, bool fallback)
+    wchar_t g_configPath[MAX_PATH] = {};
+
+    // Config::Initialize가 쓰는 것과 같은 파일이다. 진단 토글은 Config보다 먼저 필요하므로(로그가
+    // 그 전에 열려야 한다) 여기서 직접 읽는다.
+    void ResolveConfigPath()
+    {
+        wchar_t localAppData[MAX_PATH]{};
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH - 24)
+            return;
+        if (swprintf_s(g_configPath, L"%ls\\cbpk\\config.ini", localAppData) < 0)
+            g_configPath[0] = L'\0';
+    }
+
+    // 토글 하나를 푸는 순서: 환경 변수가 있으면 그것, 없으면 config.ini의 [diagnostics] 값,
+    // 그것도 없으면 컴파일 기본값. 환경 변수를 위에 두는 이유는 게임을 그 변수와 함께 띄운
+    // 세션에서만 일회성으로 덮어쓰고 싶은 경우가 있기 때문이고, ini를 두는 이유는 이미 떠 있는
+    // 게임에 나중에 주입할 때 환경 변수를 심을 방법이 없기 때문이다.
+    //
+    // ini에 키가 없으면 기본값을 한 번 써 넣어서 파일만 봐도 어떤 스위치가 있는지 알 수 있게 한다.
+    bool ReadToggle(const wchar_t* environmentName, const wchar_t* iniKey, bool fallback)
     {
         wchar_t value[8]{};
-        const DWORD length = GetEnvironmentVariableW(name, value, 8);
-        if (length == 0 || length >= 8)
+        const DWORD length = GetEnvironmentVariableW(environmentName, value, 8);
+        if (length > 0 && length < 8)
+            return value[0] == L'1';
+
+        if (g_configPath[0] == L'\0')
             return fallback;
-        return value[0] == L'1';
+
+        constexpr UINT kMissing = 0xFFFF;
+        const UINT stored = GetPrivateProfileIntW(L"diagnostics", iniKey, kMissing, g_configPath);
+        if (stored != kMissing)
+            return stored != 0;
+
+        WritePrivateProfileStringW(L"diagnostics", iniKey, fallback ? L"1" : L"0", g_configPath);
+        return fallback;
     }
 
     void EnsureTrailingSeparator(wchar_t* path, std::size_t capacity)
@@ -631,8 +663,11 @@ namespace Diagnostics
 {
     void Initialize(HMODULE module)
     {
-        g_loggingEnabled.store(ReadEnvironmentFlag(L"CBPK_LOG", true), std::memory_order_relaxed);
-        g_debugOutputEnabled.store(ReadEnvironmentFlag(L"CBPK_DBGOUT", false), std::memory_order_relaxed);
+        ResolveConfigPath();
+        g_loggingEnabled.store(ReadToggle(L"CBPK_LOG", L"logging", true), std::memory_order_relaxed);
+        g_debugOutputEnabled.store(ReadToggle(L"CBPK_DBGOUT", L"debug_output", false), std::memory_order_relaxed);
+        const bool profilingEnabled = ReadToggle(L"CBPK_PROFILE", L"profiling", true);
+        Profile::SetEnabled(profilingEnabled);
 
         wchar_t moduleDir[MAX_PATH]{};
         ResolveBaseDirectory(module, moduleDir, MAX_PATH);
@@ -665,7 +700,7 @@ namespace Diagnostics
         // 켜 두는 것 자체가 게임 동작을 바꿀 수 있는 변수다. 필요할 때만 CBPK_VEH=1로 켠다.
         // 마지막(우선순위 0)에 등록해 게임/RED4ext/CET의 핸들러가 먼저 처리할 기회를 갖게 한다.
         // 예전 구현은 우선순위 1로 모든 핸들러보다 앞에 끼어들었다.
-        const bool vehRequested = ReadEnvironmentFlag(L"CBPK_VEH", false);
+        const bool vehRequested = ReadToggle(L"CBPK_VEH", L"veh", false);
         if (vehRequested)
             g_vehHandle = AddVectoredExceptionHandler(0, VectoredExceptionHandler);
 
@@ -675,6 +710,10 @@ namespace Diagnostics
         Log("log sink: path=%ls async=%s dbgout=%s (CBPK_LOG_DIR overrides the directory)", g_logPath,
             g_writerRunning.load(std::memory_order_acquire) ? "on" : "off (writer thread unavailable)",
             g_debugOutputEnabled.load(std::memory_order_relaxed) ? "on" : "off");
+        Log("diagnostics toggles: logging=%d profiling=%d veh=%d dbgout=%d config=%ls",
+            g_loggingEnabled.load(std::memory_order_relaxed) ? 1 : 0, profilingEnabled ? 1 : 0,
+            vehRequested ? 1 : 0, g_debugOutputEnabled.load(std::memory_order_relaxed) ? 1 : 0,
+            g_configPath[0] != L'\0' ? g_configPath : L"<unavailable>");
         Flush();
     }
 

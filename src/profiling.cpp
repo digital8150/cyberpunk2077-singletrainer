@@ -142,9 +142,17 @@ namespace Diagnostics::Profile
         return value.QuadPart;
     }
 
+    void SetEnabled(bool enabled)
+    {
+        if (g_enabled.exchange(enabled, std::memory_order_relaxed) == enabled)
+            return;
+        if (!enabled)
+            Reset();
+    }
+
     void Record(Slot slot, std::int64_t ticks)
     {
-        if (slot >= Slot::Count || ticks < 0)
+        if (slot >= Slot::Count || ticks < 0 || !Enabled())
             return;
 
         Accumulator& accumulator = g_slots[static_cast<std::size_t>(slot)];
@@ -166,6 +174,9 @@ namespace Diagnostics::Profile
 
     void LogCadence()
     {
+        if (!Enabled())
+            return;
+
         const ULONGLONG now = GetTickCount64();
         if (g_lastCadenceTick == 0)
         {
