@@ -346,6 +346,9 @@ namespace
                 }
             }
             Diagnostics::Profile::LogCadence();
+            // VEH가 링 버퍼에 적어 둔 예외를 여기서 로그로 옮긴다. 예외 문맥이 아닌 평범한 틱
+            // 문맥이라 모듈 조회와 파일 쓰기를 해도 안전하다.
+            Diagnostics::DrainExceptionLog();
         }
 
         if (g_originalOnTick)
