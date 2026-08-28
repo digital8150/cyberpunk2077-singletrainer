@@ -793,15 +793,20 @@ namespace
             if (puppet)
                 TrackPuppet(entity);
 
+            // Read the id before taking the lock. An access violation between acquire and release would leak
+            // g_lastEntityLock permanently now that this body is inside __except, and GetStats would then block
+            // forever on it. Nothing under the lock touches game memory.
+            const std::uint64_t entityId = entity->entityId;
+
             AcquireSRWLockExclusive(&g_lastEntityLock);
-            g_lastEntityId = entity->entityId;
+            g_lastEntityId = entityId;
             g_lastPosition[0] = position[0];
             g_lastPosition[1] = position[1];
             g_lastPosition[2] = position[2];
             if (puppet)
             {
                 g_hasLastPuppet = true;
-                g_lastPuppetId = entity->entityId;
+                g_lastPuppetId = entityId;
                 g_lastPuppetPosition[0] = position[0];
                 g_lastPuppetPosition[1] = position[1];
                 g_lastPuppetPosition[2] = position[2];
@@ -813,7 +818,7 @@ namespace
                 Diagnostics::Log("entity registered: total=%llu ptr=%p id=0x%llX typeHash=0x%llX puppet=%d "
                                  "positioned=%d pos=(%.2f, %.2f, %.2f)",
                                  static_cast<unsigned long long>(total), entity,
-                                 static_cast<unsigned long long>(entity->entityId),
+                                 static_cast<unsigned long long>(entityId),
                                  static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
                                  hasPosition ? 1 : 0, position[0], position[1], position[2]);
             }

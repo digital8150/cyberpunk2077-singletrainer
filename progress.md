@@ -1064,3 +1064,96 @@
 
 - `E:/repos/cyberpunk2077-fix-veh` 워크트리에서 Release 빌드 완료 (`build/bin/Release/cp2077_trainer.dll`).
 - SEH 접근 위반 발생 시에도 스레드 중단 없이 즉시 복구됨을 확인.
+
+## 2026-08-28 - 세션 인계: VEH 수정 머지 + Phase 5 구현 완료 (라이브 검증 미완)
+
+다음 작업을 깨끗한 세션에서 이어가기 위한 인계 기록이다. 위 "긴급 수정: VEH 동기 덤프" 항목은
+`fix/veh-freeze-safe` 워크트리에서 작성된 것이고, 아래는 그것을 master에 머지하면서 확인·보완한
+내용과 Phase 5 구현 상태다.
+
+### 1. 머지 결과
+
+- `fix/veh-freeze-safe` (커밋 `f468b9d`)를 master에 `--no-ff`로 머지했다. 분기점이 Phase 0 기준선
+  커밋(`2162900`)이라 소스 충돌은 없었다.
+- **머지하면서 고친 것 하나**: `CaptureEntity`를 `__try`로 감싼 변경에 락 누수 위험이 있었다.
+  `AcquireSRWLockExclusive(&g_lastEntityLock)` 다음 줄이 `g_lastEntityId = entity->entityId`라
+  거기서 폴트가 나면 `__except`로 빠지면서 `g_lastEntityLock`이 영영 잠긴 채로 남고, 이후
+  `GetStats()`가 그 락에서 무한 대기한다(= ESP 진단 스레드 정지). 엔티티 ID를 락을 잡기 전에 지역
+  변수로 읽어두고, 락 구간에서는 게임 메모리를 전혀 건드리지 않도록 바꿨다.
+- VEH 로그 스팸 우려는 실측으로 기각했다. 전체 로그에서 VEH 인터셉트는 15건뿐이고, 그중 9건은
+  11:18 언로드 재시도 루프에서 `KERNELBASE.dll+0xC187A`(RaiseException)로 초당 1건씩 찍힌 것이다.
+  스냅샷 경로의 stale 폴트는 `staleRemoved=2` 수준으로 드물다. 1줄 로그를 남기는 비용은 문제없다.
+
+### 2. 12:52 프리즈에 대해 기록으로 남길 사실 (해석과 분리)
+
+측정된 사실만:
+
+- 12:51:53경 `inject.py --unload`로 언로드 이벤트를 신호했다. 트레이너 로그에는
+  `safe unload requested`도 `hook shutdown started`도 **찍히지 않았다**. 11:18의 정상 언로드
+  때는 두 줄 다 찍혔다.
+- 12:52:03.329 렌더 스레드(tid 8136)에서 `cp2077_trainer.dll+0xCAB9`가 `0xFFFFFFFFFFFFFFFF`를
+  읽으려다 AV. 스택은 트레이너 → `nvwgf2umx.dll`(NVIDIA D3D12 드라이버) → 트레이너로 이어진다.
+- 12:52:04.624 미니덤프 기록 완료. **파일 크기는 133,561,559 바이트(133 MB)다** — 위 항목의
+  "1.2GB"는 실제 파일과 다르다. 결론(동기 덤프가 렌더 루프를 멈춘다)은 그대로 유효하다.
+- 이후 로그가 끊겼고 PID 13196은 `Responding=False` 상태로 살아 있다.
+
+아직 확정하지 못한 것:
+
+- 언로드 요청과 AV의 인과. 워커가 로그를 한 줄도 남기지 않은 것은 "요청이 워커에 닿지 않았다"는
+  뜻이고, 그러면 언로드가 D3D 자원을 해제해서 Present가 터졌다는 설명은 성립하지 않는다. 반대로
+  이벤트 신호 후 정확히 10초(인젝터 타임아웃)만에 AV가 났다는 시간적 근접은 남는다. 다음에 언로드할
+  때 이 두 줄이 찍히는지부터 확인할 것.
+
+### 3. Phase 5 구현 (커밋 `da74847`) — 빌드 통과, 인게임 검증 미완
+
+기준선에서 health가 퍼펫 2명일 때 26.1 us, 45명일 때 22.2 us로 **퍼펫 수와 무관한 고정 비용**이었기
+때문에 계획의 마지막 단계였던 Phase 5를 1순위로 올려서 먼저 구현했다.
+
+- **점유 비트맵**(`g_puppetOccupancy`, 256비트 = 32바이트). health/attitude/highlight의 라운드로빈이
+  이제 이 비트맵을 보고 실제로 찬 슬롯만 만진다. 이전에는 매 틱 1 KB 넘는 엔트리 256개를 stride로
+  훑었다. `TrackedPuppet::entity`가 여전히 단일 진실 원천이고, 비트맵은 같은 락 아래에서 갱신되며
+  스캔이 착지한 엔트리는 항상 다시 검증한다. 세팅 지점은 `TrackPuppet` 하나, 클리어 지점은
+  `GetPuppetSnapshots`의 stale 제거 하나뿐이다.
+- **배치 발행**: `PublishHealthBatch` / `PublishHostilityBatch`가 배치당 배타 락 1회만 잡고, 수집
+  시점의 슬롯 인덱스에 바로 쓴다. 값 하나당 전체 리스트를 훑던 것이 비교 1회로 줄었다. 슬롯이
+  재활용됐을 수 있으므로 정체성 검증은 그대로 남아 있다.
+- **attitude agent 캐시**: `TrackedPuppet::attitudeAgent`. `FindAttitudeAgent`는 엔티티의 모든
+  컴포넌트를 훑는데 NPC마다 패스마다 돌고 있었다. 리플렉션 호출이 실패하면 캐시를 비워서 컴포넌트가
+  교체된 경우 다음 패스에 자동 복구된다.
+- **계측 추가**: `profile tickdetail` 줄이 새로 생긴다 —
+  `healthCollect / healthInvoke / attitudeCollect / attitudeInvoke / highlightCollect`.
+  기준선만으로는 health의 고정 비용이 슬롯 순회에서 온 것인지 리플렉션 호출에서 온 것인지 가를 수
+  없었다. 이 다섯 값이 그 답을 준다.
+
+**주의**: 이 커밋은 빌드만 통과했고 한 번도 게임에 들어가 본 적이 없다. 배포하려던 순간 위 프리즈가
+났다.
+
+### 4. 현재 빌드 상태
+
+- `build-next/bin/Release/cp2077_trainer.dll` — 머지 + Phase 5 + 락 누수 수정이 전부 들어간 최신
+  산출물. Release 빌드 통과.
+- `build/bin/Release/cp2077_trainer.dll` — **구버전(11:18 빌드)이다.** 멈춘 게임 프로세스가 물고
+  있어서 링크가 `LNK1104`로 막힌다. 프로세스를 정리한 뒤 다시 빌드해야 한다.
+
+### 5. 다음 세션이 할 일 (순서대로)
+
+1. PID 13196을 정리하고 게임 재시작. `cmake --build build --config Release`로 `build/`를 최신화.
+2. Phase 5 DLL 주입 → 몇 분 플레이 → `profile tick`과 새 `profile tickdetail` 줄을 기준선과 대조.
+   확인할 것: health의 고정 26 us가 줄었는가, 줄었다면 collect 쪽인가 invoke 쪽인가.
+   attitude agent 캐시가 `attitudeInvoke`를 떨어뜨렸는가.
+3. 결과를 기록하고 커밋한 뒤 **Phase 1**(스냅샷 패스 프레임당 1회 통합)로 진행.
+4. 이후 **Phase 2 축소판**(카테고리 캐시 + `IsCorpseDead` 주기 제한 + `kMaxSkeletonSegments` 64→8,
+   락 재구성은 제외), **Phase 3**(포즈 슬롯 읽기를 메인 틱으로), **Phase 4**는 보류 유지.
+5. 마지막 단계에서 **로깅·프로파일링 마스터 토글**을 만든다. 개발 중이 아닐 때는 진단 로그와 QPC
+   계측을 통째로 끄고 최고 성능으로 돌릴 수 있게 하는 것이 목표다.
+
+### 6. 같이 남은 미해결 항목
+
+- **Release 빌드가 PDB를 만들지 않는다.** 그래서 `cp2077_trainer.dll+0xCAB9`를 함수 이름으로 풀 수
+  없었다. 크래시 도구를 붙여 놓은 마당에 심볼이 없으면 덤프의 가치가 절반이다. `/Zi` + `/DEBUG`를
+  Release에 켜는 것을 검토할 것 (런타임 성능에는 영향 없음).
+- **언로드 경로**. 11:18에는 `detour callbacks did not drain within 5000 ms` 후 재시도로 성공했고,
+  12:52에는 워커가 로그를 한 줄도 남기지 못했다. 드레인 판정과 요청 전달 경로 둘 다 아직 믿을 수
+  없는 상태다.
+- **Phase 4 판단 보류**. 12:52 세션에서는 visible-only가 켜져 있었는데도(`visibility[on=1]`)
+  75분간 캐스트 24,681회에 `dropped=0`이었다. 예전 로그의 drop 누계는 다른 세션 것이다.
