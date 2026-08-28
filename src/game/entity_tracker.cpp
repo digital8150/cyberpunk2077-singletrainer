@@ -165,9 +165,6 @@ namespace
         Game::EntityTracker::NpcCategory category = Game::EntityTracker::NpcCategory::Other;
         Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
         ULONGLONG hostilityUpdatedAt = 0;
-        // This puppet's gameAttitudeAgent component. Located once and reused; cleared whenever a reflected call
-        // through it fails, so a swapped or freed component self-heals on the next pass.
-        void* attitudeAgent = nullptr;
         bool isDead = false;
         bool healthValid = false;
         float healthCurrent = 0.0f;
@@ -1406,22 +1403,24 @@ namespace
         return resolved;
     }
 
-    // agent is this puppet's cached gameAttitudeAgent: located on first use and reused afterwards, since the
-    // component search walks every component of the entity and was running once per NPC per pass.
-    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, void*& agent,
-                                                 Game::Rtti::Handle& playerAgent)
+    // The gameAttitudeAgent component is deliberately NOT cached across ticks. Phase 5 did cache it, and that
+    // is what froze the game: the component belongs to the NPC, so it is freed when the NPC streams out, and the
+    // stale pointer was still being passed to a reflected VM call as `this`. Once that memory is recycled into
+    // another object the pointer is readable, so the __try below never fires - the call simply lands on the wrong
+    // object and corrupts it. Re-resolving per pass costs one component walk and is the only safe option without
+    // a liveness signal for the component itself.
+    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, Game::Rtti::Handle& playerAgent)
     {
         using Game::EntityTracker::Hostility;
         std::int32_t attitude = -1;
         bool called = false;
         __try
         {
-            if (!agent)
-                agent = FindAttitudeAgent(entity);
-            if (agent)
+            void* npcAgent = FindAttitudeAgent(entity);
+            if (npcAgent)
             {
                 Game::Rtti::Argument arguments[] = {{&playerAgent}};
-                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, agent, arguments, 1,
+                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, npcAgent, arguments, 1,
                                             &attitude);
             }
         }
@@ -1430,11 +1429,7 @@ namespace
             called = false;
         }
         if (!called)
-        {
-            // Drop the cache so a component that was swapped out is looked up again instead of retried forever.
-            agent = nullptr;
             return Hostility::Unknown;
-        }
 
         // EAIAttitude: AIA_Friendly = 0, AIA_Neutral = 1, AIA_Hostile = 2.
         switch (attitude)
@@ -1455,12 +1450,10 @@ namespace
         EntityLayout* entity = nullptr;
         std::uint64_t entityId = 0;
         std::size_t slot = 0;
-        void* attitudeAgent = nullptr;
         Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
     };
 
-    // Same shape as PublishHealthBatch: one exclusive lock, one identity comparison at a known slot. The agent
-    // pointer resolved during the pass is written back so the next pass skips the component search.
+    // Same shape as PublishHealthBatch: one exclusive lock, one identity comparison at a known slot.
     void PublishHostilityBatch(const AttitudeWork* items, std::size_t count)
     {
         const ULONGLONG now = GetTickCount64();
@@ -1475,7 +1468,6 @@ namespace
                 continue;
             tracked.hostility = work.hostility;
             tracked.hostilityUpdatedAt = now;
-            tracked.attitudeAgent = work.attitudeAgent;
         }
         ReleaseSRWLockExclusive(&g_puppetListLock);
         g_attitudeValid.fetch_add(validCount, std::memory_order_relaxed);
@@ -1510,7 +1502,6 @@ namespace
             work.entity = tracked.entity;
             work.entityId = tracked.entityId;
             work.slot = slot;
-            work.attitudeAgent = tracked.attitudeAgent;
         }
         ReleaseSRWLockShared(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeCollect,
@@ -1569,8 +1560,7 @@ namespace
         const std::int64_t invokeStart = Diagnostics::Profile::Now();
         for (std::size_t i = 0; i < workCount; ++i)
         {
-            workItems[i].hostility = ReadHostility(workItems[i].entity, workItems[i].attitudeAgent,
-                                                   g_attitudeRuntime.playerAgent);
+            workItems[i].hostility = ReadHostility(workItems[i].entity, g_attitudeRuntime.playerAgent);
         }
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
                                      Diagnostics::Profile::Now() - invokeStart);
