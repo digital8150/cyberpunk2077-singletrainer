@@ -176,11 +176,26 @@ Claude Code 전용 지침은 `CLAUDE.md`를 따로 참고하되, 프로젝트 �
   |---|---|---|---|
   | `logging` | `CBPK_LOG` | 1 | 진단 로그 전체 |
   | `profiling` | `CBPK_PROFILE` | 1 | QPC 구간 계측 (끄면 `Scope`가 QPC도 안 부른다) |
-  | `veh` | `CBPK_VEH` | 0 | 예외 관측 VEH 등록 |
+  | `veh` | `CBPK_VEH` | 0 | 예외 관측 VEH 등록 (`fatal_log`가 켜져 있으면 이 값과 무관하게 등록된다) |
   | `debug_output` | `CBPK_DBGOUT` | 0 | `OutputDebugStringA` (줄마다 SEH 예외가 든다) |
+  | `fatal_log` | `CBPK_FATAL` | 1 | 치명적 폴트 직기록 (`cp2077_fatal.log`) + 마지막 기회 필터 |
 
   초기화 시 `diagnostics toggles: ...` 줄에 그 세션의 상태가 남으므로, 로그를 해석할 때 이 줄을
   먼저 볼 것.
+- **치명적 폴트 기록 (`cp2077_fatal.log`)**: 평시 로그와 같은 디렉터리에 따로 쌓인다. 평시 로그는
+  링 버퍼 + writer 스레드라 **프로세스를 죽이는 폴트를 기록하지 못한다** (링은 다음 메인 틱에서야
+  비워지는데 그 틱이 오지 않는다). 그래서 이 경로만 미리 열어 둔 `FILE_FLAG_WRITE_THROUGH` 핸들로
+  곧바로 쓴다. 로그를 해석할 때:
+  - `[FATAL][veh]`는 first-chance라 **게임이 스스로 복구한 예외도 찍힌다**. 이것만 있으면 크래시의
+    증거가 아니다. `[FATAL][unhandled]`이 같이 있어야 그 예외가 실제로 프로세스를 죽였다는 뜻이다.
+  - `[SESSION] closed cleanly` 줄이 없는 세션 = 정상 종료가 아니었다. 예외 레코드도 없이 그렇다면
+    `TerminateProcess`/행/전원 차단 쪽을 본다.
+  - 세션 헤더에 모듈 표가 같이 들어가므로 이 파일 하나로 원시 주소를 풀 수 있다. 다만 스냅샷은 주입
+    시점 것이라, 그 뒤에 로드된 모듈의 주소는 이름 없이 원시 값으로 남는다.
+  - **이 경로에 손댈 때의 규칙**: 핸들러 안에서 CRT(`snprintf` 포함)·할당·로더 락을 잡을 수 있는 API
+    (`GetModuleHandleEx`, `MiniDumpWriteDump`, DbgHelp 전부)·대기하는 잠금을 쓰지 말 것. 쓰기 예산
+    (`kFatalRecordBudget`)을 없애지 말 것 — `ACCESS_VIOLATION`은 게임이 스트리밍 중 정상적으로 내고
+    복구하므로, 예산이 없으면 그 코드가 매 프레임 디스크를 두드리는 프리징 경로가 된다.
 - **Cheat Engine 7.7 / IDA Free 8.4**: 개발 머신에 설치되어 있음 (`C:\Program Files\Cheat Engine`,
   `C:\Program Files\IDA Freeware 8.4`). 둘 다 GUI 애플리케이션이라 에이전트가 자동화할 수 없음 — 사용자가
   직접 조작하는 수동 RE 용도.

@@ -11,6 +11,16 @@
 //   CBPK_LOG_DIR    로그/덤프 디렉터리 지정. 기본값은 %LOCALAPPDATA%\cp2077_trainer\.
 //   CBPK_DBGOUT=1   OutputDebugStringA 출력을 켠다 (기본 off: 줄마다 SEH 예외가 든다).
 //   CBPK_VEH=1      예외 관측용 VEH를 등록한다.
+//   CBPK_FATAL=0    치명적 폴트 직기록을 끈다 (기본 on).
+//
+// 치명적 폴트는 위의 비동기 경로를 타지 않는다. 링은 다음 메인 틱에서야 비워지는데 프로세스를 죽이는
+// 폴트에는 그 틱이 오지 않기 때문이다. 대신 미리 열어 둔 전용 핸들(`cp2077_fatal.log`)에 곧바로 쓴다.
+// 그 경로는 CRT도 할당도 로더 락도 쓰지 않고, 프로세스 수명 전체에 쓰기 예산이 걸려 있으며, 잠금은
+// 기다리지 않는 try-lock 하나뿐이다 -- 로거가 크래시나 프리징의 원인이 되지 않는 것이 유일한 설계 목표다.
+// 남는 기록은 두 종류이고, 둘을 비교하면 예외의 성격을 가릴 수 있다:
+//   [FATAL][veh]        first-chance. 게임이 스스로 복구한 예외도 여기 찍힌다.
+//   [FATAL][unhandled]  아무도 처리하지 않았다. 이 예외가 실제로 프로세스를 죽였다는 확정 신호.
+// `[SESSION] closed cleanly` 줄이 없는 세션은 정상 종료가 아니었다는 뜻이다.
 namespace Diagnostics
 {
     void Initialize(HMODULE module);

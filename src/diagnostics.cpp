@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <DbgHelp.h>
+#include <tlhelp32.h>
 
 namespace
 {
@@ -18,6 +19,58 @@ namespace
     wchar_t g_baseDir[MAX_PATH] = {};
     PVOID g_vehHandle = nullptr;
     std::atomic<bool> g_dumpWritten{false};
+
+    // ---- 치명적 폴트 직기록 경로 --------------------------------------------
+    // 평시 로그(Log)는 링에 넣고 writer 스레드가 1초 cadence로 쓴다. 그것이 바로 프로세스를 죽이는
+    // 폴트를 기록하지 못하는 이유다: 링은 다음 메인 틱에서야 비워지는데 그 틱이 오지 않는다.
+    // 2026-08-28 15:46:10 크래시가 정확히 그 모양이었다. VEH 기록 0건, WER 덤프 없음, 남은 것은
+    // CDPR 자체 post-mortem뿐이었고 우리 쪽 증거는 통째로 비어 있었다.
+    //
+    // 그래서 치명적 폴트만은 링을 거치지 않고 전용 핸들로 곧바로 내보낸다. 이 경로의 설계 목표는
+    // "로거 자신이 크래시나 프리징의 원인이 되지 않는 것" 하나뿐이고, 그 대가로 기록 품질은 양보했다.
+    //   - 핸들러 안에서 CRT도, 할당도, 로더 락을 잡을 수 있는 API도 부르지 않는다. 포맷터는 손으로 썼다.
+    //     부르는 WinAPI는 GetSystemTimeAsFileTime / GetCurrentThreadId / GetCurrentProcessId / WriteFile 넷뿐이다.
+    //   - 파일 핸들, 모듈 테이블, 타임존 보정값은 Initialize에서 미리 준비한다.
+    //   - 프로세스 수명 전체에 쓰기 예산을 둔다(kFatalRecordBudget). ACCESS_VIOLATION은 게임이 엔티티
+    //     스트리밍 중 정상적으로 내고 자체 SEH로 복구하기도 한다. 예산이 없으면 이 코드가 매 프레임
+    //     디스크를 두드리는, 바로 그 프리징 경로가 된다.
+    //   - 스택 버퍼 대신 정적 버퍼를 쓴다(EXCEPTION_STACK_OVERFLOW에서는 남은 스택이 한 페이지뿐이다).
+    //     상호배제는 try-lock 하나로 끝내고 잡지 못하면 포기한다. 어떤 경우에도 대기하지 않는다.
+    //   - 전 구간을 __try로 감싸고, 코어 레코드와 스택 스캔을 따로 써서 스캔이 폴트나도 코어는 남긴다.
+    constexpr std::size_t kFatalRecordCapacity = 4096;
+    constexpr int kFatalRecordBudget = 16;
+    constexpr std::size_t kFatalModuleSlots = 256;
+    constexpr std::size_t kFatalStackScanSlots = 96;
+    constexpr int kFatalStackScanHits = 12;
+    constexpr char kFatalHexDigits[] = "0123456789ABCDEF";
+
+    // Initialize에서 한 번 채우고 그 뒤로는 읽기 전용이다. 핸들러가 주소를 모듈 이름으로 바꾸는 데
+    // 쓴다. 그 순간에 GetModuleHandleEx를 부르면 로더 락이라 그럴 수 없기 때문이다.
+    struct FatalModuleRange
+    {
+        std::uintptr_t base;
+        std::uintptr_t end;
+        char name[64];
+    };
+
+    FatalModuleRange g_fatalModules[kFatalModuleSlots]{};
+    std::atomic<std::size_t> g_fatalModuleCount{0};
+    std::uintptr_t g_selfModuleBase = 0;
+    std::uintptr_t g_selfModuleEnd = 0;
+
+    HANDLE g_fatalFile = INVALID_HANDLE_VALUE;
+    wchar_t g_fatalPath[MAX_PATH]{};
+    std::atomic<bool> g_fatalEnabled{false};
+    std::atomic<int> g_fatalBudget{kFatalRecordBudget};
+    volatile LONG g_fatalBufferGate = 0;
+    char g_fatalBuffer[kFatalRecordCapacity]{};
+    // UTC를 로컬로 옮기는 보정값. 핸들러에서 GetLocalTime을 부를 수 없어서(타임존 캐시/레지스트리를
+    // 만질 수 있다) 미리 재 둔다. 세션 도중 DST가 바뀌면 한 시간 어긋나므로 같은 줄에 원본 FILETIME도
+    // 함께 남긴다.
+    std::int64_t g_localTimeBias100ns = 0;
+
+    LPTOP_LEVEL_EXCEPTION_FILTER g_previousUnhandledFilter = nullptr;
+    std::atomic<bool> g_unhandledFilterInstalled{false};
 
     // ── 비동기 로그 큐 ──────────────────────────────────────────────────────────────
     // 로그를 부르는 쪽은 Present 스레드와 게임 메인 틱이다. 그 스레드에서 디스크를 만지면 프레임이
@@ -567,6 +620,474 @@ namespace
     // 그 경우 확실히 죽는 구조였다.
     thread_local bool t_insideVeh = false;
 
+    // ---- 손으로 쓴 포맷터 -----------------------------------------------------
+    // snprintf 계열은 로케일 락을 잡고 구현에 따라 할당도 한다. 예외 문맥에서는 둘 다 금지라
+    // 필요한 최소한만 직접 만든다. 전부 순수 계산이고 어떤 전역 상태도 만지지 않는다.
+    struct FatalWriter
+    {
+        char* buffer;
+        std::size_t capacity;
+        std::size_t length;
+    };
+
+    void PutChar(FatalWriter& writer, char value)
+    {
+        if (writer.length + 1 < writer.capacity)
+            writer.buffer[writer.length++] = value;
+    }
+
+    void PutText(FatalWriter& writer, const char* text)
+    {
+        if (!text)
+            return;
+        for (std::size_t i = 0; i < 512 && text[i]; ++i)
+            PutChar(writer, text[i]);
+    }
+
+    void PutHex(FatalWriter& writer, std::uint64_t value, int digits)
+    {
+        if (digits < 1)
+            digits = 1;
+        if (digits > 16)
+            digits = 16;
+        for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
+            PutChar(writer, kFatalHexDigits[(value >> shift) & 0xF]);
+    }
+
+    void PutHexTrim(FatalWriter& writer, std::uint64_t value)
+    {
+        int digits = 1;
+        for (std::uint64_t probe = value >> 4; probe != 0; probe >>= 4)
+            ++digits;
+        PutHex(writer, value, digits);
+    }
+
+    void PutDec(FatalWriter& writer, std::uint64_t value, int minDigits)
+    {
+        char digits[24];
+        int count = 0;
+        do
+        {
+            digits[count++] = static_cast<char>('0' + static_cast<int>(value % 10));
+            value /= 10;
+        } while (value != 0 && count < 24);
+
+        for (int pad = count; pad < minDigits; ++pad)
+            PutChar(writer, '0');
+        while (count > 0)
+            PutChar(writer, digits[--count]);
+    }
+
+    // Initialize가 떠 둔 스냅샷만 본다. 정적 배열 선형 스캔이라 락도 시스템 콜도 없다.
+    const FatalModuleRange* FindFatalModule(std::uintptr_t address)
+    {
+        if (address == 0)
+            return nullptr;
+        const std::size_t count = g_fatalModuleCount.load(std::memory_order_acquire);
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (address >= g_fatalModules[i].base && address < g_fatalModules[i].end)
+                return &g_fatalModules[i];
+        }
+        return nullptr;
+    }
+
+    void PutAddress(FatalWriter& writer, std::uintptr_t address)
+    {
+        PutText(writer, "0x");
+        PutHex(writer, address, 16);
+        if (const FatalModuleRange* range = FindFatalModule(address))
+        {
+            PutText(writer, " (");
+            PutText(writer, range->name);
+            PutText(writer, "+0x");
+            PutHexTrim(writer, address - range->base);
+            PutChar(writer, ')');
+        }
+    }
+
+    // GetSystemTimeAsFileTime은 KUSER_SHARED_DATA를 읽는 것이 전부라 락도 할당도 없다.
+    // GetLocalTime은 그렇지 않으므로 여기서 부르지 않고, 미리 재 둔 보정값을 더한다.
+    void PutFatalTimestamp(FatalWriter& writer)
+    {
+        FILETIME now{};
+        GetSystemTimeAsFileTime(&now);
+        const std::uint64_t utc =
+            (static_cast<std::uint64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+        const std::uint64_t local = utc + static_cast<std::uint64_t>(g_localTimeBias100ns);
+        const std::uint64_t msOfDay = (local / 10000ull) % 86400000ull;
+
+        PutDec(writer, msOfDay / 3600000ull, 2);
+        PutChar(writer, ':');
+        PutDec(writer, (msOfDay / 60000ull) % 60ull, 2);
+        PutChar(writer, ':');
+        PutDec(writer, (msOfDay / 1000ull) % 60ull, 2);
+        PutChar(writer, '.');
+        PutDec(writer, msOfDay % 1000ull, 3);
+        PutText(writer, " (utc_ft=0x");
+        PutHex(writer, utc, 16);
+        PutChar(writer, ')');
+    }
+
+    void FlushFatalWriter(FatalWriter& writer)
+    {
+        const HANDLE file = g_fatalFile;
+        if (file == INVALID_HANDLE_VALUE || writer.length == 0)
+            return;
+
+        // FILE_FLAG_WRITE_THROUGH로 열어 뒀으므로 FlushFileBuffers를 따로 부르지 않는다.
+        // 그쪽은 메타데이터까지 밀어내는 훨씬 비싼 호출이다.
+        DWORD written = 0;
+        WriteFile(file, writer.buffer, static_cast<DWORD>(writer.length), &written, nullptr);
+    }
+
+    // ---- 레코드 본문 ---------------------------------------------------------
+    void BuildFatalCoreRecord(PEXCEPTION_POINTERS exceptionInfo, const char* origin)
+    {
+        FatalWriter writer{g_fatalBuffer, kFatalRecordCapacity, 0};
+
+        const EXCEPTION_RECORD* record = exceptionInfo ? exceptionInfo->ExceptionRecord : nullptr;
+        const DWORD code = record ? record->ExceptionCode : 0;
+
+        PutText(writer, "[FATAL][");
+        PutText(writer, origin);
+        PutText(writer, "] ");
+        PutFatalTimestamp(writer);
+        PutText(writer, " pid=");
+        PutDec(writer, GetCurrentProcessId(), 1);
+        PutText(writer, " tid=");
+        PutDec(writer, GetCurrentThreadId(), 1);
+        PutText(writer, "\r\n  code=0x");
+        PutHex(writer, code, 8);
+        PutChar(writer, ' ');
+        PutText(writer, ExceptionCodeToString(code));
+
+        if (record)
+        {
+            const std::uintptr_t faultAddress = reinterpret_cast<std::uintptr_t>(record->ExceptionAddress);
+
+            PutText(writer, "\r\n  at=");
+            PutAddress(writer, faultAddress);
+
+            if (code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
+            {
+                const ULONG_PTR accessType = record->ExceptionInformation[0];
+                PutText(writer, "\r\n  access=");
+                PutText(writer, accessType == 0   ? "READ"
+                                : accessType == 1 ? "WRITE"
+                                : accessType == 8 ? "EXECUTE(DEP)"
+                                                  : "UNKNOWN");
+                PutText(writer, " target=");
+                PutAddress(writer, static_cast<std::uintptr_t>(record->ExceptionInformation[1]));
+            }
+
+            // 이 한 줄이 "트레이너가 그랬는가"에 대한 즉답이다. 폴트 주소가 우리 모듈 안이면 우리 코드다.
+            const bool inTrainer = g_selfModuleBase != 0 && faultAddress >= g_selfModuleBase &&
+                                   faultAddress < g_selfModuleEnd;
+            PutText(writer, "\r\n  fault-in-trainer=");
+            PutText(writer, inTrainer ? "YES" : "no");
+        }
+
+        if (exceptionInfo && exceptionInfo->ContextRecord)
+        {
+            const CONTEXT* context = exceptionInfo->ContextRecord;
+            PutText(writer, "\r\n  rip=0x");
+            PutHex(writer, context->Rip, 16);
+            PutText(writer, " rsp=0x");
+            PutHex(writer, context->Rsp, 16);
+            PutText(writer, " rbp=0x");
+            PutHex(writer, context->Rbp, 16);
+            PutText(writer, "\r\n  rax=0x");
+            PutHex(writer, context->Rax, 16);
+            PutText(writer, " rbx=0x");
+            PutHex(writer, context->Rbx, 16);
+            PutText(writer, " rcx=0x");
+            PutHex(writer, context->Rcx, 16);
+            PutText(writer, " rdx=0x");
+            PutHex(writer, context->Rdx, 16);
+            PutText(writer, "\r\n  rsi=0x");
+            PutHex(writer, context->Rsi, 16);
+            PutText(writer, " rdi=0x");
+            PutHex(writer, context->Rdi, 16);
+            PutText(writer, " r8=0x");
+            PutHex(writer, context->R8, 16);
+            PutText(writer, " r9=0x");
+            PutHex(writer, context->R9, 16);
+            PutText(writer, "\r\n  r10=0x");
+            PutHex(writer, context->R10, 16);
+            PutText(writer, " r11=0x");
+            PutHex(writer, context->R11, 16);
+            PutText(writer, " r12=0x");
+            PutHex(writer, context->R12, 16);
+            PutText(writer, " r13=0x");
+            PutHex(writer, context->R13, 16);
+        }
+
+        PutText(writer, "\r\n");
+        FlushFatalWriter(writer);
+    }
+
+    // 스택을 되감지 않고 훑기만 한다. RtlLookupFunctionEntry/StackWalk64는 락을 잡을 수 있어서
+    // 예외 문맥에서 부를 수 없다. 대신 RSP 위쪽(이미 커밋된 방향)의 값들 중 Initialize에서 떠 둔
+    // 모듈 범위 안에 떨어지는 것만 골라 적는다. 리턴 주소가 아닌 값도 섞이지만, "그때 어느 모듈이
+    // 콜 스택에 있었는가"는 이것만으로 충분히 읽힌다.
+    // 읽기 자체가 폴트날 수 있으므로 루프만 따로 감싼다. 바깥에서 감싸면 폴트가 난 순간 그때까지 모은
+    // 줄까지 통째로 날아간다 -- 실제로 첫 테스트에서 스택 꼭대기를 넘어 읽다가 그렇게 잃었다.
+    void ScanStackForModules(FatalWriter& writer, const std::uintptr_t* slots, std::size_t count)
+    {
+        volatile int hits = 0;
+        __try
+        {
+            for (std::size_t i = 0; i < count && hits < kFatalStackScanHits; ++i)
+            {
+                const std::uintptr_t value = slots[i];
+                const FatalModuleRange* range = FindFatalModule(value);
+                if (!range)
+                    continue;
+
+                PutText(writer, "\r\n    +0x");
+                PutHexTrim(writer, i * sizeof(std::uintptr_t));
+                PutChar(writer, ' ');
+                PutAddress(writer, value);
+                ++hits;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            PutText(writer, "\r\n    <stack read faulted here>");
+        }
+
+        if (hits == 0)
+            PutText(writer, " <no address inside a snapshotted module>");
+    }
+
+    void BuildFatalStackScan(PEXCEPTION_POINTERS exceptionInfo)
+    {
+        if (!exceptionInfo || !exceptionInfo->ContextRecord)
+            return;
+
+        const std::uintptr_t stackPointer = exceptionInfo->ContextRecord->Rsp;
+        if (stackPointer == 0 || (stackPointer & 7) != 0)
+            return;
+
+        // 스레드 스택의 실제 경계를 넘어서 읽지 않는다. GetCurrentThreadStackLimits는 TEB를 읽는 것이
+        // 전부라 예외 문맥에서도 안전하고, VEH/UEF 모두 폴트가 난 그 스레드에서 돌기 때문에 값도 맞다.
+        ULONG_PTR lowLimit = 0;
+        ULONG_PTR highLimit = 0;
+        GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+        if (stackPointer < lowLimit || stackPointer >= highLimit)
+            return;
+
+        std::size_t count = (highLimit - stackPointer) / sizeof(std::uintptr_t);
+        if (count > kFatalStackScanSlots)
+            count = kFatalStackScanSlots;
+        if (count == 0)
+            return;
+
+        FatalWriter writer{g_fatalBuffer, kFatalRecordCapacity, 0};
+        PutText(writer, "  stack:");
+        ScanStackForModules(writer, reinterpret_cast<const std::uintptr_t*>(stackPointer), count);
+        PutText(writer, "\r\n");
+        FlushFatalWriter(writer);
+    }
+
+    // __try를 쓰므로 이 함수에는 소멸자를 가진 객체를 두지 않는다(C2712). 코어와 스택 스캔을 따로
+    // 감싸는 이유는, 스캔이 폴트나도 코어 레코드는 이미 디스크에 나가 있게 하려는 것이다.
+    void GuardedFatalRecord(PEXCEPTION_POINTERS exceptionInfo, const char* origin)
+    {
+        __try
+        {
+            BuildFatalCoreRecord(exceptionInfo, origin);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+
+        __try
+        {
+            BuildFatalStackScan(exceptionInfo);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    // ignoreBudget은 UEF 전용이다. 그 경로는 프로세스당 사실상 한 번뿐인데, 그때 남길 레코드가
+    // 앞서 복구된 예외들에게 예산을 다 뺏기면 정작 죽는 순간의 기록이 없어진다.
+    void RecordFatalException(PEXCEPTION_POINTERS exceptionInfo, const char* origin, bool ignoreBudget)
+    {
+        if (!g_fatalEnabled.load(std::memory_order_relaxed) || g_fatalFile == INVALID_HANDLE_VALUE)
+            return;
+
+        // 정적 버퍼 하나를 두 스레드가 동시에 쓰지 못하게 막는다. 잡지 못하면 기다리지 않고 포기한다.
+        // 크래시 핸들러에서 락을 기다리는 것이야말로 우리가 없애려는 프리징이다.
+        if (InterlockedCompareExchange(&g_fatalBufferGate, 1, 0) != 0)
+            return;
+
+        // 예산은 게이트를 잡은 뒤에 깎는다. 순서를 뒤집으면 여러 스레드가 동시에 폴트를 낼 때 게이트에서
+        // 밀린 쪽이 아무것도 쓰지 않고 예산만 태운다. 8스레드 동시 폴트 테스트에서 실제로 16줄이 아니라
+        // 1줄만 남았다.
+        if (!ignoreBudget && g_fatalBudget.fetch_sub(1, std::memory_order_relaxed) <= 0)
+        {
+            // 0 밑으로 계속 내려가지 않게 붙잡아 둔다. 다시 양수가 되는 경로는 없다.
+            g_fatalBudget.store(0, std::memory_order_relaxed);
+            InterlockedExchange(&g_fatalBufferGate, 0);
+            return;
+        }
+
+        GuardedFatalRecord(exceptionInfo, origin);
+
+        InterlockedExchange(&g_fatalBufferGate, 0);
+    }
+
+    // VEH가 잡는 것은 first-chance라 "게임이 스스로 복구한 예외"와 구분되지 않는다. 여기까지 왔다는
+    // 것은 아무도 처리하지 않았다는 뜻이고, 즉 이 예외가 실제로 프로세스를 죽인다는 확정 신호다.
+    LONG WINAPI FatalUnhandledExceptionFilter(PEXCEPTION_POINTERS exceptionInfo)
+    {
+        if (!t_insideVeh)
+        {
+            t_insideVeh = true;
+            RecordFatalException(exceptionInfo, "unhandled", true);
+            t_insideVeh = false;
+        }
+
+        // 링에 남아 있는 평시 로그를 디스크까지 민다. 마지막 1초가 통째로 사라지던 구멍이 이것이다.
+        // 이 경로는 프로세스가 죽는 중이라 기다려도 되고, writer가 이미 죽었더라도 Flush의 타임아웃이
+        // 상한을 잡아 준다.
+        Diagnostics::Flush();
+
+        // CDPR 자체 post-mortem(CrashInfo.json)이 지금까지 유일한 증거였다. 반드시 이어서 부른다.
+        if (g_previousUnhandledFilter)
+            return g_previousUnhandledFilter(exceptionInfo);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // ---- 준비 (전부 평범한 문맥에서, Initialize 시점에만) ----------------------
+    void ComputeLocalTimeBias()
+    {
+        SYSTEMTIME utc{};
+        SYSTEMTIME local{};
+        GetSystemTime(&utc);
+        GetLocalTime(&local);
+
+        FILETIME utcFileTime{};
+        FILETIME localFileTime{};
+        if (!SystemTimeToFileTime(&utc, &utcFileTime) || !SystemTimeToFileTime(&local, &localFileTime))
+            return;
+
+        const std::uint64_t utcTicks =
+            (static_cast<std::uint64_t>(utcFileTime.dwHighDateTime) << 32) | utcFileTime.dwLowDateTime;
+        const std::uint64_t localTicks =
+            (static_cast<std::uint64_t>(localFileTime.dwHighDateTime) << 32) | localFileTime.dwLowDateTime;
+        g_localTimeBias100ns = static_cast<std::int64_t>(localTicks) - static_cast<std::int64_t>(utcTicks);
+    }
+
+    // Toolhelp을 쓰는 이유는 kernel32에 있어 추가 링크가 필요 없기 때문이다. 스냅샷은 여기서 한 번만
+    // 뜬다. 주입 시점에 이미 대부분의 모듈이 올라와 있고, 그 뒤에 로드된 모듈은 원시 주소로 남는다.
+    void SnapshotFatalModules(HMODULE self)
+    {
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (snapshot == INVALID_HANDLE_VALUE)
+            return;
+
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        std::size_t count = 0;
+
+        if (Module32FirstW(snapshot, &entry))
+        {
+            do
+            {
+                if (count >= kFatalModuleSlots)
+                    break;
+
+                FatalModuleRange& range = g_fatalModules[count];
+                range.base = reinterpret_cast<std::uintptr_t>(entry.modBaseAddr);
+                range.end = range.base + entry.modBaseSize;
+                if (WideCharToMultiByte(CP_UTF8, 0, entry.szModule, -1, range.name,
+                                        static_cast<int>(sizeof(range.name)), nullptr, nullptr) == 0)
+                {
+                    range.name[0] = '?';
+                    range.name[1] = '\0';
+                }
+                range.name[sizeof(range.name) - 1] = '\0';
+
+                if (self && reinterpret_cast<HMODULE>(range.base) == self)
+                {
+                    g_selfModuleBase = range.base;
+                    g_selfModuleEnd = range.end;
+                }
+                ++count;
+            } while (Module32NextW(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        g_fatalModuleCount.store(count, std::memory_order_release);
+    }
+
+    // 세션 헤더 + 모듈 표. 크래시 파일 하나만 보고도 원시 주소를 풀 수 있어야 하므로 파일 안에 같이 둔다.
+    // WRITE_THROUGH 핸들이라 줄마다 쓰면 그만큼 동기 I/O가 되니, 한 버퍼에 모아 WriteFile 한 번으로 끝낸다.
+    char g_fatalHeaderBuffer[64 * 1024];
+
+    void WriteFatalSessionHeader(HMODULE self)
+    {
+        if (g_fatalFile == INVALID_HANDLE_VALUE)
+            return;
+
+        SYSTEMTIME time{};
+        GetLocalTime(&time);
+
+        const std::size_t count = g_fatalModuleCount.load(std::memory_order_acquire);
+        int offset = snprintf(g_fatalHeaderBuffer, sizeof(g_fatalHeaderBuffer),
+                              "\r\n============================================================\r\n"
+                              "[SESSION] %04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu trainer=%p "
+                              "range=0x%016llX-0x%016llX\r\n"
+                              "[SESSION] modules=%zu (snapshotted at init; anything loaded later shows as a raw address)\r\n",
+                              time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+                              time.wMilliseconds, GetCurrentProcessId(), static_cast<void*>(self),
+                              static_cast<unsigned long long>(g_selfModuleBase),
+                              static_cast<unsigned long long>(g_selfModuleEnd), count);
+        if (offset < 0)
+            return;
+
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const std::size_t remaining = sizeof(g_fatalHeaderBuffer) - static_cast<std::size_t>(offset);
+            if (remaining < 128)
+                break;
+            const int written = snprintf(g_fatalHeaderBuffer + offset, remaining, "  0x%016llX-0x%016llX %s\r\n",
+                                         static_cast<unsigned long long>(g_fatalModules[i].base),
+                                         static_cast<unsigned long long>(g_fatalModules[i].end),
+                                         g_fatalModules[i].name);
+            if (written < 0 || static_cast<std::size_t>(written) >= remaining)
+                break;
+            offset += written;
+        }
+
+        DWORD writtenBytes = 0;
+        WriteFile(g_fatalFile, g_fatalHeaderBuffer, static_cast<DWORD>(offset), &writtenBytes, nullptr);
+    }
+
+    void OpenFatalSink(HMODULE self)
+    {
+        wcscpy_s(g_fatalPath, g_baseDir);
+        wcscat_s(g_fatalPath, L"cp2077_fatal.log");
+        RollLogIfLarge(g_fatalPath);
+
+        // WRITE_THROUGH: 이 파일에 쓰는 시점은 프로세스가 죽는 중이라 파일 시스템 캐시에만 남겨서는
+        // 안심할 수 없다. 대신 쓰기 횟수를 예산으로 묶어 뒀기 때문에 비용의 상한이 정해져 있다.
+        g_fatalFile = CreateFileW(g_fatalPath, FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+        if (g_fatalFile == INVALID_HANDLE_VALUE)
+            return;
+
+        ComputeLocalTimeBias();
+        SnapshotFatalModules(self);
+        WriteFatalSessionHeader(self);
+        g_fatalEnabled.store(true, std::memory_order_release);
+    }
+
     LONG WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS exceptionInfo)
     {
         if (!exceptionInfo || !exceptionInfo->ExceptionRecord)
@@ -599,6 +1120,10 @@ namespace
         {
             g_exceptionDropped.fetch_add(1, std::memory_order_relaxed);
         }
+
+        // 링은 다음 메인 틱에서야 비워진다. 그 틱이 오지 않는 경우가 바로 우리가 놓쳤던 크래시라,
+        // 여기서 한 번 더 디스크에 직접 남긴다. 예산과 게이트가 비용의 상한을 잡는다.
+        RecordFatalException(exceptionInfo, "veh", false);
 
         t_insideVeh = false;
 
@@ -700,20 +1225,46 @@ namespace Diagnostics
         // 켜 두는 것 자체가 게임 동작을 바꿀 수 있는 변수다. 필요할 때만 CBPK_VEH=1로 켠다.
         // 마지막(우선순위 0)에 등록해 게임/RED4ext/CET의 핸들러가 먼저 처리할 기회를 갖게 한다.
         // 예전 구현은 우선순위 1로 모든 핸들러보다 앞에 끼어들었다.
+        // 치명적 폴트 기록은 기본으로 켠다. 관측용 VEH(아래)와 달리 이쪽은 평시에 아무 일도 하지
+        // 않는다 -- 실제로 쓰기가 일어나는 것은 프로세스를 죽일 만한 폴트가 났을 때뿐이고, 그마저
+        // 예산으로 묶여 있다. 끄려면 CBPK_FATAL=0 또는 ini의 fatal_log=0.
+        const bool fatalRequested = ReadToggle(L"CBPK_FATAL", L"fatal_log", true);
+        if (fatalRequested)
+            OpenFatalSink(module);
+
+        const bool fatalActive = g_fatalEnabled.load(std::memory_order_acquire);
+        if (fatalActive)
+        {
+            // 마지막 기회 필터. VEH와 달리 여기까지 온 예외는 실제로 프로세스를 죽인다는 확정 신호다.
+            // 이전 필터(= CDPR post-mortem)를 반드시 붙잡아 두고 이어서 부른다.
+            g_previousUnhandledFilter = SetUnhandledExceptionFilter(FatalUnhandledExceptionFilter);
+            g_unhandledFilterInstalled.store(true, std::memory_order_release);
+        }
+
+        // VEH는 기본으로 끈다(관측 용도). 다만 치명적 폴트 직기록이 켜져 있으면 first-chance를 볼
+        // 유일한 통로라서 같이 등록한다.
         const bool vehRequested = ReadToggle(L"CBPK_VEH", L"veh", false);
-        if (vehRequested)
+        if (vehRequested || fatalActive)
             g_vehHandle = AddVectoredExceptionHandler(0, VectoredExceptionHandler);
 
         Log("============================================================");
         Log("diagnostics initialized; module=%p veh=%s", module,
-            !vehRequested ? "disabled (set CBPK_VEH=1 to enable)" : (g_vehHandle ? "active" : "failed"));
+            g_vehHandle       ? (vehRequested ? "active" : "active (registered for the fatal sink)")
+            : vehRequested    ? "failed"
+            : fatalActive     ? "not registered"
+                              : "disabled (set CBPK_VEH=1 to enable)");
         Log("log sink: path=%ls async=%s dbgout=%s (CBPK_LOG_DIR overrides the directory)", g_logPath,
             g_writerRunning.load(std::memory_order_acquire) ? "on" : "off (writer thread unavailable)",
             g_debugOutputEnabled.load(std::memory_order_relaxed) ? "on" : "off");
-        Log("diagnostics toggles: logging=%d profiling=%d veh=%d dbgout=%d config=%ls",
+        Log("fatal sink: %s path=%ls budget=%d modules=%zu unhandled-filter=%s",
+            fatalActive ? "armed" : (fatalRequested ? "requested but the file could not be opened" : "disabled"),
+            g_fatalPath[0] != L'\0' ? g_fatalPath : L"<unavailable>", kFatalRecordBudget,
+            g_fatalModuleCount.load(std::memory_order_acquire),
+            g_unhandledFilterInstalled.load(std::memory_order_acquire) ? "chained" : "not installed");
+        Log("diagnostics toggles: logging=%d profiling=%d veh=%d dbgout=%d fatal=%d config=%ls",
             g_loggingEnabled.load(std::memory_order_relaxed) ? 1 : 0, profilingEnabled ? 1 : 0,
             vehRequested ? 1 : 0, g_debugOutputEnabled.load(std::memory_order_relaxed) ? 1 : 0,
-            g_configPath[0] != L'\0' ? g_configPath : L"<unavailable>");
+            fatalRequested ? 1 : 0, g_configPath[0] != L'\0' ? g_configPath : L"<unavailable>");
         Flush();
     }
 
@@ -722,10 +1273,43 @@ namespace Diagnostics
         DrainExceptionLog();
         Log("diagnostics shutdown");
 
+        // 순서가 중요하다: 먼저 무장을 풀어 새 레코드가 들어오지 않게 하고, 핸들러를 뗀 다음에야
+        // 핸들을 닫는다. 반대로 하면 닫힌 핸들에 쓰는(최악의 경우 재사용된 핸들에 쓰는) 창이 열린다.
+        g_fatalEnabled.store(false, std::memory_order_release);
+
         if (g_vehHandle)
         {
             RemoveVectoredExceptionHandler(g_vehHandle);
             g_vehHandle = nullptr;
+        }
+
+        if (g_unhandledFilterInstalled.exchange(false, std::memory_order_acq_rel))
+        {
+            // 우리 위에 다른 필터가 올라와 있으면 그것을 밀어내지 않는다.
+            const LPTOP_LEVEL_EXCEPTION_FILTER current = SetUnhandledExceptionFilter(g_previousUnhandledFilter);
+            if (current != FatalUnhandledExceptionFilter)
+                SetUnhandledExceptionFilter(current);
+            g_previousUnhandledFilter = nullptr;
+        }
+
+        if (g_fatalFile != INVALID_HANDLE_VALUE)
+        {
+            // 정상 종료 표시. 이 줄이 없는 세션 헤더는 "예외 하나 없이 사라졌다"는 뜻이고, 그것 자체가
+            // TerminateProcess/행/전원 차단을 가리키는 신호다.
+            SYSTEMTIME time{};
+            GetLocalTime(&time);
+            char closing[128]{};
+            const int length = snprintf(closing, sizeof(closing), "[SESSION] closed cleanly at %02u:%02u:%02u.%03u\r\n",
+                                        time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+            if (length > 0)
+            {
+                DWORD written = 0;
+                WriteFile(g_fatalFile, closing, static_cast<DWORD>(length), &written, nullptr);
+            }
+
+            const HANDLE fatalFile = g_fatalFile;
+            g_fatalFile = INVALID_HANDLE_VALUE;
+            CloseHandle(fatalFile);
         }
 
         StopLogWriter();
