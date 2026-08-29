@@ -1922,3 +1922,12 @@ NPC가 있다).
 4. 스냅샷 패스 다이어트 — 특히 80퍼펫 구간의 정체 불명 240 µs
 5. healthInvoke 축소 (tickTotal 28.8 µs 중 22.9 µs)
 6. visibility in-flight 중복 제거 (재현 대기, 이번 세션도 `dropped=0`)
+
+## 2026-08-30
+
+- **라이브 프로세스(PID 29324) 프리징 사고 분석 및 보고서 작성**:
+  - 인게임 구동 중 발생한 하드 프리징에 대해 Live 프로세스 메모리 덤프(`build/cp2077_crash_pid29324.dmp`, 158MB) 생성 및 MO2 Overwrite/트레이너 로그 역추적 완료.
+  - 원인: 메인 틱 스레드(`TID 14916`)의 `FindAttitudeAgent`에서 RTTI 타입 검사(`IsClassOrDerived`) 중 유효하지 않은 포인터(`0xFFFFFFFFFFFFFFFF`) 역참조로 `0xC0000005` 발생.
+  - `ReadHostility`에 `__try/__except`가 있었으나, 1st-chance 단계에서 REDengine 자체 VEH가 개입하여 크래시 덤프 매니페스트(`Cyberpunk2077.exe-*-14916.txt`)를 작성하고 메인 스레드를 정지시켜 전체 스레드 하드 프리징 유발.
+  - `reports/TEMPLATE.md` 보고서 템플릿(메타데이터 헤더, 자율 본문, 후속 디버깅 힌트) 및 `reports/2026-08-30_freeze_analysis_pid29324.md` 분석 보고서 작성.
+
