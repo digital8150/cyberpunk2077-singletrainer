@@ -1930,4 +1930,9 @@ NPC가 있다).
   - 원인: 메인 틱 스레드(`TID 14916`)의 `FindAttitudeAgent`에서 RTTI 타입 검사(`IsClassOrDerived`) 중 유효하지 않은 포인터(`0xFFFFFFFFFFFFFFFF`) 역참조로 `0xC0000005` 발생.
   - `ReadHostility`에 `__try/__except`가 있었으나, 1st-chance 단계에서 REDengine 자체 VEH가 개입하여 크래시 덤프 매니페스트(`Cyberpunk2077.exe-*-14916.txt`)를 작성하고 메인 스레드를 정지시켜 전체 스레드 하드 프리징 유발.
   - `reports/TEMPLATE.md` 보고서 템플릿(메타데이터 헤더, 자율 본문, 후속 디버깅 힌트) 및 `reports/2026-08-30_freeze_analysis_pid29324.md` 분석 보고서 작성.
+- **RTTI 역참조 포인터 정합성 검사 및 SEH 방어 강화 (Issue #1 패치)**:
+  - `src/game/rtti_invoker.cpp`: `IsValidUserPointer` 검증 함수를 도입하고 `NativeType`, `IsClassOrDerived`, `FindFunction`, `ParentClass`, `ClassNameHash`, `FunctionCount`, `FunctionAt`, `ParameterCount`, `Invoke` 전반에 유저 모드 주소 범위(`0x10000 ~ 0x7FFFFFFEFFFF`) 검사 및 `__try / __except` 방어 블록 적용.
+  - `src/game/entity_tracker.cpp`: `ForEachComponent`에서 엔티티/컴포넌트 엔트리/컴포넌트 인스턴스 포인터의 유효 범위를 선행 검사하도록 강화하고, 중복/불안전했던 로컬 `IsClassOrDerived`를 제거하고 `IsCorpseDead`가 안전한 `Game::Rtti`를 경유하도록 수정.
+  - Release 빌드 정상 통과 (`cp2077_trainer.dll`).
+
 

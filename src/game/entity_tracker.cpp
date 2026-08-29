@@ -501,30 +501,35 @@ namespace
         return isPuppet ? PuppetKind::Npc : PuppetKind::None;
     }
 
-    bool IsClassOrDerived(const ClassLayout* type, std::uint64_t nameHash)
-    {
-        for (unsigned depth = 0; type && depth < 24; ++depth, type = type->parent)
-        {
-            if (type->nameHash == nameHash)
-                return true;
-        }
-        return false;
-    }
-
     template<typename Callback>
     void ForEachComponent(const EntityLayout* entity, Callback&& callback)
     {
-        if (!entity || !entity->components.entries || entity->components.size > entity->components.capacity ||
-            entity->components.size > 512)
-        {
+        const auto entityAddr = reinterpret_cast<std::uintptr_t>(entity);
+        if (entityAddr < 0x10000ULL || entityAddr > 0x00007FFFFFFEFFFFULL)
             return;
-        }
-        for (std::uint32_t i = 0; i < entity->components.size; ++i)
+
+        __try
         {
-            std::byte* handle = entity->components.entries + static_cast<std::size_t>(i) * 0x10;
-            void* component = *reinterpret_cast<void**>(handle);
-            if (component)
-                callback(static_cast<std::byte*>(component));
+            const auto entriesAddr = reinterpret_cast<std::uintptr_t>(entity->components.entries);
+            if (entriesAddr < 0x10000ULL || entriesAddr > 0x00007FFFFFFEFFFFULL ||
+                entity->components.size > entity->components.capacity ||
+                entity->components.size > 512)
+            {
+                return;
+            }
+            for (std::uint32_t i = 0; i < entity->components.size; ++i)
+            {
+                const std::byte* handle = entity->components.entries + static_cast<std::size_t>(i) * 0x10;
+                void* component = *reinterpret_cast<void* const*>(handle);
+                const auto compAddr = reinterpret_cast<std::uintptr_t>(component);
+                if (compAddr >= 0x10000ULL && compAddr <= 0x00007FFFFFFEFFFFULL)
+                {
+                    callback(static_cast<std::byte*>(component));
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
         }
     }
 
@@ -663,9 +668,9 @@ namespace
         };
         bool dead = false;
         ForEachComponent(entity, [&](std::byte* component) {
-            const auto* type = *reinterpret_cast<ClassLayout**>(component + 0x30);
+            const auto* type = Game::Rtti::NativeType(component);
             for (const std::uint64_t name : corpseComponentNames)
-                dead = dead || IsClassOrDerived(type, name);
+                dead = dead || Game::Rtti::IsClassOrDerived(type, name);
         });
         return dead;
     }

@@ -143,51 +143,83 @@ namespace
 
 namespace Game::Rtti
 {
+    [[nodiscard]] inline bool IsValidUserPointer(const void* ptr) noexcept
+    {
+        const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+        return addr >= 0x10000ULL && addr <= 0x00007FFFFFFEFFFFULL;
+    }
+
     Class* NativeType(const void* object)
     {
-        if (!object)
+        if (!IsValidUserPointer(object))
             return nullptr;
-        return reinterpret_cast<Class*>(
-            *reinterpret_cast<ClassLayout* const*>(static_cast<const std::byte*>(object) + 0x30));
+        __try
+        {
+            auto* classPtr = *reinterpret_cast<ClassLayout* const*>(
+                static_cast<const std::byte*>(object) + 0x30);
+            if (IsValidUserPointer(classPtr))
+                return reinterpret_cast<Class*>(classPtr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return nullptr;
     }
 
     bool IsClassOrDerived(const Class* type, std::uint64_t nameHash)
     {
-        auto* current = reinterpret_cast<const ClassLayout*>(type);
-        for (unsigned depth = 0; current && depth < 32; ++depth, current = current->parent)
+        if (!IsValidUserPointer(type))
+            return false;
+        __try
         {
-            if (current->nameHash == nameHash)
-                return true;
+            auto* current = reinterpret_cast<const ClassLayout*>(type);
+            for (unsigned depth = 0; IsValidUserPointer(current) && depth < 32; ++depth, current = current->parent)
+            {
+                if (current->nameHash == nameHash)
+                    return true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
         }
         return false;
     }
 
     Function* FindFunction(const Class* type, std::uint64_t functionNameHash)
     {
-        auto* current = reinterpret_cast<const ClassLayout*>(type);
-        for (unsigned depth = 0; current && depth < 32; ++depth, current = current->parent)
+        if (!IsValidUserPointer(type))
+            return nullptr;
+        __try
         {
-            const auto* functions = reinterpret_cast<const DynArrayLayout*>(
-                reinterpret_cast<const std::byte*>(current) + 0x48);
-            if (!functions->entries || functions->size > functions->capacity || functions->size > 8192)
-                continue;
-            for (std::uint32_t i = 0; i < functions->size; ++i)
+            auto* current = reinterpret_cast<const ClassLayout*>(type);
+            for (unsigned depth = 0; IsValidUserPointer(current) && depth < 32; ++depth, current = current->parent)
             {
-                auto* function = static_cast<FunctionLayout*>(functions->entries[i]);
-                if (function && function->shortNameHash == functionNameHash)
-                    return reinterpret_cast<Function*>(function);
+                const auto* functions = reinterpret_cast<const DynArrayLayout*>(
+                    reinterpret_cast<const std::byte*>(current) + 0x48);
+                if (!IsValidUserPointer(functions->entries) || functions->size > functions->capacity || functions->size > 8192)
+                    continue;
+                for (std::uint32_t i = 0; i < functions->size; ++i)
+                {
+                    auto* function = static_cast<FunctionLayout*>(functions->entries[i]);
+                    if (IsValidUserPointer(function) && function->shortNameHash == functionNameHash)
+                        return reinterpret_cast<Function*>(function);
+                }
             }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
         }
         return nullptr;
     }
 
     const Class* ParentClass(const Class* type)
     {
-        if (!type)
+        if (!IsValidUserPointer(type))
             return nullptr;
         __try
         {
-            return reinterpret_cast<const Class*>(reinterpret_cast<const ClassLayout*>(type)->parent);
+            const auto* parent = reinterpret_cast<const ClassLayout*>(type)->parent;
+            return IsValidUserPointer(parent) ? reinterpret_cast<const Class*>(parent) : nullptr;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -197,7 +229,7 @@ namespace Game::Rtti
 
     std::uint64_t ClassNameHash(const Class* type)
     {
-        if (!type)
+        if (!IsValidUserPointer(type))
             return 0;
         __try
         {
@@ -211,13 +243,13 @@ namespace Game::Rtti
 
     std::size_t FunctionCount(const Class* type)
     {
-        if (!type)
+        if (!IsValidUserPointer(type))
             return 0;
         __try
         {
             const auto* functions = reinterpret_cast<const DynArrayLayout*>(
                 reinterpret_cast<const std::byte*>(type) + 0x48);
-            if (!functions->entries || functions->size > functions->capacity || functions->size > 8192)
+            if (!IsValidUserPointer(functions->entries) || functions->size > functions->capacity || functions->size > 8192)
                 return 0;
             return functions->size;
         }
@@ -229,13 +261,16 @@ namespace Game::Rtti
 
     Function* FunctionAt(const Class* type, std::size_t index)
     {
-        if (index >= FunctionCount(type))
+        if (!IsValidUserPointer(type) || index >= FunctionCount(type))
             return nullptr;
         __try
         {
             const auto* functions = reinterpret_cast<const DynArrayLayout*>(
                 reinterpret_cast<const std::byte*>(type) + 0x48);
-            return static_cast<Function*>(functions->entries[index]);
+            if (!IsValidUserPointer(functions->entries) || index >= functions->size)
+                return nullptr;
+            auto* func = static_cast<FunctionLayout*>(functions->entries[index]);
+            return IsValidUserPointer(func) ? reinterpret_cast<Function*>(func) : nullptr;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -423,45 +458,66 @@ namespace Game::Rtti
 
     std::size_t ParameterCount(const Function* opaqueFunction)
     {
-        const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
-        if (!function || function->params.size > function->params.capacity || function->params.size > 24)
+        if (!IsValidUserPointer(opaqueFunction))
             return 0;
-        return function->params.size;
+        __try
+        {
+            const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
+            if (function->params.size > function->params.capacity || function->params.size > 24)
+                return 0;
+            return function->params.size;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
     }
 
     bool Invoke(Function* opaqueFunction, void* context, const Argument* arguments, std::size_t argumentCount,
                 void* result)
     {
-        auto* function = reinterpret_cast<FunctionLayout*>(opaqueFunction);
-        InternalExecuteFn execute = ResolveInternalExecute();
-        if (!function || !execute || argumentCount > 24 ||
-            (argumentCount > 0 && !arguments) || function->params.size != argumentCount ||
-            function->params.size > function->params.capacity ||
-            (function->params.size > 0 && !function->params.entries))
+        if (!IsValidUserPointer(opaqueFunction) || !IsValidUserPointer(context))
+            return false;
+
+        __try
+        {
+            auto* function = reinterpret_cast<FunctionLayout*>(opaqueFunction);
+            InternalExecuteFn execute = ResolveInternalExecute();
+            if (!function || !execute || argumentCount > 24 ||
+                (argumentCount > 0 && !arguments) || function->params.size != argumentCount ||
+                function->params.size > function->params.capacity ||
+                (function->params.size > 0 && (!IsValidUserPointer(function->params.entries) || !function->params.entries)))
+            {
+                return false;
+            }
+
+            std::array<char, 512> bytecode{};
+            char* cursor = bytecode.data();
+            for (std::size_t i = 0; i < argumentCount; ++i)
+            {
+                auto* parameter = static_cast<PropertyLayout*>(function->params.entries[i]);
+                if (!IsValidUserPointer(parameter) || !IsValidUserPointer(parameter->type) || !arguments[i].value)
+                    return false;
+                *cursor++ = static_cast<char>(kParamOpcode);
+                std::memcpy(cursor, &parameter->type, sizeof(parameter->type));
+                cursor += sizeof(parameter->type);
+                std::memcpy(cursor, &arguments[i].value, sizeof(arguments[i].value));
+                cursor += sizeof(arguments[i].value);
+            }
+            *cursor = static_cast<char>(kParamEndOpcode);
+
+            StackFrameLayout frame{};
+            frame.code = bytecode.data();
+            frame.function = function;
+            frame.context = context;
+            void* resultType = (function->returnType && IsValidUserPointer(function->returnType))
+                                   ? function->returnType->type
+                                   : nullptr;
+            return execute(function, context, &frame, result, resultType);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
         }
-
-        std::array<char, 512> bytecode{};
-        char* cursor = bytecode.data();
-        for (std::size_t i = 0; i < argumentCount; ++i)
-        {
-            auto* parameter = static_cast<PropertyLayout*>(function->params.entries[i]);
-            if (!parameter || !parameter->type || !arguments[i].value)
-                return false;
-            *cursor++ = static_cast<char>(kParamOpcode);
-            std::memcpy(cursor, &parameter->type, sizeof(parameter->type));
-            cursor += sizeof(parameter->type);
-            std::memcpy(cursor, &arguments[i].value, sizeof(arguments[i].value));
-            cursor += sizeof(arguments[i].value);
-        }
-        *cursor = static_cast<char>(kParamEndOpcode);
-
-        StackFrameLayout frame{};
-        frame.code = bytecode.data();
-        frame.function = function;
-        frame.context = context;
-        void* resultType = function->returnType ? function->returnType->type : nullptr;
-        return execute(function, context, &frame, result, resultType);
     }
 }
