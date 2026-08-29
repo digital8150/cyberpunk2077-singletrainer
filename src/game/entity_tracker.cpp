@@ -528,13 +528,31 @@ namespace
         }
     }
 
-    bool ReadSlotPosition(const EntityLayout* entity, std::uint64_t slotName, float output[3])
+    // 슬롯 하나를 읽는 데 필요한 것은 entSlotComponent와 그 타입의 GetSlotTransform이고, 둘 다 슬롯
+    // 이름과 무관하다. 예전에는 슬롯 이름마다 이것을 다시 찾느라 컴포넌트 리스트를 6번 걷고 컴포넌트마다
+    // RTTI 계층 검사를, 그리고 같은 함수 조회를 6번 반복했다. 게다가 그 엔티티에 없는 슬롯 이름
+    // (NPC에 따라 LegLeft/LegRight가 없다)에서는 조기 종료 조건이 걸리지 않아 매번 전체 순회였다.
+    // 한 번만 찾아 두고 이름만 바꿔 가며 호출한다.
+    constexpr std::size_t kMaxSlotAccessors = 4;
+
+    struct SlotAccessors
+    {
+        std::byte* components[kMaxSlotAccessors]{};
+        Game::Rtti::Function* functions[kMaxSlotAccessors]{};
+        std::size_t count = 0;
+    };
+
+    // 하나만 찾고 끝내지 않는 이유는 예전 동작을 그대로 두기 위해서다. 예전 코드는 컴포넌트를 순서대로
+    // 훑다가 "그 슬롯 이름으로 성공한" 첫 컴포넌트를 채택했으므로, 슬롯 컴포넌트가 둘 이상이면 이름마다
+    // 다른 컴포넌트가 뽑힐 수 있었다. 목록으로 들고 있으면 그 순서와 결과가 동일하다.
+    SlotAccessors FindSlotAccessors(const EntityLayout* entity)
     {
         constexpr std::uint64_t slotComponentName = Fnv1a64("entSlotComponent");
         constexpr std::uint64_t getSlotTransformName = Fnv1a64("GetSlotTransform");
-        bool found = false;
+
+        SlotAccessors accessors;
         ForEachComponent(entity, [&](std::byte* component) {
-            if (found)
+            if (accessors.count >= kMaxSlotAccessors)
                 return;
             auto* type = Game::Rtti::NativeType(component);
             if (!Game::Rtti::IsClassOrDerived(type, slotComponentName))
@@ -543,21 +561,38 @@ namespace
             if (!function)
                 return;
 
+            accessors.components[accessors.count] = component;
+            accessors.functions[accessors.count] = function;
+            ++accessors.count;
+        });
+        return accessors;
+    }
+
+    bool ReadSlotPosition(const SlotAccessors& accessors, std::uint64_t slotName, float output[3])
+    {
+        for (std::size_t i = 0; i < accessors.count; ++i)
+        {
             WorldTransformLayout transform{};
             bool result = false;
             Game::Rtti::Argument arguments[] = {{&slotName}, {&transform}};
-            if (!Game::Rtti::Invoke(function, component, arguments, 2, &result) || !result)
-                return;
+            if (!Game::Rtti::Invoke(accessors.functions[i], accessors.components[i], arguments, 2, &result) ||
+                !result)
+            {
+                continue;
+            }
 
             constexpr float fixedPointScale = 1.0f / static_cast<float>(2 << 16);
             output[0] = static_cast<float>(transform.x) * fixedPointScale;
             output[1] = static_cast<float>(transform.y) * fixedPointScale;
             output[2] = static_cast<float>(transform.z) * fixedPointScale;
-            found = std::isfinite(output[0]) && std::isfinite(output[1]) && std::isfinite(output[2]) &&
-                    std::abs(output[0]) < 1000000.0f && std::abs(output[1]) < 1000000.0f &&
-                    std::abs(output[2]) < 1000000.0f;
-        });
-        return found;
+            if (std::isfinite(output[0]) && std::isfinite(output[1]) && std::isfinite(output[2]) &&
+                std::abs(output[0]) < 1000000.0f && std::abs(output[1]) < 1000000.0f &&
+                std::abs(output[2]) < 1000000.0f)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     void AddSkeletonSegment(Game::AnimationData::VisualData& visual, const float start[3], const float end[3])
@@ -586,13 +621,16 @@ namespace
             float position[3]{};
         };
 
+        // 컴포넌트 순회와 RTTI 조회는 여기서 한 번이면 된다. 아래 6줄은 Invoke만 남는다.
+        const SlotAccessors accessors = FindSlotAccessors(entity);
+
         PosePoint head, chest, hips, rightHand, leftLeg, rightLeg;
-        head.valid = ReadSlotPosition(entity, Fnv1a64("Head"), head.position);
-        chest.valid = ReadSlotPosition(entity, Fnv1a64("Chest"), chest.position);
-        hips.valid = ReadSlotPosition(entity, Fnv1a64("Hips"), hips.position);
-        rightHand.valid = ReadSlotPosition(entity, Fnv1a64("RightHand"), rightHand.position);
-        leftLeg.valid = ReadSlotPosition(entity, Fnv1a64("LegLeft"), leftLeg.position);
-        rightLeg.valid = ReadSlotPosition(entity, Fnv1a64("LegRight"), rightLeg.position);
+        head.valid = ReadSlotPosition(accessors, Fnv1a64("Head"), head.position);
+        chest.valid = ReadSlotPosition(accessors, Fnv1a64("Chest"), chest.position);
+        hips.valid = ReadSlotPosition(accessors, Fnv1a64("Hips"), hips.position);
+        rightHand.valid = ReadSlotPosition(accessors, Fnv1a64("RightHand"), rightHand.position);
+        leftLeg.valid = ReadSlotPosition(accessors, Fnv1a64("LegLeft"), leftLeg.position);
+        rightLeg.valid = ReadSlotPosition(accessors, Fnv1a64("LegRight"), rightLeg.position);
 
         visual.hasHeadPosition = head.valid;
         if (head.valid)
