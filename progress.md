@@ -2023,3 +2023,18 @@ containment 경계가 바뀐다. 예전에는 컴포넌트 순회 중 폴트가 
 
 attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수정은 빈도를 낮춘 것이지 없앤 것이 아니므로,
 `cp2077_fatal.log`에 `FindAttitudeAgent` 계열 레코드가 또 나오면 수명 관리 쪽으로 접근할 것.
+
+## 2026-08-30 - 라이브 프로세스(PID 13248) 프리징 사고 분석 및 아티팩트 보존
+
+- **프리징 사고 개요**:
+  - PID 13248 구동 약 71분(uptime 4298초) 시점인 01:48:03(KST)에 게임 화면 및 입력이 멈추는 하드 프리징 발생.
+  - Live 프로세스 메모리 덤프(`build/cp2077_freeze_pid13248.dmp` / `reports/artifacts/2026-08-30_freeze_pid13248/cp2077_freeze_pid13248.dmp`, 160MB) 확보 완료.
+  - 관련 아티팩트(`cp2077_fatal.log`, `cp2077_trainer.log`, `Cyberpunk2077.exe-20260830-003624-13248-30224.txt`, `.dmp`)를 `reports/artifacts/2026-08-30_freeze_pid13248/` 디렉터리에 격리 보존.
+  - 분석 완료 후 프로세스 강제 종료(`Stop-Process -Id 13248 -Force`) 완료.
+- **원인 분석 결과**:
+  - 메인 틱 스레드(`TID 30224`)의 `FindAttitudeAgent` → `NativeType`(`rtti_invoker.cpp:152`)에서 해제된 힙 메모리 포인터(`0x41E5BB48`)의 클래스 오프셋(`+0x30`, `0x41E5BB78`) 역참조 시 `0xC0000005` 발생.
+  - 이전 사고(PID 29324)와 **동일한 근본 구조적 원인**의 연속 발현. `IsValidUserPointer`는 유저모드 canonical 범위(`0x10000~0x7FFFFFFEFFFF`)만 검사하므로 Use-After-Free 포인터를 걸러내지 못하며, `__try/__except` 블록 도달 전에 엔진 VEH가 1st-chance로 예외를 낚아채 크래시 리포팅 및 메인 틱 스레드 정지 루프로 진입시켜 전체 스레드 하드 프리징 유발.
+- **산출물**:
+  - 분석 보고서: `reports/2026-08-30_freeze_analysis_pid13248.md`
+  - 아티팩트 디렉터리: `reports/artifacts/2026-08-30_freeze_pid13248/`
+
