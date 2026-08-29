@@ -1936,3 +1936,90 @@ NPC가 있다).
   - Release 빌드 정상 통과 (`cp2077_trainer.dll`).
 
 
+
+## 2026-08-30 - PID 29324 프리징 수정 검토 + SEH 범위 축소 + 다음 최적화 계획
+
+`945d596`(보고서)와 `f39e03f`(수정)를 검토했다.
+
+### 1. 이번 변경이 원인인가 — 아니다
+
+크래시 경로는 `HookOnTick` → `OnGameMainTick` → `ProcessAttitudeOnMainTick`(1520행) →
+`ReadHostility`(1455행) → `FindAttitudeAgent`(1349행) → `Rtti::IsClassOrDerived`이다.
+**게임 메인 틱의 attitude 경로**다.
+
+직전 커밋 `719cf48`(슬롯 조회 접기)이 건드린 것은 528~640행 구간의 `FindSlotAccessors` /
+`ReadSlotPosition` / `ReadCurrentPoseSlots`뿐이고, 이것은 **Present 스레드의 pose 경로**다.
+스레드도 호출 경로도 겹치지 않는다. `198c4d6`(크래시 로거)도 VEH를 우선순위 0(마지막)으로 등록하고
+`EXCEPTION_CONTINUE_SEARCH`만 반환하므로 예외 디스패치를 바꾸지 않는다.
+
+오히려 반대다. **이 버그가 정확히 짚인 것은 크래시 로거 덕분이다.** `[FATAL][veh]` 레코드가
+`at=cp2077_trainer.dll+0xD65C` / `fault-in-trainer=YES`를 남겼고, 그 RVA를 PDB로 풀어 소스 라인이
+바로 나왔다. 로거를 넣기 전이었다면 CDPR 매니페스트의 "Unhandled exception" 한 줄만 남았을 것이다.
+
+`4319ab7`에서 attitude 컴포넌트 포인터 캐시를 걷어낸 뒤로 `FindAttitudeAgent`가 **매 틱** 컴포넌트
+목록을 새로 걷는다. 노출 빈도를 올린 것은 그 커밋이지, 이번 것들이 아니다.
+
+### 2. 적용된 수정에서 좋았던 것
+
+- `IsValidUserPointer` 선행 검증. 관측된 폴트를 실제로 막는 유일한 부분이다.
+- entity_tracker.cpp의 **중복 `IsClassOrDerived` 로컬 사본 제거**와 `IsCorpseDead`를 가드가 있는
+  `Game::Rtti` 쪽으로 돌린 것. 방어가 없던 사본이 하나 사라졌다.
+- 보고서의 덤프 + PDB 심볼화 절차 자체는 재현 가능하고 유용하다.
+
+### 3. 되돌린 것 두 가지 (이번 커밋)
+
+**(a) `Rtti::Invoke`가 엔진 스크립트 VM 호출까지 `__try`로 감싸고 있었다.**
+`execute(...)`는 게임의 `InternalExecute`다. 그 안에서 난 예외를 우리가 `EXCEPTION_EXECUTE_HANDLER`로
+삼키면 VM은 **프레임이 반쯤 실행되고 refcount가 어긋난 상태로** 남는다. 지금 당장 안 죽어도 나중에
+프리징이나 메모리 손상으로 돌아오는 모양이고, 우리가 없애려는 장애 그 자체다. 게다가 이번 폴트는
+`execute` 안이 아니라 `IsClassOrDerived`에서 났으므로 이 확장은 보고된 버그와 무관하다.
+→ 마샬링만 `BuildInvocationFrame`으로 떼어 SEH로 감싸고, **엔진 호출은 SEH 밖으로** 되돌렸다.
+검증 로직은 하나도 빼지 않았다.
+
+**(b) `ForEachComponent`의 `__except`가 콜백에서 난 예외까지 삼키고 있었다.**
+containment 경계가 바뀐다. 예전에는 컴포넌트 순회 중 폴트가 `TrySnapshot`의 `__except`까지 올라가
+`SnapshotResult::Stale` → 추적 목록에서 정리였다. 바뀐 코드에서는 `ForEachComponent`가 삼켜 버려
+`TrySnapshot`이 **`Ready`를 반환**한다. 죽어 가는 엔티티가 부분 데이터를 들고 목록에 계속 남는다.
+→ 게임 메모리를 읽는 부분만 `CollectComponents`로 떼어 SEH로 감싸고, **콜백은 SEH 밖에서** 부르게
+되돌렸다. 덤으로 템플릿 본문에서 `__try`가 빠져 앞으로 소멸자 있는 캡처를 쓰는 콜백에서 C2712가
+나지 않는다.
+
+`IsValidUserPointer`는 `rtti_invoker.h`로 올려 두 파일이 같은 술어를 쓰게 했다. 상수 사본이 갈라지면
+그 자체가 버그다.
+
+### 4. 보고서에서 바로잡을 사실 두 가지
+
+- **"SEH로 1st-chance VEH 크래시를 막는다"는 성립하지 않는다.** 커밋 메시지가 그렇게 되어 있는데,
+  보고서 본문 스스로가 "VEH가 `__except`보다 먼저 돈다"고 옳게 적고 있다. `__try/__except`는
+  1st-chance 디스패치 자체를 막지 못한다. **막는 것은 선행 검증뿐이다.** 앞으로 SEH를 방어책으로
+  오해하지 않도록 남긴다.
+- **`target=0xFFFFFFFFFFFFFFFF`는 센티넬 포인터 값이 아니다.** x64에서 non-canonical 주소 접근은
+  #GP이고 Windows는 그때 폴트 주소를 `-1`로 보고한다. 즉 실제 포인터는 "0xFFFF...FF"가 아니라
+  임의의 쓰레기 값이었다. 결과적으로 `IsValidUserPointer`가 걸러 주긴 하지만, 이는 **범위 검사이지
+  유효성 검사가 아니다.** 이미 해제됐지만 주소만 그럴듯한 포인터는 그대로 통과해 폴트를 낸다.
+  → 1st-chance 예외의 빈도를 줄일 뿐 없애지 못한다. 재발하면 다음은 소유권/수명 쪽을 봐야 한다.
+
+### 5. 아직 측정하지 않은 것
+
+`ForEachComponent`와 `IsClassOrDerived`는 직전 세션에서 **가장 비싼 경로로 측정된 바로 그 코드**다
+(스냅샷 패스의 40~53%). 거기에 범위 검사와 SEH 프레임이 들어갔는데 전후 측정이 없다. 범위 검사는
+비교 두 번이라 저렴하고 x64 SEH는 예외가 없으면 런타임 비용이 0이지만, 컴파일러가 가드 구간에서
+지역 변수를 메모리에 묶는 영향은 남는다. **다음 세션에서 `poseSlots avg`로 같이 확인한다.**
+
+### 6. 다음 최적화 계획
+
+측정 대기 중인 것이 두 개 겹쳐 있다(슬롯 조회 접기, RTTI 검증 추가). 둘 다 같은 슬롯(`poseSlots`,
+`snapshot`)에 나타나므로 **다음 세션 한 번으로 합쳐 확인**하고, 회귀가 보이면 그때 분리한다.
+
+| # | 항목 | 근거 | 위험 |
+|---|---|---|---|
+| 1 | (측정) 슬롯 조회 접기 + RTTI 검증 | `poseSlots avg`, `snapshot avg`. `poseBounds`/`skeletonLines`가 이전과 같은지 함께 확인 | - |
+| 2 | pose를 실제로 그릴 대상에만 | ESP 깔때기가 `snapshots=28 → drawn=4`. pose가 필요한 건 4~6인데 28개 전부 계산 중 | 화면에 새로 들어온 퍼펫의 pose가 최대 33 ms 늦게 붙는 팝 |
+| 3 | poseSlots → 메인 틱 | **성능이 아니라 스레드 규칙 준수.** `ReadSlotPosition`이 `Rtti::Invoke`(스크립트 VM)를 Present 스레드에서 부른다 | 스레드 문맥 이동. 1~2로 총량을 줄인 뒤가 옮길 양이 적다 |
+| 4 | 80퍼펫 구간 정체 불명 240 µs | 285 µs 중 pose는 43 µs뿐. 퍼펫당 비pose 비용이 다른 구간의 2~3배 | 원인 미상이라 먼저 계측 추가 |
+| 5 | `snapshot max` 스파이크 | 878~1263 µs, 한 윈도우는 15,526 µs. 평균이 아니라 이쪽이 체감 히칭일 수 있다 | - |
+| 6 | healthInvoke 축소 | tickTotal 28.8 µs 중 22.9 µs | - |
+| 7 | visibility in-flight 중복 제거 | 두 세션 연속 `dropped=0` | 재현 대기 |
+
+attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수정은 빈도를 낮춘 것이지 없앤 것이 아니므로,
+`cp2077_fatal.log`에 `FindAttitudeAgent` 계열 레코드가 또 나오면 수명 관리 쪽으로 접근할 것.

@@ -501,36 +501,50 @@ namespace
         return isPuppet ? PuppetKind::Npc : PuppetKind::None;
     }
 
-    template<typename Callback>
-    void ForEachComponent(const EntityLayout* entity, Callback&& callback)
-    {
-        const auto entityAddr = reinterpret_cast<std::uintptr_t>(entity);
-        if (entityAddr < 0x10000ULL || entityAddr > 0x00007FFFFFFEFFFFULL)
-            return;
+    constexpr std::uint32_t kMaxComponentsPerEntity = 512;
 
+    // 컴포넌트 포인터를 한 번에 걷어 온다. 여기서 읽는 것은 전부 게임 소유 메모리라 스트리밍 중에
+    // 사라질 수 있어 SEH로 감싼다. 중간에 폴트가 나면 그때까지 모은 것만 쓴다.
+    std::uint32_t CollectComponents(const EntityLayout* entity, void** output, std::uint32_t capacity)
+    {
+        if (!Game::Rtti::IsValidUserPointer(entity))
+            return 0;
+
+        std::uint32_t collected = 0;
         __try
         {
-            const auto entriesAddr = reinterpret_cast<std::uintptr_t>(entity->components.entries);
-            if (entriesAddr < 0x10000ULL || entriesAddr > 0x00007FFFFFFEFFFFULL ||
+            if (!Game::Rtti::IsValidUserPointer(entity->components.entries) ||
                 entity->components.size > entity->components.capacity ||
-                entity->components.size > 512)
+                entity->components.size > kMaxComponentsPerEntity)
             {
-                return;
+                return 0;
             }
-            for (std::uint32_t i = 0; i < entity->components.size; ++i)
+
+            const std::uint32_t count = entity->components.size < capacity ? entity->components.size : capacity;
+            for (std::uint32_t i = 0; i < count; ++i)
             {
                 const std::byte* handle = entity->components.entries + static_cast<std::size_t>(i) * 0x10;
                 void* component = *reinterpret_cast<void* const*>(handle);
-                const auto compAddr = reinterpret_cast<std::uintptr_t>(component);
-                if (compAddr >= 0x10000ULL && compAddr <= 0x00007FFFFFFEFFFFULL)
-                {
-                    callback(static_cast<std::byte*>(component));
-                }
+                if (Game::Rtti::IsValidUserPointer(component))
+                    output[collected++] = component;
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
         }
+        return collected;
+    }
+
+    // 콜백은 SEH 밖에서 부른다. 콜백까지 감싸면 콜백 안에서 난 폴트를 여기서 삼켜 버리는데, 그러면
+    // TrySnapshot의 __except가 그것을 보지 못한다. 죽어 가는 엔티티가 Stale로 판정되어 목록에서
+    // 정리되는 대신, 부분 데이터를 들고 Ready로 남아 추적 목록에 계속 쌓이게 된다.
+    template<typename Callback>
+    void ForEachComponent(const EntityLayout* entity, Callback&& callback)
+    {
+        void* components[kMaxComponentsPerEntity];
+        const std::uint32_t count = CollectComponents(entity, components, kMaxComponentsPerEntity);
+        for (std::uint32_t i = 0; i < count; ++i)
+            callback(static_cast<std::byte*>(components[i]));
     }
 
     // 슬롯 하나를 읽는 데 필요한 것은 entSlotComponent와 그 타입의 GetSlotTransform이고, 둘 다 슬롯

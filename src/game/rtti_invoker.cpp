@@ -143,12 +143,6 @@ namespace
 
 namespace Game::Rtti
 {
-    [[nodiscard]] inline bool IsValidUserPointer(const void* ptr) noexcept
-    {
-        const auto addr = reinterpret_cast<std::uintptr_t>(ptr);
-        return addr >= 0x10000ULL && addr <= 0x00007FFFFFFEFFFFULL;
-    }
-
     Class* NativeType(const void* object)
     {
         if (!IsValidUserPointer(object))
@@ -473,25 +467,22 @@ namespace Game::Rtti
         }
     }
 
-    bool Invoke(Function* opaqueFunction, void* context, const Argument* arguments, std::size_t argumentCount,
-                void* result)
+    // 파라미터 마샬링만 SEH로 감싼다. 여기서 읽는 params/type은 전부 게임 소유 메모리라 스트리밍
+    // 중에 사라질 수 있지만, 아직 엔진 코드로 들어가기 전이라 여기서 예외를 삼켜도 잃는 상태가 없다.
+    bool BuildInvocationFrame(FunctionLayout* function, void* context, const Argument* arguments,
+                              std::size_t argumentCount, std::array<char, 512>& bytecode,
+                              StackFrameLayout& frame, void*& resultType)
     {
-        if (!IsValidUserPointer(opaqueFunction) || !IsValidUserPointer(context))
-            return false;
-
         __try
         {
-            auto* function = reinterpret_cast<FunctionLayout*>(opaqueFunction);
-            InternalExecuteFn execute = ResolveInternalExecute();
-            if (!function || !execute || argumentCount > 24 ||
-                (argumentCount > 0 && !arguments) || function->params.size != argumentCount ||
+            if (argumentCount > 24 || (argumentCount > 0 && !arguments) ||
+                function->params.size != argumentCount ||
                 function->params.size > function->params.capacity ||
-                (function->params.size > 0 && (!IsValidUserPointer(function->params.entries) || !function->params.entries)))
+                (function->params.size > 0 && !IsValidUserPointer(function->params.entries)))
             {
                 return false;
             }
 
-            std::array<char, 512> bytecode{};
             char* cursor = bytecode.data();
             for (std::size_t i = 0; i < argumentCount; ++i)
             {
@@ -506,18 +497,38 @@ namespace Game::Rtti
             }
             *cursor = static_cast<char>(kParamEndOpcode);
 
-            StackFrameLayout frame{};
             frame.code = bytecode.data();
             frame.function = function;
             frame.context = context;
-            void* resultType = (function->returnType && IsValidUserPointer(function->returnType))
-                                   ? function->returnType->type
-                                   : nullptr;
-            return execute(function, context, &frame, result, resultType);
+            resultType = IsValidUserPointer(function->returnType) ? function->returnType->type : nullptr;
+            return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
         }
+    }
+
+    bool Invoke(Function* opaqueFunction, void* context, const Argument* arguments, std::size_t argumentCount,
+                void* result)
+    {
+        if (!IsValidUserPointer(opaqueFunction) || !IsValidUserPointer(context))
+            return false;
+
+        InternalExecuteFn execute = ResolveInternalExecute();
+        if (!execute)
+            return false;
+
+        auto* function = reinterpret_cast<FunctionLayout*>(opaqueFunction);
+        std::array<char, 512> bytecode{};
+        StackFrameLayout frame{};
+        void* resultType = nullptr;
+        if (!BuildInvocationFrame(function, context, arguments, argumentCount, bytecode, frame, resultType))
+            return false;
+
+        // 스크립트 VM 호출은 의도적으로 SEH 밖에 둔다. 엔진 안에서 난 예외를 우리가 삼키면 VM은
+        // 프레임이 반쯤 실행되고 refcount가 어긋난 상태로 남는다. 그것이야말로 나중에 프리징으로
+        // 돌아오는 모양이고, 2026-08-30 폴트는 여기가 아니라 IsClassOrDerived에서 났다.
+        return execute(function, context, &frame, result, resultType);
     }
 }

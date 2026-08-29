@@ -46,6 +46,18 @@ namespace Game::Rtti
         return hash;
     }
 
+    // 게임 소유 포인터가 역참조해도 될 만한 값인지 보는 최소 검사. 커널 주소와 non-canonical 주소를
+    // 걸러낸다. x64에서 non-canonical 주소 접근은 #GP라 Windows가 폴트 주소를 0xFFFFFFFFFFFFFFFF로
+    // 보고하는데, 2026-08-30 프리징의 예외 레코드가 정확히 그 모양이었다.
+    //
+    // 이것은 범위 검사이지 유효성 검사가 아니다. 이미 해제됐지만 주소만 그럴듯한 포인터는 그대로
+    // 통과해서 폴트를 낸다. 1st-chance 예외의 빈도를 줄일 뿐 없애지는 못한다.
+    inline bool IsValidUserPointer(const void* pointer) noexcept
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        return address >= 0x10000ull && address <= 0x00007FFFFFFEFFFFull;
+    }
+
     Class* NativeType(const void* object);
     bool IsClassOrDerived(const Class* type, std::uint64_t nameHash);
     Function* FindFunction(const Class* type, std::uint64_t functionNameHash);
