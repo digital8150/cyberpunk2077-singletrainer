@@ -319,6 +319,11 @@ namespace Aimbot
         return g_stats;
     }
 
+    void Disable()
+    {
+        StopAim();
+    }
+
     void DrawOverlay(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame)
     {
         const ImGuiIO& io = ImGui::GetIO();

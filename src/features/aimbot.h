@@ -25,6 +25,9 @@ namespace Aimbot
     };
 
     Stats GetStats();
+    // Clears active memory/silent aim state once when the feature transitions to disabled. This is intentionally
+    // separate from RunFrame so a disabled feature does not enter the per-frame candidate path.
+    void Disable();
     // 스냅샷 패스는 호출자(Features::DrawOverlay/UpdateHeadless)가 프레임당 한 번만 돌리고 그 결과를 넘긴다.
     void DrawOverlay(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame);
     void UpdateHeadless(const Features::AimbotSettings& settings, const Features::FrameSnapshots& frame,

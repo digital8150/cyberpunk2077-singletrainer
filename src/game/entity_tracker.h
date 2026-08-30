@@ -121,6 +121,10 @@ namespace Game::EntityTracker
     // Executes tracker health refreshes and native highlight events on the game main tick. Never call from Present.
     void OnGameMainTick();
 
+    // Publishes which snapshot consumers still need reflected health/attitude refreshes. The values are consumed
+    // only by OnGameMainTick; disabling a requirement clears its cached state once on that same main-tick path.
+    void UpdateFeatureRequirements(bool health, bool attitude);
+
     // Requests a main-tick clear and waits for a clear event plus a following tick before unload. The request itself
     // is atomic, so this function never calls into the engine from the unload worker.
     bool PrepareForShutdown(std::uint32_t timeoutMilliseconds);
