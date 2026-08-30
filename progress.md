@@ -2174,4 +2174,7 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
 - 상세 보고서와 원본 로그/manifest는 `reports/2026-08-30_freeze_analysis_pid30148.md` 및
   `reports/artifacts/2026-08-30_freeze_pid30148/`에 보존했다. 다음 #1 격리 검증을 위해 로컬
   `%LOCALAPPDATA%\cbpk\config.ini`의 `native_highlight`를 0으로 바꿨다.
+- 운영자는 90분 기준에 2분 15초 못 미친 차이보다 87분 45초 동안의 실제 스트리밍 부하와 579,786건의
+  lifetime-safe attitude 처리가 더 중요한 완료 증거라고 판정했다. 종료 원인이 별도 Issue #2로 완전히
+  분리됐고 다른 작업 중에도 추가 추적할 수 있으므로, 이 승인에 따라 GitHub Issue #1을 완료 처리한다.
 
