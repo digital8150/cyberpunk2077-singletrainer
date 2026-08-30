@@ -2411,3 +2411,67 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   받게 했다. 이렇게 해야 misc lane이 신규 기능을 붙일 때 perf lane 소유인 `features.cpp`를 건드리지
   않는다.
 - 두 선행 커밋 모두 `cmake --build build --config Release` 통과를 확인하고 커밋했다.
+
+## 2026-08-30 - M2 3-lane 통합과 인게임 검증 (PID 29968)
+
+- 세 lane(`m2/ui`, `m2/misc`, `m2/perf`)이 모두 완료됐다. **파일 소유권 분리 덕분에 세 브랜치 병합에서
+  충돌이 한 건도 없었다** — 사전에 공유 스키마를 master에 커밋해 둔 것이 그대로 값을 했다.
+- **Codex 샌드박스는 worktree에서 커밋을 만들지 못한다.** worktree의 git 메타데이터는 부모 저장소의
+  `.git/worktrees/<name>`에 있는데 워커의 쓰기 범위는 worktree 디렉터리로 제한되어 `index.lock` 생성이
+  거부된다. 세 lane 모두 같은 지점에서 막혔다. 다음에 worktree + 샌드박스 워커를 쓸 때는 커밋을
+  통합자가 대신 만든다고 처음부터 정해 두는 편이 낫다.
+- 검증은 실행 중이던 게임(PID 29968, 2.31)에 직접 주입해서 했다. 주입→검증→언로드 사이클을 7회 돌렸고
+  매번 정상 종료했다.
+
+### 확인된 것
+
+- **FOV 각도 변환**: `camera angular scale: pixelsPerTangent=1062.7 horizontalFov=100.6deg
+  display=2560x1440`. 여기서 나오는 수직 화각 68.2도는 16:9에서 수평 100.6도와 정확히 대응하고, 이는
+  게임 내 FOV 설정값과 일치한다. 아핀 프로브가 실제 투영 행렬을 읽고 있다는 뜻이다. 참고로 기존
+  `fov_radius_pixels=129.27`은 이 스케일에서 6.94도이므로, 새 기본값 13도는 예전보다 두 배 가까이 넓다.
+- **꺼진 경로 게이팅** (perf lane의 핵심 주장): ESP/에임봇을 끈 상태로 주입해 계측을 비교했다.
+  - 켜짐: `tickTotal 27.7us | health 0.6 | attitude 9.0 | highlight 1.7 | playerMods 15.6`
+    + `present: snapshot 1.5 | esp 0.3 | aimbot 8.3`
+  - 꺼짐: `tickTotal 23.4us | playerMods 22.6 | visibility 0.3` — health/attitude/highlight 슬롯이
+    **로그에서 통째로 사라졌다**(n=0, 스코프 자체가 안 돌았다). `profile present` 줄도 아예 없다.
+- **config v1 마이그레이션**: `[trainer] no_recoil=1`이 `[misc]`로 이어져 modifier 11개가 적용됐다.
+  이 폴백이 없었으면 기존 사용자 설정이 조용히 초기화됐다.
+
+### 인게임에서만 드러난 버그 두 건 (통합 시 수정)
+
+misc lane의 infinite health / infinite stamina는 빌드는 통과했지만 **인게임에서 아무 일도 하지 않았다**.
+시스템 포인터도 함수 이름도 맞았는데, 두 resolver 모두 **관측이 아니라 가정으로 세운 시그니처 술어**에서
+탈락해 `resolved=0`으로 조용히 자기 자신을 꺼 버렸다. 로그만으로는 이름이 틀린 건지 시그니처가 틀린
+건지 구분할 수 없었다.
+
+그래서 `Rtti::ParameterAt`(파라미터 이름 해시 + 플래그)를 추가하고, resolve 실패 시 그 타입의 리플렉션
+표면을 파라미터 이름까지 한 번 찍게 했다. 그 덤프가 즉시 원인을 지목했다:
+
+| 함수 | 코드가 가정한 것 | 2.31 실제 |
+|---|---|---|
+| `AddGodMode(entID, gmType, sourceInfo)` | 반환값 없음 | **반환값 있음** |
+| `RequestSettingStatPoolValue(objID, statPoolType, newValue, instigator, perc, ignoreCustomLimit)` | 파라미터 4개 | **6개** (뒤 2개는 optional 플래그지만 Invoke는 정확한 개수를 요구) |
+
+수정 후: 두 resolver 모두 `resolved=1`, `player modifiers applied: count=25 mask=0x3`(recoil 11 +
+spread 14), `health GodMode applied: mode=Invulnerable(0)`, `stamina infinite mode applied:
+restore=100.000 max=100.000 refreshMs=250`. 언로드에서 `modifiers removed: count=25` /
+`GodMode removed` / `stamina restored: value=100.000` / `misc cleanup acknowledged`까지 전부 통과했다.
+
+**교훈**: 리플렉션 API는 이름만 맞히면 되는 게 아니다. 시그니처(파라미터 개수, 반환 유무)도 관측해야
+하고, 관측 실패는 반드시 그 자리에서 표면을 덤프해 보고되어야 한다. 무증상으로 기능만 죽는 것이 최악이다.
+
+### perf lane 통합 시 보강한 것
+
+네이티브 하이라이트 게이트가 request/mode만 보고 있었다. desired 상태는 남았는데 braindance mode가
+아직 안 올라온 좁은 창에서 경로가 잠들면 엔티티가 하이라이트된 채 영영 남는다. enabled가 내려가는
+순간 세우고 "비울 것이 없음"을 관측한 뒤에만 내리는 drain 래치를 추가했다.
+
+### 남은 것
+
+- **auto pistol 미구현**. 커뮤니티 구현(TriggerModeControl)은 redscript로 `WeaponTransition`의
+  `CanHoldToShoot`/`IsFullAutoAction`을 감싸는 방식이고, 대응되는 native 리플렉션 표면을 찾지 못했다.
+  추측 메모리 쓰기는 넣지 않았다. 설정 필드는 선언만 되어 있고 동작하지 않는다.
+- **오버레이 UI는 아직 눈으로 확인하지 않았다**: 탭 전환, 한글 글리프, 라이트 테마 대비, 2560x1440에서의
+  레이아웃, FOV 링이 ADS에서 커지는지.
+- spread 스탯 ID 14개와 `Stamina=35`, `Invulnerable=0`은 공개 enum 표 기준이고 런타임 확인은 안 했다.
+  다만 위 apply/remove가 성공했으므로 최소한 유효한 ID이기는 하다.
