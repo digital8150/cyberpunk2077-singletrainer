@@ -32,6 +32,26 @@ namespace Widgets
         Tab g_activeTab = Tab::Aimbot;
         bool g_silentDiagnosticsOpen = false;
 
+        // ApplyStyle에서 채워진다. 폰트 아틀라스를 못 만든 환경에서는 전부 nullptr로 남고, 아래 헬퍼가
+        // nullptr을 걸러 내므로 그대로 기본 폰트 하나로 그려진다.
+        ImFont* g_fontBody = nullptr;
+        ImFont* g_fontTitle = nullptr;
+        ImFont* g_fontLabel = nullptr;  // 카드 제목용 소형 굵은 자체
+        ImFont* g_fontSmall = nullptr;  // 부연 설명·값 표시
+
+        // 카드 안에서는 오른쪽 여백만큼 줄어든 폭을 써야 컬트롤이 카드 테두리에 붙지 않는다.
+        float g_contentInset = 0.0f;
+
+        void PushFontScaled(ImFont* font)
+        {
+            ImGui::PushFont(font ? font : ImGui::GetFont(), 0.0f);
+        }
+
+        float RowWidth()
+        {
+            return (std::max)(1.0f, ImGui::GetContentRegionAvail().x - g_contentInset);
+        }
+
         ImVec4 Color(ImU32 value)
         {
             return ImGui::ColorConvertU32ToFloat4(value);
@@ -156,52 +176,139 @@ namespace Widgets
             return changed;
         }
 
-        void HintBox(const char* text)
+        // 예전에는 모든 설명이 노란 경고 블록으로 나와서, 에임봇 탭 하나에만 세 개가 쌓이면 패널의
+        // 절반을 먹었다. 설명과 경고를 분리한다: 대부분은 왼쪽 세로 줄만 가진 작은 보조 텍스트고,
+        // 사용자가 켜면 성능을 잃는 진짜 경고만 박스로 그린다.
+        void HintText(const char* text)
         {
             if (!text)
                 return;
 
             const UiTheme::Palette& palette = UiTheme::Current();
-            const float width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x);
-            constexpr float leftPadding = 44.0f;
-            constexpr float rightPadding = 18.0f;
-            constexpr float verticalPadding = 13.0f;
-            const float textWidth = (std::max)(1.0f, width - leftPadding - rightPadding);
+            PushFontScaled(g_fontSmall);
+            constexpr float kRule = 2.0f;
+            constexpr float kGap = 10.0f;
+            const float width = RowWidth();
+            const float textWidth = (std::max)(1.0f, width - kRule - kGap);
             const float textHeight = ImGui::CalcTextSize(text, nullptr, false, textWidth).y;
-            const float height = (std::max)(46.0f, textHeight + verticalPadding * 2.0f);
+            const ImVec2 minimum = ImGui::GetCursorScreenPos();
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            drawList->AddRectFilled(minimum, ImVec2(minimum.x + kRule, minimum.y + textHeight),
+                                    UiTheme::WithAlpha(palette.border, 220), 1.0f);
+            drawList->AddText(nullptr, 0.0f, ImVec2(minimum.x + kRule + kGap, minimum.y), palette.textMuted,
+                              text, nullptr, textWidth);
+            ImGui::Dummy(ImVec2(width, textHeight));
+            ImGui::PopFont();
+        }
+
+        // 성능 경고 전용. 사용자가 요구한 "힌트박스 디자인"은 이쪽이다.
+        void WarningBox(const char* text)
+        {
+            if (!text)
+                return;
+
+            const UiTheme::Palette& palette = UiTheme::Current();
+            PushFontScaled(g_fontSmall);
+            constexpr float kBar = 3.0f;
+            constexpr float kPaddingX = 12.0f;
+            constexpr float kPaddingY = 9.0f;
+            const float width = RowWidth();
+            const float textWidth = (std::max)(1.0f, width - kBar - kPaddingX * 2.0f);
+            const float textHeight = ImGui::CalcTextSize(text, nullptr, false, textWidth).y;
+            const float height = textHeight + kPaddingY * 2.0f;
             const ImVec2 minimum = ImGui::GetCursorScreenPos();
             const ImVec2 maximum(minimum.x + width, minimum.y + height);
             ImDrawList* drawList = ImGui::GetWindowDrawList();
-            drawList->AddRectFilled(minimum, maximum, palette.warningSoft, 8.0f);
-            drawList->AddRect(minimum, maximum, UiTheme::WithAlpha(palette.warning, 130), 8.0f);
-            drawList->AddRectFilled(minimum, ImVec2(minimum.x + 4.0f, maximum.y), palette.warning, 8.0f);
-            drawList->AddCircleFilled(ImVec2(minimum.x + 22.0f, minimum.y + height * 0.5f), 10.0f,
-                                      UiTheme::WithAlpha(palette.warning, 42));
-            const char* icon = "!";
-            const ImVec2 iconSize = ImGui::CalcTextSize(icon);
-            drawList->AddText(ImVec2(minimum.x + 22.0f - iconSize.x * 0.5f,
-                                     minimum.y + height * 0.5f - iconSize.y * 0.5f),
-                              palette.warning, icon);
-            drawList->AddText(nullptr, 0.0f, ImVec2(minimum.x + leftPadding, minimum.y + verticalPadding),
-                              palette.text, text, nullptr, textWidth);
+            drawList->AddRectFilled(minimum, maximum, palette.warningSoft, 7.0f);
+            drawList->AddRectFilled(minimum, ImVec2(minimum.x + kBar + 4.0f, maximum.y), palette.warning, 7.0f);
+            drawList->AddRectFilled(ImVec2(minimum.x + kBar, minimum.y), ImVec2(minimum.x + kBar + 6.0f, maximum.y),
+                                    palette.warningSoft, 0.0f);
+            drawList->AddText(nullptr, 0.0f, ImVec2(minimum.x + kBar + kPaddingX, minimum.y + kPaddingY),
+                              palette.warning, text, nullptr, textWidth);
             ImGui::Dummy(ImVec2(width, height));
+            ImGui::PopFont();
+        }
+
+        // 카드 하나. 내용의 높이를 미리 알 수 없으므로 드로우 채널을 갈라서 배경을 나중에 그린다
+        // (ImGui에서 컨테이너 배경을 그리는 표준 방법이다). 카드는 중첩하지 않으므로 채널 하나면 된다.
+        struct CardScope
+        {
+            ImVec2 minimum{};
+            float width = 0.0f;
+            float previousInset = 0.0f;
+        };
+
+        CardScope g_card;
+        constexpr float kCardPadX = 16.0f;
+        constexpr float kCardPadY = 14.0f;
+
+        void BeginCard(const char* title)
+        {
+            g_card.minimum = ImGui::GetCursorScreenPos();
+            g_card.width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x);
+            g_card.previousInset = g_contentInset;
+
+            ImGui::GetWindowDrawList()->ChannelsSplit(2);
+            ImGui::GetWindowDrawList()->ChannelsSetCurrent(1);
+
+            ImGui::Indent(kCardPadX);
+            // Indent는 왼쪽만 밀어 준다. 오른쪽 여백은 위젯이 폭을 계산할 때 빼야 한다.
+            g_contentInset = kCardPadX * 2.0f;
+            ImGui::Dummy(ImVec2(0.0f, kCardPadY - ImGui::GetStyle().ItemSpacing.y));
+
+            if (title && *title)
+            {
+                const UiTheme::Palette& palette = UiTheme::Current();
+                PushFontScaled(g_fontLabel);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(palette.textSubtle));
+                ImGui::TextUnformatted(title);
+                ImGui::PopStyleColor();
+                ImGui::PopFont();
+                ImGui::Dummy(ImVec2(0.0f, 3.0f));
+            }
+        }
+
+        void EndCard()
+        {
+            ImGui::Dummy(ImVec2(0.0f, kCardPadY - ImGui::GetStyle().ItemSpacing.y));
+            ImGui::Unindent(kCardPadX);
+            g_contentInset = g_card.previousInset;
+
+            const ImVec2 maximum(g_card.minimum.x + g_card.width, ImGui::GetCursorScreenPos().y);
+            const UiTheme::Palette& palette = UiTheme::Current();
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            drawList->ChannelsSetCurrent(0);
+            // 아주 옅은 그림자 한 겹이 카드를 바닥에서 띄운다. 라이트 테마에서 특히 이것 없이는
+            // 흰 카드가 회색 바닥에 그냥 얹힌 종이처럼만 보인다.
+            drawList->AddRectFilled(ImVec2(g_card.minimum.x, g_card.minimum.y + 2.0f),
+                                    ImVec2(maximum.x, maximum.y + 3.0f), palette.shadow, 11.0f);
+            drawList->AddRectFilled(g_card.minimum, maximum, palette.cardBackground, 11.0f);
+            drawList->AddRect(g_card.minimum, maximum, palette.border, 11.0f);
+            drawList->ChannelsMerge();
+
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
         }
 
         void SectionSeparator()
         {
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
+            const UiTheme::Palette& palette = UiTheme::Current();
+            ImGui::Dummy(ImVec2(0.0f, 4.0f));
+            const ImVec2 start = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddLine(start, ImVec2(start.x + RowWidth(), start.y),
+                                                UiTheme::WithAlpha(palette.border, 180));
+            ImGui::Dummy(ImVec2(0.0f, 5.0f));
         }
 
         void ToggleRow(Loc::Str label, const char* id, bool* value)
         {
             ImGui::PushID(id);
+            const float width = RowWidth();
+            const float startX = ImGui::GetCursorPosX();
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(Loc::Text(label));
             ImGui::SameLine();
-            const float toggleWidth = ImGui::GetFrameHeight() * 1.8f;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - toggleWidth);
+            constexpr float kToggleWidth = 36.0f;
+            ImGui::SetCursorPosX(startX + width - kToggleWidth);
             ToggleSwitch("##switch", value);
             ImGui::PopID();
         }
@@ -209,10 +316,12 @@ namespace Widgets
         void KeyRow(Loc::Str label, unsigned int* key)
         {
             ImGui::PushID("activation_key_row");
+            const float width = RowWidth();
+            const float startX = ImGui::GetCursorPosX();
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(Loc::Text(label));
             ImGui::SameLine();
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 156.0f);
+            ImGui::SetCursorPosX(startX + width - 132.0f);
             KeyBindButton(key);
             ImGui::PopID();
         }
@@ -254,7 +363,8 @@ namespace Widgets
         {
             ImGuiWindow* window = ImGui::GetCurrentWindow();
             const float width = (std::max)(1.0f, ImGui::GetContentRegionAvail().x);
-            const ImVec2 size(width, 50.0f);
+            // 50px 높이에 항목이 넷뿐이라 사이드바 위쪽이 텅 비어 보였다. 38px면 목록으로 읽힌다.
+            const ImVec2 size(width, 38.0f);
             ImGui::PushID(id);
             const bool pressed = ImGui::InvisibleButton("##tab", size);
             const ImVec2 minimum = ImGui::GetItemRectMin();
@@ -265,19 +375,19 @@ namespace Widgets
             if (selected)
             {
                 window->DrawList->AddRectFilled(minimum, maximum, palette.accentSoft, 8.0f);
-                window->DrawList->AddRectFilled(ImVec2(minimum.x, minimum.y + 7.0f),
-                                                ImVec2(minimum.x + 3.0f, maximum.y - 7.0f), palette.accent, 2.0f);
+                window->DrawList->AddRectFilled(ImVec2(minimum.x, minimum.y + 9.0f),
+                                                ImVec2(minimum.x + 3.0f, maximum.y - 9.0f), palette.accent, 2.0f);
             }
             else if (hovered)
             {
                 window->DrawList->AddRectFilled(minimum, maximum, palette.controlHovered, 8.0f);
             }
-            const ImVec2 dotCenter(minimum.x + 19.0f, minimum.y + size.y * 0.5f);
-            window->DrawList->AddCircleFilled(dotCenter, selected ? 5.0f : 4.0f,
-                                              selected ? palette.accent : palette.textSubtle);
-            window->DrawList->AddText(ImVec2(minimum.x + 36.0f,
+            // 예전엔 항목마다 회색 점이 붙어 있었는데, 선택 상태는 배경과 좌측 바가 이미 말해 준다.
+            PushFontScaled(selected ? g_fontBody : g_fontBody);
+            window->DrawList->AddText(ImVec2(minimum.x + 16.0f,
                                              minimum.y + (size.y - ImGui::GetTextLineHeight()) * 0.5f),
-                                      selected ? palette.text : palette.textMuted, Loc::Text(label));
+                                      selected ? palette.accent : palette.textMuted, Loc::Text(label));
+            ImGui::PopFont();
             ImGui::PopID();
             if (pressed)
             {
@@ -378,61 +488,75 @@ namespace Widgets
             const ImVec2 windowSize = ImGui::GetWindowSize();
             const ImVec2 windowMaximum(windowMinimum.x + windowSize.x, windowMinimum.y + windowSize.y);
             window->DrawList->AddRectFilled(windowMinimum, windowMaximum, palette.sidebarBackground, 12.0f);
-            window->DrawList->AddRect(windowMinimum, windowMaximum, palette.border, 12.0f);
 
-            const ImVec2 brandPosition = ImGui::GetCursorScreenPos();
-            window->DrawList->AddText(brandPosition, palette.accent, Loc::Text(Loc::Str::BrandName));
-            window->DrawList->AddText(ImVec2(brandPosition.x, brandPosition.y + 23.0f), palette.textSubtle,
+            // 브랜드 표시: 액센트 사각형 하나 + 굵은 제목. 예전에는 본문과 같은 크기의 "CBPK / TRAINER"
+            // 한 줄이라 헤더로 읽히지 않았다.
+            const ImVec2 brand = ImGui::GetCursorScreenPos();
+            window->DrawList->AddRectFilled(ImVec2(brand.x, brand.y + 3.0f), ImVec2(brand.x + 4.0f, brand.y + 21.0f),
+                                            palette.accent, 2.0f);
+            PushFontScaled(g_fontTitle);
+            window->DrawList->AddText(ImVec2(brand.x + 14.0f, brand.y), palette.text,
+                                      Loc::Text(Loc::Str::BrandName));
+            ImGui::PopFont();
+            PushFontScaled(g_fontSmall);
+            window->DrawList->AddText(ImVec2(brand.x + 14.0f, brand.y + 26.0f), palette.textSubtle,
                                       Loc::Text(Loc::Str::BrandSubtitle));
-            ImGui::Dummy(ImVec2(0.0f, 61.0f));
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(0.0f, 56.0f));
 
             SidebarTab("aimbot", Loc::Str::TabAimbot, Tab::Aimbot);
             SidebarTab("esp", Loc::Str::TabEsp, Tab::Esp);
             SidebarTab("misc", Loc::Str::TabMisc, Tab::Misc);
             SidebarTab("debug", Loc::Str::TabDebug, Tab::Debug);
 
-            constexpr float footerHeight = 144.0f;
+            constexpr float footerHeight = 122.0f;
             const float footerTop = ImGui::GetWindowHeight() - footerHeight - ImGui::GetStyle().WindowPadding.y;
             if (ImGui::GetCursorPosY() < footerTop)
                 ImGui::SetCursorPosY(footerTop);
-            ImGui::Spacing();
             const ImVec2 lineStart = ImGui::GetCursorScreenPos();
             window->DrawList->AddLine(lineStart,
                                       ImVec2(lineStart.x + ImGui::GetContentRegionAvail().x, lineStart.y),
-                                      palette.border);
-            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+                                      UiTheme::WithAlpha(palette.border, 200));
+            ImGui::Dummy(ImVec2(0.0f, 8.0f));
             DrawLanguagePicker(settings);
-            ImGui::Spacing();
+            ImGui::Dummy(ImVec2(0.0f, 2.0f));
             DrawThemePicker(settings);
-            ImGui::TextDisabled("%s", Loc::Text(Loc::Str::FooterHotkeys));
+            ImGui::Dummy(ImVec2(0.0f, 6.0f));
+            PushFontScaled(g_fontSmall);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(palette.textSubtle));
+            ImGui::TextUnformatted(Loc::Text(Loc::Str::FooterHotkeys));
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
         }
 
-        bool BeginSectionCard(const char* id)
+        // 페이지 본체는 스크롤 영역일 뿐 그 자체가 카드가 아니다. 예전에는 여기서도 카드 배경을 그려서,
+        // 이제 각 그룹이 카드를 갖게 된 뒤로는 카드 안에 카드가 겹치는 모양이 된다.
+        bool BeginPageScroll(const char* id)
         {
-            const UiTheme::Palette& palette = UiTheme::Current();
-            const ImVec2 minimum = ImGui::GetCursorScreenPos();
-            const ImVec2 size((std::max)(1.0f, ImGui::GetContentRegionAvail().x),
-                              (std::max)(1.0f, ImGui::GetContentRegionAvail().y));
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
-            const ImVec2 maximum(minimum.x + size.x, minimum.y + size.y);
-            drawList->AddRectFilled(minimum, maximum, palette.cardBackground, 10.0f);
-            drawList->AddRect(minimum, maximum, palette.border, 10.0f);
-            return ImGui::BeginChild(id, ImVec2(0.0f, 0.0f), false,
-                                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            return ImGui::BeginChild(id, ImVec2(0.0f, 0.0f), false, ImGuiWindowFlags_NoBackground);
         }
 
-        void EndSectionCard()
+        void EndPageScroll()
         {
             ImGui::EndChild();
         }
 
         void DrawAimbot(Features::Settings& settings)
         {
+            BeginCard(Loc::Text(Loc::Str::CardGeneral));
             ToggleRow(Loc::Str::AimbotEnabled, "aimbot_enabled", &settings.aimbot.enabled);
-            SectionSeparator();
             ToggleRow(Loc::Str::SilentAim, "silent", &settings.aimbot.silentAim);
             KeyRow(Loc::Str::ActivationKey, &settings.aimbot.activationKey);
-            ToggleRow(Loc::Str::DrawFovCircle, "fov_circle", &settings.aimbot.drawFovCircle);
+            char activationHint[768]{};
+            snprintf(activationHint, sizeof(activationHint),
+                     settings.aimbot.silentAim ? Loc::Text(Loc::Str::ActivationSilentHint)
+                                               : Loc::Text(Loc::Str::ActivationClassicHint),
+                     KeyName(settings.aimbot.activationKey));
+            ImGui::Dummy(ImVec2(0.0f, 2.0f));
+            HintText(activationHint);
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardTargeting));
             ToggleRow(Loc::Str::TargetEnemies, "target_enemies", &settings.aimbot.targetEnemies);
             ToggleRow(Loc::Str::TargetPolice, "target_police", &settings.aimbot.targetPolice);
             ToggleRow(Loc::Str::OnlyVisibleTargets, "visible_only", &settings.aimbot.visibleOnly);
@@ -443,55 +567,73 @@ namespace Widgets
                 FilledSliderFloat(Loc::Text(Loc::Str::MaxHealthPool), &settings.aimbot.maxHealthPool, 500.0f,
                                   6000.0f, Loc::Text(Loc::Str::HealthFormat));
             }
+            if (settings.aimbot.visibleOnly || settings.aimbot.requireHealthPool ||
+                settings.aimbot.limitHealthPool)
+            {
+                ImGui::Dummy(ImVec2(0.0f, 2.0f));
+            }
+            if (settings.aimbot.visibleOnly)
+                HintText(Loc::Text(Loc::Str::VisibleOnlyHint));
+            if (settings.aimbot.requireHealthPool || settings.aimbot.limitHealthPool)
+                HintText(Loc::Text(Loc::Str::HealthFilterHint));
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardAiming));
+            ToggleRow(Loc::Str::DrawFovCircle, "fov_circle", &settings.aimbot.drawFovCircle);
             FilledSliderFloat(Loc::Text(Loc::Str::FovRadius), &settings.aimbot.fovRadiusDegrees, 1.0f, 60.0f,
                               Loc::Text(Loc::Str::DegreesFormat));
             if (!settings.aimbot.silentAim)
                 FilledSliderFloat(Loc::Text(Loc::Str::Smoothing), &settings.aimbot.smoothing, 0.0f, 30.0f,
                                   Loc::Text(Loc::Str::DecimalFormat));
-            FilledSliderFloat(Loc::Text(Loc::Str::AimDistance), &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f,
-                              Loc::Text(Loc::Str::MetersFormat));
-
-            char activationHint[768]{};
-            snprintf(activationHint, sizeof(activationHint),
-                     settings.aimbot.silentAim ? Loc::Text(Loc::Str::ActivationSilentHint)
-                                               : Loc::Text(Loc::Str::ActivationClassicHint),
-                     KeyName(settings.aimbot.activationKey));
-            HintBox(activationHint);
-            if (settings.aimbot.visibleOnly)
-                HintBox(Loc::Text(Loc::Str::VisibleOnlyHint));
-            if (settings.aimbot.requireHealthPool || settings.aimbot.limitHealthPool)
-                HintBox(Loc::Text(Loc::Str::HealthFilterHint));
+            FilledSliderFloat(Loc::Text(Loc::Str::AimDistance), &settings.aimbot.maxDistanceMeters, 10.0f,
+                              300.0f, Loc::Text(Loc::Str::MetersFormat));
+            EndCard();
         }
 
         void DrawEsp(Features::Settings& settings)
         {
+            BeginCard(Loc::Text(Loc::Str::CardGeneral));
             ToggleRow(Loc::Str::EspEnabled, "esp_enabled", &settings.esp.enabled);
-            SectionSeparator();
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardVisuals));
             ToggleRow(Loc::Str::BoundingBoxes, "boxes", &settings.esp.boundingBoxes);
             ToggleRow(Loc::Str::Skeleton, "skeleton", &settings.esp.skeleton);
             ToggleRow(Loc::Str::HealthBars, "health", &settings.esp.healthBars);
             ToggleRow(Loc::Str::NativeHighlight, "native", &settings.esp.nativeHighlight);
-            ToggleRow(Loc::Str::HideDeadNpcs, "hide_dead", &settings.esp.hideDead);
-            ToggleRow(Loc::Str::VisibilityCheck, "visibility", &settings.esp.visibilityCheck);
-            ToggleRow(Loc::Str::HideOccludedNpcs, "hide_occluded", &settings.esp.hideOccluded);
-            SectionSeparator();
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardFilters));
             ToggleRow(Loc::Str::Civilians, "civilians", &settings.esp.showCivilians);
             ToggleRow(Loc::Str::Enemies, "enemies", &settings.esp.showEnemies);
             ToggleRow(Loc::Str::Police, "police", &settings.esp.showPolice);
             ToggleRow(Loc::Str::Unclassified, "unclassified", &settings.esp.showUnclassified);
+            SectionSeparator();
+            ToggleRow(Loc::Str::HideDeadNpcs, "hide_dead", &settings.esp.hideDead);
+            ToggleRow(Loc::Str::VisibilityCheck, "visibility", &settings.esp.visibilityCheck);
+            ToggleRow(Loc::Str::HideOccludedNpcs, "hide_occluded", &settings.esp.hideOccluded);
             FilledSliderFloat(Loc::Text(Loc::Str::MaxDistance), &settings.esp.maxDistanceMeters, 10.0f, 300.0f,
                               Loc::Text(Loc::Str::MetersFormat));
             if (settings.esp.visibilityCheck)
-                HintBox(Loc::Text(Loc::Str::VisibilityPerformanceHint));
+            {
+                ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                WarningBox(Loc::Text(Loc::Str::VisibilityPerformanceHint));
+            }
+            EndCard();
         }
 
         void DrawMisc(Features::Settings& settings)
         {
+            BeginCard(Loc::Text(Loc::Str::CardWeapon));
             ToggleRow(Loc::Str::NoRecoil, "no_recoil", &settings.misc.noRecoil);
             ToggleRow(Loc::Str::NoSpread, "no_spread", &settings.misc.noSpread);
             ToggleRow(Loc::Str::AutoPistol, "auto_pistol", &settings.misc.autoPistol);
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardPlayer));
             ToggleRow(Loc::Str::InfiniteHealth, "infinite_health", &settings.misc.infiniteHealth);
             ToggleRow(Loc::Str::InfiniteStamina, "infinite_stamina", &settings.misc.infiniteStamina);
+            EndCard();
         }
 
         void DrawInternalStats()
@@ -560,7 +702,7 @@ namespace Widgets
             ImGui::Spacing();
             if (DisclosureHeader("silent_diagnostics", Loc::Str::SilentAimDiagnostics, &g_silentDiagnosticsOpen))
             {
-                HintBox(Loc::Text(Loc::Str::HeadlessAimbotHint));
+                HintText(Loc::Text(Loc::Str::HeadlessAimbotHint));
                 ImGui::TextDisabled("Crosshair core: calls %llu | redirects %llu",
                                     static_cast<unsigned long long>(silentStats.nativeCrosshairCoreCalls),
                                     static_cast<unsigned long long>(silentStats.nativeCrosshairCoreRedirects));
@@ -586,25 +728,35 @@ namespace Widgets
 
         void DrawDebug(Features::Settings& settings)
         {
+            BeginCard(Loc::Text(Loc::Str::CardOverlay));
             ToggleRow(Loc::Str::ShowFps, "show_fps", &settings.debug.showFps);
             ToggleRow(Loc::Str::ShowGraph, "show_graph", &settings.debug.showGraph);
             ToggleRow(Loc::Str::ShowInternalStats, "show_stats", &settings.debug.showInternalStats);
-            SectionSeparator();
+            EndCard();
+
+            // 이 카드의 토글은 전부 켜면 비용을 내는 것들이다. 켜져 있을 때만 경고 박스를 붙인다 -
+            // 꺼져 있는 항목까지 경고를 달면 패널이 경고로 뒤덮여서 진짜 경고가 안 읽힌다.
+            BeginCard(Loc::Text(Loc::Str::CardDiagnostics));
             ToggleRow(Loc::Str::DiagnosticLogging, "logging", &settings.debug.diagnosticLogging);
             if (settings.debug.diagnosticLogging)
-                HintBox(Loc::Text(Loc::Str::DiagnosticLoggingHint));
+                WarningBox(Loc::Text(Loc::Str::DiagnosticLoggingHint));
             ToggleRow(Loc::Str::CrashReporting, "crash_reporting", &settings.debug.crashReporting);
             if (settings.debug.crashReporting)
-                HintBox(Loc::Text(Loc::Str::CrashReportingHint));
+                WarningBox(Loc::Text(Loc::Str::CrashReportingHint));
             ToggleRow(Loc::Str::PerformanceProfiling, "profiling", &settings.debug.performanceProfiling);
             if (settings.debug.performanceProfiling)
-                HintBox(Loc::Text(Loc::Str::PerformanceProfilingHint));
+                WarningBox(Loc::Text(Loc::Str::PerformanceProfilingHint));
             ToggleRow(Loc::Str::DebuggerOutput, "debugger_output", &settings.debug.debuggerOutput);
             if (settings.debug.debuggerOutput)
-                HintBox(Loc::Text(Loc::Str::DebuggerOutputHint));
+                WarningBox(Loc::Text(Loc::Str::DebuggerOutputHint));
+            EndCard();
+
+            BeginCard(Loc::Text(Loc::Str::CardAdvanced));
             ToggleRow(Loc::Str::HeadlessAimbot, "headless_aimbot", &settings.debug.headlessAimbot);
             if (settings.debug.headlessAimbot)
-                HintBox(Loc::Text(Loc::Str::HeadlessAimbotHint));
+                WarningBox(Loc::Text(Loc::Str::HeadlessAimbotHint));
+            EndCard();
+
             if (settings.debug.showInternalStats)
                 DrawInternalStats();
         }
@@ -622,11 +774,23 @@ namespace Widgets
                                              : g_activeTab == Tab::Misc ? Loc::Str::MiscDescription
                                                                         : Loc::Str::DebugDescription;
             const UiTheme::Palette& palette = UiTheme::Current();
-            ImGui::TextColored(Color(palette.accent), "%s", Loc::Text(title));
-            ImGui::TextDisabled("%s", Loc::Text(description));
-            ImGui::Spacing();
-            const bool cardVisible = BeginSectionCard("##settings_card");
-            if (cardVisible)
+
+            // 페이지 제목은 본문보다 확실히 커야 한다. 예전에는 본문과 같은 크기에 색만 파래서 제목으로
+            // 읽히지 않았다.
+            PushFontScaled(g_fontTitle);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(palette.text));
+            ImGui::TextUnformatted(Loc::Text(title));
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+            PushFontScaled(g_fontSmall);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(palette.textSubtle));
+            ImGui::TextUnformatted(Loc::Text(description));
+            ImGui::PopStyleColor();
+            ImGui::PopFont();
+            ImGui::Dummy(ImVec2(0.0f, 10.0f));
+
+            const bool visible = BeginPageScroll("##settings_scroll");
+            if (visible)
             {
                 if (g_activeTab == Tab::Aimbot)
                     DrawAimbot(settings);
@@ -638,21 +802,33 @@ namespace Widgets
                     DrawDebug(settings);
             }
             // BeginChild/EndChild 쌍은 클리핑되어 false가 반환된 경우에도 반드시 닫아야 한다.
-            EndSectionCard();
+            EndPageScroll();
         }
     }
 
     void ApplyStyle()
     {
-        // 기본 ImGui 폰트엔 한글 글리프가 없어서 한글 텍스트가 깨질 수 있다. Windows에 기본 내장된
-        // 맑은 고딕을 얹고, 파일이 없는 환경이면 조용히 기본 폰트로 폴백한다.
+        // 기본 ImGui 폰트엔 한글 글리프가 없어서 한글이 깨진다. Windows에 기본 내장된 맑은 고딕을
+        // 얹고, 파일이 없는 환경이면 조용히 기본 폰트로 폴백한다.
+        //
+        // 크기를 네 단계로 나눠 얹는 이유: 전부 한 크기(17px)로 그리면 제목과 항목 이름과 부연 설명이
+        // 같은 무게로 읽혀서 눈이 어디를 먼저 볼지 못 정한다. AGENTS.md가 "ImGui가 투박해 보이는
+        // 원인의 8할이 폰트"라고 적어 둔 것이 정확히 이 지점이다. 굵은 자체(malgunbd)가 있으면 제목과
+        // 카드 라벨에만 쓰고, 없으면 같은 파일을 크기만 달리 얹는다.
         ImGuiIO& io = ImGui::GetIO();
-        if (GetFileAttributesW(L"C:\\Windows\\Fonts\\malgun.ttf") != INVALID_FILE_ATTRIBUTES)
+        const char* regular = "C:\Windows\Fonts\malgun.ttf";
+        const char* bold = "C:\Windows\Fonts\malgunbd.ttf";
+        const bool hasBold = GetFileAttributesW(L"C:\Windows\Fonts\malgunbd.ttf") != INVALID_FILE_ATTRIBUTES;
+        if (GetFileAttributesW(L"C:\Windows\Fonts\malgun.ttf") != INVALID_FILE_ATTRIBUTES)
         {
             ImFontConfig config;
             config.OversampleH = 2;
             config.OversampleV = 2;
-            io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\malgun.ttf", 17.0f, &config);
+            // 첫 번째로 얹은 폰트가 기본값이 된다. 본문이 기본이어야 한다.
+            g_fontBody = io.Fonts->AddFontFromFileTTF(regular, 15.5f, &config);
+            g_fontTitle = io.Fonts->AddFontFromFileTTF(hasBold ? bold : regular, 19.0f, &config);
+            g_fontLabel = io.Fonts->AddFontFromFileTTF(hasBold ? bold : regular, 12.0f, &config);
+            g_fontSmall = io.Fonts->AddFontFromFileTTF(regular, 13.0f, &config);
         }
 
         UiTheme::ApplyImGuiStyle();
@@ -666,12 +842,15 @@ namespace Widgets
 
         ImGuiContext& g = *ImGui::GetCurrentContext();
         const ImGuiID id = window->GetID(label);
-        const float height = ImGui::GetFrameHeight();
-        const float width = height * 1.8f;
-        const ImVec2 position = window->DC.CursorPos;
-        const ImRect boundingBox(position, ImVec2(position.x + width, position.y + height));
+        // 고정 크기다. 예전엔 GetFrameHeight()에 비례해서 27x48쯤 되는 바람에, 토글 열 개가 세로로
+        // 쌓히면 채도 높은 파랑 알약이 패널을 지배했다. 작게 잡으면 같은 정보량이 훨씬 조용해진다.
+        constexpr float kHeight = 20.0f;
+        constexpr float kWidth = 36.0f;
+        const ImVec2 position(window->DC.CursorPos.x,
+                              window->DC.CursorPos.y + (ImGui::GetFrameHeight() - kHeight) * 0.5f);
+        const ImRect boundingBox(position, ImVec2(position.x + kWidth, position.y + kHeight));
 
-        ImGui::ItemSize(boundingBox);
+        ImGui::ItemSize(ImVec2(kWidth, ImGui::GetFrameHeight()));
         if (!ImGui::ItemAdd(boundingBox, id))
             return false;
 
@@ -684,17 +863,20 @@ namespace Widgets
         const float target = *value ? 1.0f : 0.0f;
         ImGuiStorage* storage = window->DC.StateStorage;
         float animation = storage->GetFloat(id, target);
-        animation += (target - animation) * ImMin(g.IO.DeltaTime * 12.0f, 1.0f);
+        animation += (target - animation) * ImMin(g.IO.DeltaTime * 14.0f, 1.0f);
         storage->SetFloat(id, animation);
 
         const UiTheme::Palette& palette = UiTheme::Current();
         const ImU32 background = *value ? (held ? palette.accentHovered : palette.accent)
                                         : (hovered ? palette.toggleOffHovered : palette.toggleOff);
-        window->DrawList->AddRectFilled(boundingBox.Min, boundingBox.Max, background, height * 0.5f);
-        const float radius = height * 0.5f - 2.0f;
-        const float thumbX = boundingBox.Min.x + radius + 2.0f + animation * (width - height);
-        window->DrawList->AddCircleFilled(ImVec2(thumbX, boundingBox.Min.y + height * 0.5f), radius,
-                                          palette.toggleThumb);
+        window->DrawList->AddRectFilled(boundingBox.Min, boundingBox.Max, background, kHeight * 0.5f);
+        const float radius = kHeight * 0.5f - 2.5f;
+        const ImVec2 thumb(boundingBox.Min.x + radius + 2.5f + animation * (kWidth - kHeight),
+                           boundingBox.Min.y + kHeight * 0.5f);
+        // thumb 밑에 아주 약한 그림자를 깔아야 동그라미가 트랙 위에 얹혀 보인다.
+        window->DrawList->AddCircleFilled(ImVec2(thumb.x, thumb.y + 1.0f), radius,
+                                          UiTheme::WithAlpha(IM_COL32(0, 0, 0, 255), 28));
+        window->DrawList->AddCircleFilled(thumb, radius, palette.toggleThumb);
         return pressed;
     }
 
@@ -703,46 +885,68 @@ namespace Widgets
         if (!value || maximum <= minimum || !format)
             return false;
 
+        // 예전 슬라이더는 트랙이 16px 높이에 폭을 꽉 채우고 값만큼 진한 파랑으로 칠해져서, 컨트롤이 아니라
+        // 로딩 바처럼 보였다. 트랙을 얇게(4px) 깔고 그랩을 원으로 띄우면 같은 기능이 훨씬 가볍게 읽힌다.
         ImGui::PushID(label);
+        const UiTheme::Palette& palette = UiTheme::Current();
         char valueText[64]{};
         snprintf(valueText, sizeof(valueText), format, *value);
-        const float trackPositionX = ImGui::GetCursorPosX();
-        const float trackWidth = (std::max)(160.0f, ImGui::GetContentRegionAvail().x);
-        const float trackRightX = trackPositionX + trackWidth;
+
+        const float width = RowWidth();
+        const float startX = ImGui::GetCursorPosX();
+
+        // 라벨과 값은 같은 줄에 두고 값은 오른쪽 정렬한다. 세로 공간이 한 줄 줄어든다.
         ImGui::TextUnformatted(label);
         ImGui::SameLine();
+        PushFontScaled(g_fontSmall);
         const float valueWidth = ImGui::CalcTextSize(valueText).x;
-        ImGui::SetCursorPosX(trackRightX - valueWidth);
-        ImGui::TextDisabled("%s", valueText);
+        ImGui::SetCursorPosX(startX + width - valueWidth);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(palette.textMuted));
+        ImGui::TextUnformatted(valueText);
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
 
-        const float height = 16.0f;
-        ImGui::SetCursorPosX(trackPositionX);
-        ImGui::InvisibleButton("##track", ImVec2(trackWidth, height));
+        constexpr float kHitHeight = 18.0f;
+        constexpr float kTrackHeight = 4.0f;
+        constexpr float kGrabRadius = 7.0f;
+        ImGui::SetCursorPosX(startX);
+        // 히트 영역은 트랙보다 두껍게 잡아야 4px 선을 정확히 집지 않아도 잡힌다.
+        ImGui::InvisibleButton("##track", ImVec2(width, kHitHeight));
 
+        const ImVec2 itemMinimum = ImGui::GetItemRectMin();
+        const ImVec2 itemMaximum = ImGui::GetItemRectMax();
+        const float usable = (std::max)(1.0f, (itemMaximum.x - kGrabRadius) - (itemMinimum.x + kGrabRadius));
         bool changed = false;
         if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left))
         {
-            const ImVec2 trackMinimum = ImGui::GetItemRectMin();
-            const ImVec2 trackMaximum = ImGui::GetItemRectMax();
-            const float normalized = std::clamp((ImGui::GetIO().MousePos.x - trackMinimum.x) /
-                                                    (trackMaximum.x - trackMinimum.x),
-                                                0.0f, 1.0f);
+            const float normalized =
+                std::clamp((ImGui::GetIO().MousePos.x - (itemMinimum.x + kGrabRadius)) / usable, 0.0f, 1.0f);
             const float newValue = minimum + normalized * (maximum - minimum);
             changed = newValue != *value;
             *value = newValue;
         }
 
-        const ImVec2 trackMinimum = ImGui::GetItemRectMin();
-        const ImVec2 trackMaximum = ImGui::GetItemRectMax();
         const float normalized = std::clamp((*value - minimum) / (maximum - minimum), 0.0f, 1.0f);
-        const float radius = height * 0.5f;
-        const float grabX = trackMinimum.x + normalized * (trackMaximum.x - trackMinimum.x);
-        const UiTheme::Palette& palette = UiTheme::Current();
+        const float centerY = itemMinimum.y + kHitHeight * 0.5f;
+        const float trackLeft = itemMinimum.x + kGrabRadius;
+        const float grabX = trackLeft + normalized * usable;
+        const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemActive();
         ImDrawList* drawList = ImGui::GetWindowDrawList();
-        drawList->AddRectFilled(trackMinimum, trackMaximum, palette.controlBackground, radius);
-        if (grabX > trackMinimum.x)
-            drawList->AddRectFilled(trackMinimum, ImVec2(grabX, trackMaximum.y), palette.accent, radius);
-        drawList->AddCircleFilled(ImVec2(grabX, trackMinimum.y + radius), radius - 2.0f, palette.toggleThumb);
+
+        drawList->AddRectFilled(ImVec2(itemMinimum.x, centerY - kTrackHeight * 0.5f),
+                                ImVec2(itemMaximum.x, centerY + kTrackHeight * 0.5f),
+                                palette.controlBackground, kTrackHeight * 0.5f);
+        if (grabX > itemMinimum.x)
+        {
+            drawList->AddRectFilled(ImVec2(itemMinimum.x, centerY - kTrackHeight * 0.5f),
+                                    ImVec2(grabX, centerY + kTrackHeight * 0.5f), palette.accent,
+                                    kTrackHeight * 0.5f);
+        }
+        drawList->AddCircleFilled(ImVec2(grabX, centerY + 1.0f), kGrabRadius,
+                                  UiTheme::WithAlpha(IM_COL32(0, 0, 0, 255), 30));
+        drawList->AddCircleFilled(ImVec2(grabX, centerY), kGrabRadius, palette.toggleThumb);
+        drawList->AddCircle(ImVec2(grabX, centerY), kGrabRadius,
+                            hovered ? palette.accent : UiTheme::WithAlpha(palette.accent, 150), 0, 1.6f);
 
         ImGui::PopID();
         return changed;

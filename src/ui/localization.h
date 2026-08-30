@@ -119,6 +119,16 @@ namespace Loc
         InternalStatsTitle,
         LanguagePopup,
         ThemePopup,
+        CardGeneral,
+        CardTargeting,
+        CardAiming,
+        CardVisuals,
+        CardFilters,
+        CardWeapon,
+        CardPlayer,
+        CardOverlay,
+        CardDiagnostics,
+        CardAdvanced,
     };
 
     const char* Text(Str id);

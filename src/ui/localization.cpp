@@ -135,12 +135,22 @@ namespace Loc
             LOC_KO_EN("내부 통계", "Internal stats"),
             LOC_KO_EN("언어 선택", "Select language"),
             LOC_KO_EN("테마 선택", "Select theme"),
+            LOC_KO_EN("일반", "General"),
+            LOC_KO_EN("타겟 선정", "Targeting"),
+            LOC_KO_EN("조준 동작", "Aiming"),
+            LOC_KO_EN("표시 요소", "Visuals"),
+            LOC_KO_EN("필터", "Filters"),
+            LOC_KO_EN("무기", "Weapon"),
+            LOC_KO_EN("플레이어", "Player"),
+            LOC_KO_EN("오버레이 표시", "Overlay"),
+            LOC_KO_EN("진단 및 계측", "Diagnostics"),
+            LOC_KO_EN("고급", "Advanced"),
         };
 
 #undef LOC_KO_EN
 
         constexpr std::size_t kTextCount = sizeof(kText) / sizeof(kText[0]);
-        static_assert(kTextCount == static_cast<std::size_t>(Str::ThemePopup) + 1,
+        static_assert(kTextCount == static_cast<std::size_t>(Str::CardAdvanced) + 1,
                       "localization table must contain one entry for every Str value");
     }
 
