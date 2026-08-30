@@ -49,6 +49,8 @@ add_library(cp2077_trainer SHARED
     src/hooks/hook_lifecycle.cpp
     src/hooks/d3d12_hook.cpp
     src/ui/overlay.cpp
+    src/ui/localization.cpp
+    src/ui/theme.cpp
     src/ui/widgets.cpp
 )
 
