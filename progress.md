@@ -2533,3 +2533,25 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
 빌드 검증은 별도 스크래치 트리에서 했다. 프리즈 직전 로그는 디버그 탭에서 diagnostics 토글을
 연달아 바꾸는 중이었다(`diagnostics toggles changed` 4회 + `config saved` 2회, 19:22:03~06).
 `cp2077_fatal.log`에는 예외 레코드가 없다 — 크래시가 아니라 행이다. 원인은 아직 안 봤다.
+
+## 2026-08-30 — PID 29968 로딩 프리즈 덤프 분석
+
+- 살아 있는 프로세스에서 19:36:44와 19:39:14에 154 MB 미니덤프 두 개를 수집했다. 두 덤프의 메인 틱
+  TID 34748 유사 콜스택 41개 프레임은 완전히 동일했고, 이 스레드만 코어 하나를 계속 소모했다. 나머지
+  103개 스레드는 대기 상태였다.
+- PDB 심볼화한 트레이너 프레임 `+0x1C185`는 `HookOnTick`에서 `g_originalOnTick`을 호출한 뒤의 복귀
+  주소다. 트레이너 tick 작업은 이미 끝났고, 원본 REDengine OnTick이 `Cyberpunk2077.exe+0x14AC7B /
+  +0x14AF14` scheduler 루프에서 `[r14+0x18] == 1`인 job 하나를 영구 대기하고 있었다. 렌더/GPU/Present
+  프리즈가 아니다.
+- PID 26484의 과거 Native Highlight 프리즈와 종착 스택은 같지만 선행 증거가 다르다. 이번 fatal 세션에는
+  예외가 없고, dump global `g_nativeHighlightModeActive=0`, cleanup request=0이며 대상 5개도 전부 비활성
+  civilian이었다. `215fb70`의 world-empty/settle 수정은 현재 DLL에 포함돼 있으므로 Highlight 문제가
+  되돌아온 것은 아니다.
+- 프리즈 당시 PlayerModifiers는 weapon `0x9B721C`에 `desired=active=0x3`(no-recoil + no-spread)로
+  활성 상태였다. 이 경로는 stable target 틱에도 `GetLocalPlayer`, `GetItemInSlot`, strong handle release를
+  수행하지만 Native Highlight와 같은 전환 게이트가 없다. owner identity 수정은 owner 주소가 바뀐 뒤만
+  다루므로, 같은 non-null 주소로 내부 job graph가 drain되는 limbo를 막지 못한다. 따라서 PlayerModifiers의
+  전환기 엔진 호출/handle 생명주기가 1순위 용의자다. 다만 콜백 복귀 후 덤프라 정확한 선행 callee는 아직
+  확정할 수 없다.
+- 상세 판정과 아티팩트 목록은 `reports/2026-08-30_freeze_analysis_pid29968.md`, 재사용 가능한 판정법은
+  `reports/INSIGHTS.md` 1.3/2.5에 기록했다. 소스 수정과 PID 29968 종료는 하지 않았다.
