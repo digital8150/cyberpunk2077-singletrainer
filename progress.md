@@ -2353,3 +2353,27 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   `INSIGHTS.md`에 추가하되 같은 주제가 있으면 새 항목 대신 기존 항목을 보강한다.
 - 인사이트 절을 제거한 보고서: `..._pid13248.md`, `..._pid29324.md`, `..._pid26484.md`
   (`..._pid30148.md`와 `..._gpucrash_pid29084.md`에는 원래 없었다).
+
+## 2026-08-30 - PID 4392 Issue #2 3회 save-load 통과와 no-recoil stale-owner 수정
+
+- clean PID 4392에 현재 HEAD Release DLL(SHA-256
+  `3CCFBF10C1D6F0DE9467A850270536C90184132E1841504D8C88076C9F97F50D`)을 15:27:01 주입하고 watchdog을
+  붙였다. `native_highlight=1` 상태로 사용자가 save-load 3회를 수행했다.
+- 초기 진입과 세 번의 load가 모두 `tracked=0 -> repopulated -> 1000 ms settled`를 통과했다. load별 settled
+  count는 34, 34, 63이었고 프로세스/heartbeat가 계속 살아 있었으며 현재 세션 `[FATAL]` 레코드는 0건이다.
+  End unload 중 native highlight도 `cleanup acknowledged: generation=9 queued=40 cleared=4`를 기록했다.
+  따라서 Issue #2의 즉시 재현 경로는 통과로 판정한다.
+- 별도로 no-recoil은 첫 load 뒤 새 무기 `0x9B0C4B`에 modifier 11개를 적용한 뒤 다음 load부터 제거/재적용이
+  끊겼다. End unload에서도 같은 target 제거가 계속 실패해 `hook shutdown aborted`가 무한 반복됐다. 새
+  StatsSystem에 구 월드 target/Handle을 넘기는 stale-owner 상태가 `g_active`를 영구 latch한 것이 직접 원인이다.
+- `player_modifiers.cpp`는 modifier 적용 owner의 `gameInstance / statsSystem / player instance` 주소를 identity
+  token으로 기록한다. fresh owner가 달라지면 구 시스템에 `RemoveModifier`를 호출하지 않고 exact Handle release로
+  로컬 상태를 폐기한 뒤 새 target에 재적용한다. 같은 owner의 무기 교체는 기존 remove 경로를 유지한다.
+  `HasExactHandleOwnership()`을 runtime gate에 포함했고 기존 보수적 Handle release도 exact 경로로 교정했다.
+- cleanup 중 Present의 `enabled=true` 재게시를 차단했다. DLL main unload는 요청당 3회까지만 재시도하고, 실패 시
+  강제 `FreeLibrary` 없이 resident 상태로 남아 새 End/event 요청을 기다리므로 무한 hot retry를 제거했다.
+- 진단 UI에 `retiredOwnerResets`를 추가했다. `git diff --check` 통과,
+  `cmake --build build-next --config Release` 통과. 수정 DLL SHA-256은
+  `A129F5BE7DCA2882C699B01C286EAC7C319CB88D67C832DC820E35A35D19DF43`이다. 현재 PID 4392는 구 DLL의 unload
+  루프 안이므로 강제 해제하지 않았다. 다음 clean process에서 no-recoil ON save-load 후 owner reset/재적용/End
+  unload 완료를 검증한다. 상세 근거는 `reports/2026-08-30_issue2_validation_pid4392.md`에 기록했다.

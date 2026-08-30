@@ -408,12 +408,13 @@ namespace Widgets
                             static_cast<unsigned long long>(entityStats.nativeHighlightQueued),
                             static_cast<unsigned long long>(entityStats.nativeHighlightCleared),
                             static_cast<unsigned long long>(entityStats.nativeHighlightFailures));
-        ImGui::TextDisabled("No recoil: %s (%s) | target 0x%llX | applied %llu | removed %llu | failures %llu",
+        ImGui::TextDisabled("No recoil: %s (%s) | target 0x%llX | applied %llu | removed %llu | retired %llu | failures %llu",
                             modifierStats.active ? "active" : (modifierStats.available ? "ready" : "unavailable"),
                             modifierStats.usingWeaponTarget ? "weapon" : "player fallback",
                             static_cast<unsigned long long>(modifierStats.targetId),
                             static_cast<unsigned long long>(modifierStats.applied),
                             static_cast<unsigned long long>(modifierStats.removed),
+                            static_cast<unsigned long long>(modifierStats.retiredOwnerResets),
                             static_cast<unsigned long long>(modifierStats.failures));
 
         ImGui::Spacing();

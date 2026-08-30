@@ -29,22 +29,48 @@ namespace
         else
             Diagnostics::Log("CreateEventW(unload) failed: error=%lu; End hotkey remains available", GetLastError());
 
+        constexpr unsigned kShutdownAttemptsPerRequest = 3;
+        bool shutdownComplete = false;
         bool endWasDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
-        for (;;)
+        while (!shutdownComplete)
         {
-            const bool endIsDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
-            const bool eventSignaled = unloadEvent && WaitForSingleObject(unloadEvent, 0) == WAIT_OBJECT_0;
-            if ((endIsDown && !endWasDown) || eventSignaled)
-                break;
-            endWasDown = endIsDown;
-            Sleep(50);
-        }
+            bool requestReceived = false;
+            while (!requestReceived)
+            {
+                const bool endIsDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+                const bool eventSignaled = unloadEvent && WaitForSingleObject(unloadEvent, 0) == WAIT_OBJECT_0;
+                requestReceived = (endIsDown && !endWasDown) || eventSignaled;
+                endWasDown = endIsDown;
+                if (!requestReceived)
+                    Sleep(50);
+            }
 
-        Diagnostics::Log("safe unload requested");
-        while (!Hooks::Shutdown())
-        {
-            Diagnostics::Log("safe unload is waiting for hook cleanup; retrying in 1000 ms");
-            Sleep(1000);
+            Diagnostics::Log("safe unload requested");
+            for (unsigned attempt = 1; attempt <= kShutdownAttemptsPerRequest; ++attempt)
+            {
+                if (Hooks::Shutdown())
+                {
+                    shutdownComplete = true;
+                    break;
+                }
+                if (attempt < kShutdownAttemptsPerRequest)
+                {
+                    Diagnostics::Log("safe unload cleanup attempt %u/%u failed; retrying in 1000 ms",
+                                     attempt, kShutdownAttemptsPerRequest);
+                    Sleep(1000);
+                }
+            }
+
+            if (!shutdownComplete)
+            {
+                // Never force FreeLibrary after a failed cleanup. Stop the hot retry loop, leave the DLL resident,
+                // and require a fresh End edge or automation event before another bounded attempt set.
+                Diagnostics::Log("safe unload deferred after %u attempts; DLL remains loaded; signal again to retry",
+                                 kShutdownAttemptsPerRequest);
+                if (unloadEvent)
+                    ResetEvent(unloadEvent);
+                endWasDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+            }
         }
 
         Diagnostics::Log("safe unload checks passed; releasing DLL");

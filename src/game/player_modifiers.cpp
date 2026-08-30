@@ -34,8 +34,8 @@ namespace
         void* instance = nullptr;
         Game::Rtti::Handle handle;
         // ConstructHandle establishes a strong handle before AddModifier runs. Keep this separate from active:
-        // a failed/exceptional AddModifier still leaves a handle the engine may have retained and must be removed
-        // through the exact reflected call before the local storage can be released.
+        // a failed/exceptional AddModifier still leaves a handle the engine may have retained and must normally
+        // be removed through the exact reflected call before its exact local Handle release.
         bool cleanupTracked = false;
         bool active = false;
     };
@@ -75,6 +75,7 @@ namespace
         Game::Rtti::Function* getItemInSlot = nullptr;
         Game::Rtti::Class* modifierDataClass = nullptr;
         std::size_t modifierDataSize = 0;
+        bool exactHandleOwnership = false;
         ULONGLONG lastSystemAcquireFailureLog = 0;
         std::uint64_t systemAcquireFailures = 0;
     };
@@ -90,9 +91,16 @@ namespace
     std::atomic_bool g_active{false};
     std::atomic_uint64_t g_applied{0};
     std::atomic_uint64_t g_removed{0};
+    std::atomic_uint64_t g_retiredOwnerResets{0};
     std::atomic_uint64_t g_failures{0};
     std::atomic_bool g_usingWeaponTarget{false};
     std::atomic_bool g_runtimeAvailable{false};
+    // Address values are identity tokens only. They are never dereferenced after the tick that acquired them.
+    // The modifier handles belong to this exact world/player owner and must not be removed through a replacement
+    // StatsSystem after a save load.
+    std::atomic_uintptr_t g_ownerGameInstance{0};
+    std::atomic_uintptr_t g_ownerStatsSystem{0};
+    std::atomic_uintptr_t g_ownerPlayerInstance{0};
     ULONGLONG g_lastPathLogTick = 0;
 
     constexpr std::array<std::int32_t, kModifierCount> kRecoilStats = {
@@ -229,7 +237,8 @@ namespace
     {
         const ULONGLONG now = GetTickCount64();
         const bool baseResolved = g_runtime.getLocalPlayer && g_runtime.addModifier && g_runtime.removeModifier &&
-                                  g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize;
+                                  g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize &&
+                                  g_runtime.exactHandleOwnership;
         const bool weaponApiResolved = g_runtime.getItemInSlot != nullptr;
         if (baseResolved && weaponApiResolved)
         {
@@ -292,6 +301,7 @@ namespace
                 g_runtime.modifierDataClass = modifierDataClass;
                 g_runtime.modifierDataSize = modifierDataSize;
             }
+            g_runtime.exactHandleOwnership = Game::Rtti::HasExactHandleOwnership();
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -300,13 +310,14 @@ namespace
         }
 
         const bool resolved = g_runtime.getLocalPlayer && g_runtime.addModifier && g_runtime.removeModifier &&
-                              g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize;
+                              g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize &&
+                              g_runtime.exactHandleOwnership;
         g_runtimeAvailable.store(resolved, std::memory_order_release);
         Diagnostics::Log("no-recoil resolver: getPlayer=%p add=%p remove=%p getItem=%p modifierClass=%p "
-                         "size=0x%zX resolved=%d",
+                         "size=0x%zX exactHandle=%d resolved=%d",
                          g_runtime.getLocalPlayer, g_runtime.addModifier, g_runtime.removeModifier,
                          g_runtime.getItemInSlot, g_runtime.modifierDataClass, g_runtime.modifierDataSize,
-                         resolved ? 1 : 0);
+                         g_runtime.exactHandleOwnership ? 1 : 0, resolved ? 1 : 0);
         if (!resolved)
             g_failures.fetch_add(1, std::memory_order_relaxed);
         return resolved;
@@ -331,11 +342,13 @@ namespace
 
     void ReleaseLocalHandle(Game::Rtti::Handle& handle)
     {
-        // Invoke may populate only part of an out Handle before a transition fault. Try the existing conservative
-        // release helper exactly once whenever either word was populated, then clear local storage even when no
-        // proven release path exists for a partial value. Never guess a destructor for the returned object.
+        // Invoke may populate only part of an out Handle before a transition fault. Exact release validates both
+        // words before touching the refcount; a partial result is cleared locally without guessing a destructor.
         if (handle.instance || handle.refCount)
-            Game::Rtti::ReleaseHandle(&handle);
+        {
+            if (!Game::Rtti::ReleaseHandleExact(&handle))
+                g_failures.fetch_add(1, std::memory_order_relaxed);
+        }
         handle = {};
     }
 
@@ -501,6 +514,68 @@ namespace
         return invoked && (!hasReturnValue || result);
     }
 
+    void ClearPublishedModifierState()
+    {
+        g_active.store(false, std::memory_order_release);
+        g_playerId.store(0, std::memory_order_release);
+        g_targetId.store(0, std::memory_order_release);
+        g_weaponId.store(0, std::memory_order_release);
+        g_usingWeaponTarget.store(false, std::memory_order_release);
+        g_ownerGameInstance.store(0, std::memory_order_release);
+        g_ownerStatsSystem.store(0, std::memory_order_release);
+        g_ownerPlayerInstance.store(0, std::memory_order_release);
+    }
+
+    std::uintptr_t HandleInstanceIdentity(const Game::Rtti::Handle& handle)
+    {
+        __try
+        {
+            return reinterpret_cast<std::uintptr_t>(handle.instance);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    bool ModifierOwnerChanged(const SystemContext& systems, std::uintptr_t playerInstance)
+    {
+        const std::uintptr_t ownerGame = g_ownerGameInstance.load(std::memory_order_acquire);
+        const std::uintptr_t ownerStats = g_ownerStatsSystem.load(std::memory_order_acquire);
+        const std::uintptr_t ownerPlayer = g_ownerPlayerInstance.load(std::memory_order_acquire);
+        const std::uintptr_t currentGame = reinterpret_cast<std::uintptr_t>(systems.gameInstance);
+        const std::uintptr_t currentStats = reinterpret_cast<std::uintptr_t>(systems.statsSystem);
+
+        return (ownerGame && currentGame && ownerGame != currentGame) ||
+               (ownerStats && currentStats && ownerStats != currentStats) ||
+               (ownerPlayer && playerInstance && ownerPlayer != playerInstance);
+    }
+
+    void AbandonRetiredOwner(const SystemContext& systems, std::uintptr_t playerInstance)
+    {
+        const std::uint64_t targetId = g_targetId.load(std::memory_order_relaxed);
+        const std::uintptr_t ownerGame = g_ownerGameInstance.load(std::memory_order_relaxed);
+        const std::uintptr_t ownerStats = g_ownerStatsSystem.load(std::memory_order_relaxed);
+        const std::uintptr_t ownerPlayer = g_ownerPlayerInstance.load(std::memory_order_relaxed);
+        std::size_t released = 0;
+        for (ModifierEntry& modifier : g_modifiers)
+        {
+            if (!modifier.cleanupTracked)
+                continue;
+            ReleaseLocalHandle(modifier.handle);
+            modifier = {};
+            ++released;
+        }
+        ClearPublishedModifierState();
+        g_retiredOwnerResets.fetch_add(1, std::memory_order_relaxed);
+        Diagnostics::Log("no-recoil retired owner reset: targetId=0x%llX handles=%zu "
+                         "old[game=%p stats=%p player=%p] new[game=%p stats=%p player=%p]",
+                         static_cast<unsigned long long>(targetId), released,
+                         reinterpret_cast<void*>(ownerGame), reinterpret_cast<void*>(ownerStats),
+                         reinterpret_cast<void*>(ownerPlayer), systems.gameInstance, systems.statsSystem,
+                         reinterpret_cast<void*>(playerInstance));
+    }
+
     bool RemoveModifiers(const SystemContext& systems)
     {
         if (!g_runtime.removeModifier || !systems.statsSystem)
@@ -539,20 +614,20 @@ namespace
                 Diagnostics::Log("no-recoil modifiers removed: targetId=0x%llX count=%zu",
                                  static_cast<unsigned long long>(removalTarget), activeCount);
             }
-            g_active.store(false, std::memory_order_release);
-            g_playerId.store(0, std::memory_order_release);
-            g_targetId.store(0, std::memory_order_release);
-            g_weaponId.store(0, std::memory_order_release);
-            g_usingWeaponTarget.store(false, std::memory_order_release);
+            ClearPublishedModifierState();
         }
         return allRemoved;
     }
 
-    bool ApplyModifiers(const SystemContext& systems, std::uint64_t targetId)
+    bool ApplyModifiers(const SystemContext& systems, std::uint64_t targetId, std::uintptr_t playerInstance)
     {
         if (!targetId || !systems.statsSystem || !g_runtime.addModifier || !g_runtime.modifierDataClass ||
             g_runtime.modifierDataSize != kModifierDataSize)
             return false;
+
+        g_ownerGameInstance.store(reinterpret_cast<std::uintptr_t>(systems.gameInstance), std::memory_order_release);
+        g_ownerStatsSystem.store(reinterpret_cast<std::uintptr_t>(systems.statsSystem), std::memory_order_release);
+        g_ownerPlayerInstance.store(playerInstance, std::memory_order_release);
 
         std::size_t appliedCount = 0;
         for (std::size_t i = 0; i < g_modifiers.size(); ++i)
@@ -650,6 +725,10 @@ namespace Game::PlayerModifiers
 {
     void PublishDesired(bool enabled)
     {
+        // Once unload cleanup starts it owns the desired state. Present/headless publication must not continually
+        // flip the atomic back to true while the unload worker is waiting for its main-tick acknowledgement.
+        if (enabled && g_cleanupRequested.load(std::memory_order_acquire))
+            return;
         const bool previous = g_desired.exchange(enabled, std::memory_order_acq_rel);
         if (previous != enabled)
             Diagnostics::Log("no-recoil desired settings published: enabled=%d", enabled ? 1 : 0);
@@ -660,7 +739,7 @@ namespace Game::PlayerModifiers
         const bool requested = g_cleanupRequested.load(std::memory_order_acquire)
                                    ? false
                                    : g_desired.load(std::memory_order_acquire);
-        const bool currentlyActive = g_active.load(std::memory_order_acquire);
+        bool currentlyActive = g_active.load(std::memory_order_acquire);
         if (!requested && !currentlyActive)
         {
             if (g_cleanupRequested.load(std::memory_order_acquire))
@@ -678,7 +757,20 @@ namespace Game::PlayerModifiers
         if (!requested)
         {
             SystemContext systems;
-            AcquireSystemContextOnMainTick(kStatsSystem, systems);
+            AcquireSystemContextOnMainTick(kPlayerSystem | kStatsSystem, systems);
+            Game::Rtti::Handle player;
+            std::uint64_t playerId = 0;
+            const bool hasPlayer = GetLocalPlayer(systems, player, playerId);
+            const std::uintptr_t playerInstance = hasPlayer ? HandleInstanceIdentity(player) : 0;
+            if (ModifierOwnerChanged(systems, playerInstance))
+                AbandonRetiredOwner(systems, playerInstance);
+            ReleaseLocalHandle(player);
+            if (!g_active.load(std::memory_order_acquire))
+            {
+                if (g_cleanupRequested.load(std::memory_order_acquire))
+                    g_cleanupAcknowledged.store(true, std::memory_order_release);
+                return;
+            }
             if (RemoveModifiers(systems) && g_cleanupRequested.load(std::memory_order_acquire))
                 g_cleanupAcknowledged.store(true, std::memory_order_release);
             return;
@@ -697,6 +789,13 @@ namespace Game::PlayerModifiers
                 RemoveModifiers(systems);
             g_failures.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
+
+        const std::uintptr_t playerInstance = HandleInstanceIdentity(player);
+        if (currentlyActive && ModifierOwnerChanged(systems, playerInstance))
+        {
+            AbandonRetiredOwner(systems, playerInstance);
+            currentlyActive = false;
         }
 
         std::uint64_t weaponId = 0;
@@ -731,7 +830,7 @@ namespace Game::PlayerModifiers
         }
         if (!g_active.load(std::memory_order_acquire))
         {
-            if (ApplyModifiers(systems, targetId))
+            if (ApplyModifiers(systems, targetId, playerInstance))
             {
                 g_playerId.store(playerId, std::memory_order_release);
                 g_weaponId.store(weaponId, std::memory_order_release);
@@ -775,6 +874,9 @@ namespace Game::PlayerModifiers
         g_targetId.store(0, std::memory_order_release);
         g_weaponId.store(0, std::memory_order_release);
         g_usingWeaponTarget.store(false, std::memory_order_release);
+        g_ownerGameInstance.store(0, std::memory_order_release);
+        g_ownerStatsSystem.store(0, std::memory_order_release);
+        g_ownerPlayerInstance.store(0, std::memory_order_release);
         g_runtimeAvailable.store(false, std::memory_order_release);
     }
 
@@ -788,6 +890,7 @@ namespace Game::PlayerModifiers
         result.usingWeaponTarget = g_usingWeaponTarget.load(std::memory_order_relaxed);
         result.applied = g_applied.load(std::memory_order_relaxed);
         result.removed = g_removed.load(std::memory_order_relaxed);
+        result.retiredOwnerResets = g_retiredOwnerResets.load(std::memory_order_relaxed);
         result.failures = g_failures.load(std::memory_order_relaxed);
         return result;
     }

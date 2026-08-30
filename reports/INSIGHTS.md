@@ -61,6 +61,19 @@ REDengine의 렌더 스레드(`Present`)와 다수의 워커 스레드는 메인
 — 출처: `TEMPLATE.md` 초기 축적분, `2026-08-30_freeze_analysis_pid26484.md`에서 재확인(103스레드 중 101개가
 `ntdll` 대기)
 
+### 1.5 월드 소유 상태는 target ID뿐 아니라 owner identity와 묶는다
+
+fresh-acquire한 새 시스템에 이전 월드의 target ID나 Handle을 넘겨 정리를 시도하면, 호출이 실패해 로컬 상태가
+영구 latch될 수 있습니다. PID 4392의 no-recoil은 이전 무기 ID `0x9B0C4B` 제거 실패가 새 무기 재적용과 안전
+언로드를 동시에 막았습니다.
+
+엔진 자원을 적용할 때 `gameInstance / subsystem / owning entity instance`의 주소값을 **역참조하지 않는 identity
+token**으로 함께 기록하십시오. 다음 main tick의 fresh owner와 다르면 퇴역 월드에 엔진 호출을 보내지 말고,
+검증된 소유권 계약에 따라 로컬 strong owner만 해제해 상태를 폐기합니다. 같은 owner 안에서 target만 바뀌면
+정상 remove 경로를 그대로 사용해야 중복 적용을 막을 수 있습니다.
+
+— 출처: `2026-08-30_issue2_validation_pid4392.md`
+
 ---
 
 ## 2. 프리즈 실측 기법

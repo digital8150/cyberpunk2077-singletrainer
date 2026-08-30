@@ -23,6 +23,7 @@ namespace Game::PlayerModifiers
         bool usingWeaponTarget = false;
         std::uint64_t applied = 0;
         std::uint64_t removed = 0;
+        std::uint64_t retiredOwnerResets = 0;
         std::uint64_t failures = 0;
     };
 
