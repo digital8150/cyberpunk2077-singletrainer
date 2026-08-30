@@ -2575,3 +2575,7 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   문자열이 사라진 것도 확인했다. PID 29968이 기존 `build/bin/Release/cp2077_trainer.dll`을 잡은 채
   프리즈 중이라 원본 build tree는 덮어쓰지 않았고 프로세스도 종료하지 않았다. 따라서 clean-process
   save-load 반복 검증은 다음 실행에서 필요하다.
+- 후속 요청으로 PID 29968을 강제 종료하고 잠금이 풀린 정식 `build` 트리에서 Release 빌드를 통과시켰다.
+  산출물은 `build/bin/Release/cp2077_trainer.dll`(831,488 bytes, SHA-256
+  `09E7ECCBD19547EE4F0BAF7C14C254AC6781F70AC469381BC988E6710EFFC6B7`)이다. `%LOCALAPPDATA%\cbpk\config.ini`는
+  Win32 ini API 기준 `logging=1`, `no_recoil=1`, `no_spread=1`로 확인했고 제거된 세 기능 키도 삭제했다.
