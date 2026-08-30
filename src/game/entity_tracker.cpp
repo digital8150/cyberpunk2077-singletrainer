@@ -518,9 +518,10 @@ namespace
         ULONGLONG lastResolveAttempt = 0;
         Game::Rtti::Class* eventClass = nullptr;
         std::size_t eventSize = 0;
-        void* visionModeSystem = nullptr;
         using SetBraindanceModeFn = void (*)(void*, std::uint32_t);
         SetBraindanceModeFn setBraindanceMode = nullptr;
+        ULONGLONG lastSystemAcquireFailureLog = 0;
+        std::uint64_t systemAcquireFailures = 0;
         std::size_t leakedEvents = 0;
     };
     NativeHighlightRuntime g_highlightRuntime;
@@ -1324,8 +1325,12 @@ namespace
 
     struct HighlightWork
     {
-        EntityLayout* entity = nullptr;
+        // This is an independent strong owner copied from the tracked slot under g_puppetListLock. Do not replace it
+        // with a raw Entity pointer: the work item outlives that lock while QueueEvent executes on the main tick.
+        Game::Rtti::Handle entityHandle;
         std::uint64_t entityId = 0;
+        std::uint64_t sequence = 0;
+        std::size_t slot = 0;
         bool desired = false;
     };
 
@@ -1355,7 +1360,7 @@ namespace
         const ULONGLONG now = GetTickCount64();
         if (g_highlightRuntime.attempted && g_highlightRuntime.eventClass != nullptr &&
             g_highlightRuntime.eventSize == kEntRenderHighlightEventSize &&
-            g_highlightRuntime.visionModeSystem != nullptr && g_highlightRuntime.setBraindanceMode != nullptr)
+            g_highlightRuntime.setBraindanceMode != nullptr)
             return true;
         if (g_highlightRuntime.attempted && now - g_highlightRuntime.lastResolveAttempt < 1000)
         {
@@ -1368,9 +1373,6 @@ namespace
         {
             g_highlightRuntime.eventClass = Game::Rtti::GetClass(Game::Rtti::Hash("entRenderHighlightEvent"));
             g_highlightRuntime.eventSize = Game::Rtti::ClassSize(g_highlightRuntime.eventClass);
-            void* gameInstance = ResolveGameInstanceOnMainTick();
-            g_highlightRuntime.visionModeSystem = GetSystemOnMainTick(
-                gameInstance, Game::Rtti::Hash("gameIVisionModeSystem"));
 
             HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
             const auto resolve = red4ext
@@ -1386,18 +1388,14 @@ namespace
         {
             g_highlightRuntime.eventClass = nullptr;
             g_highlightRuntime.eventSize = 0;
-            g_highlightRuntime.visionModeSystem = nullptr;
             g_highlightRuntime.setBraindanceMode = nullptr;
         }
 
         const bool resolved = g_highlightRuntime.eventClass != nullptr &&
                               g_highlightRuntime.eventSize == kEntRenderHighlightEventSize &&
-                              g_highlightRuntime.visionModeSystem != nullptr &&
                               g_highlightRuntime.setBraindanceMode != nullptr;
-        Diagnostics::Log("native highlight resolver: eventClass=%p eventSize=0x%zX visionModeSystem=%p "
-                         "setBraindanceMode=%p resolved=%d",
+        Diagnostics::Log("native highlight resolver: eventClass=%p eventSize=0x%zX setBraindanceMode=%p resolved=%d",
                          g_highlightRuntime.eventClass, g_highlightRuntime.eventSize,
-                         g_highlightRuntime.visionModeSystem,
                          reinterpret_cast<void*>(g_highlightRuntime.setBraindanceMode), resolved ? 1 : 0);
         if (!resolved)
             g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
@@ -1406,7 +1404,8 @@ namespace
 
     bool QueueHighlightEvent(const HighlightWork& work)
     {
-        if (!work.entity || work.entityId == 0)
+        EntityLayout* entity = static_cast<EntityLayout*>(work.entityHandle.instance);
+        if (!entity || !work.entityHandle.refCount || work.entityId == 0 || !IsHandleShapeValid(work.entityHandle))
             return false;
         const std::size_t eventLimit = work.desired
                                            ? kMaxLeakedHighlightEvents - kReservedHighlightClearEvents
@@ -1417,7 +1416,7 @@ namespace
         bool queued = false;
         __try
         {
-            if (work.entity->entityId != work.entityId || ClassifyPuppet(work.entity->nativeType) != PuppetKind::Npc)
+            if (entity->entityId != work.entityId || ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
                 return false;
 
             void* event = Game::Rtti::CreateInstance(g_highlightRuntime.eventClass);
@@ -1444,13 +1443,13 @@ namespace
                 return false;
 
             Game::Rtti::Function* queueEvent = Game::Rtti::FindFunction(
-                Game::Rtti::NativeType(work.entity), Game::Rtti::Hash("QueueEvent"));
+                Game::Rtti::NativeType(entity), Game::Rtti::Hash("QueueEvent"));
             if (!queueEvent || Game::Rtti::ParameterCount(queueEvent) != 1)
                 return false;
             Game::Rtti::Argument argument{&handle};
             // QueueEvent is a reflected Void method. Invoke() returning true means the call reached the VM; it does
             // not demonstrate ownership transfer, hence the conservative local-handle lifetime above.
-            queued = Game::Rtti::Invoke(queueEvent, work.entity, &argument, 1);
+            queued = Game::Rtti::Invoke(queueEvent, entity, &argument, 1);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1470,16 +1469,48 @@ namespace
         return queued;
     }
 
-    bool SetBraindanceModeOnMainTick(bool enabled)
+    bool SetBraindanceModeOnMainTick(bool enabled, bool forceReassert = false)
     {
         const bool active = g_nativeHighlightModeActive.load(std::memory_order_acquire);
-        if (active == enabled)
+        if (!forceReassert && active == enabled)
             return true;
-        if (!g_highlightRuntime.setBraindanceMode || !g_highlightRuntime.visionModeSystem)
+        if (!g_highlightRuntime.setBraindanceMode)
             return false;
+
+        // A vision-mode system belongs to the current world/session. Resolve it on every transition instead of
+        // retaining a raw pointer across ticks; save loads and streaming transitions can replace the object.
+        void* gameInstance = nullptr;
+        void* visionModeSystem = nullptr;
         __try
         {
-            g_highlightRuntime.setBraindanceMode(g_highlightRuntime.visionModeSystem, enabled ? 1u : 0u);
+            gameInstance = ResolveGameInstanceOnMainTick();
+            visionModeSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIVisionModeSystem"));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            visionModeSystem = nullptr;
+        }
+        if (!visionModeSystem)
+        {
+            ++g_highlightRuntime.systemAcquireFailures;
+            g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
+            const ULONGLONG now = GetTickCount64();
+            if (g_highlightRuntime.lastSystemAcquireFailureLog == 0 ||
+                now - g_highlightRuntime.lastSystemAcquireFailureLog >= 1000)
+            {
+                g_highlightRuntime.lastSystemAcquireFailureLog = now;
+                Diagnostics::Log("native highlight system unavailable: enabled=%d gameInstance=%p failures=%llu",
+                                 enabled ? 1 : 0, gameInstance,
+                                 static_cast<unsigned long long>(g_highlightRuntime.systemAcquireFailures));
+            }
+            return false;
+        }
+
+        __try
+        {
+            // Keep this call adjacent to the fresh acquisition above. The local system pointer is never cached in
+            // NativeHighlightRuntime or used by a later tick.
+            g_highlightRuntime.setBraindanceMode(visionModeSystem, enabled ? 1u : 0u);
             g_nativeHighlightModeActive.store(enabled, std::memory_order_release);
             Diagnostics::Log("native highlight braindance mode: %s", enabled ? "1" : "0");
             return true;
@@ -1495,15 +1526,16 @@ namespace
     {
         if (!queued)
             return;
+        EntityLayout* entity = static_cast<EntityLayout*>(work.entityHandle.instance);
+        if (!entity || work.slot >= g_puppetList.size())
+            return;
         AcquireSRWLockExclusive(&g_puppetListLock);
-        for (TrackedPuppet& tracked : g_puppetList)
+        TrackedPuppet& tracked = g_puppetList[work.slot];
+        if (tracked.entity == entity && tracked.entityHandle.instance == entity && tracked.entityId == work.entityId &&
+            tracked.sequence == work.sequence)
         {
-            if (tracked.entity == work.entity && tracked.entityId == work.entityId)
-            {
-                tracked.highlightKnown = true;
-                tracked.highlightDesired = work.desired;
-                break;
-            }
+            tracked.highlightKnown = true;
+            tracked.highlightDesired = work.desired;
         }
         ReleaseSRWLockExclusive(&g_puppetListLock);
     }
@@ -1544,13 +1576,33 @@ namespace
                 continue;
             const bool desired = enabled && IsCategoryEnabled(tracked.category, tracked.hostility, settings) &&
                                  !((settings & kHighlightHideDeadBit) != 0 && tracked.isDead);
-            anyDesired = anyDesired || desired;
             // Queue only a state transition: unknown+desired=true is the first enable, while known entries queue
             // only when the cached state differs. Unknown+desired=false has nothing to clear. The cache is updated
-            // only after QueueEvent succeeds below.
+            // only after QueueEvent succeeds below. Count a pending enable only after its Entity owner has been
+            // copied successfully; an unknown transition with no owner must not turn on braindance mode.
             const bool transitionNeeded = tracked.highlightKnown ? tracked.highlightDesired != desired : desired;
             if (transitionNeeded && workCount < workItems.size())
-                workItems[workCount++] = {tracked.entity, tracked.entityId, desired};
+            {
+                HighlightWork& work = workItems[workCount];
+                if (!Game::Rtti::CopyHandle(&tracked.entityHandle, &work.entityHandle))
+                {
+                    // An unknown desired enable must not turn on braindance mode without an owned Entity. Known
+                    // desired state remains represented by HasDesiredHighlightState below and can keep mode active.
+                    g_nativeHighlightFailures.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                work.entityId = tracked.entityId;
+                work.sequence = tracked.sequence;
+                work.slot = slot;
+                work.desired = desired;
+                ++workCount;
+                if (desired)
+                    anyDesired = true;
+            }
+            else if (tracked.highlightKnown && tracked.highlightDesired && desired)
+            {
+                anyDesired = true;
+            }
         }
         ReleaseSRWLockShared(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HighlightCollect,
@@ -1567,8 +1619,9 @@ namespace
                 // RedHotTools enables braindance mode before placing the first render event. Clear events are sent
                 // before returning to mode 0 so the engine sees a consistent transition.
                 bool modeReady = true;
-                if (modeDesired && !g_nativeHighlightModeActive.load(std::memory_order_acquire))
-                    modeReady = SetBraindanceModeOnMainTick(true);
+                const bool modeActive = g_nativeHighlightModeActive.load(std::memory_order_acquire);
+                if (modeDesired && (workCount > 0 || !modeActive))
+                    modeReady = SetBraindanceModeOnMainTick(true, workCount > 0);
 
                 // If the mode transition failed, do not enqueue events into a half-initialized render path. The
                 // transition remains pending and will be retried on a later main tick.
@@ -1584,6 +1637,11 @@ namespace
                 }
             }
         }
+
+        // Work handles are retained through every QueueEvent/identity publication above. Release only after all game
+        // calls are complete and after PublishHighlightResult has dropped the tracker lock.
+        for (std::size_t i = 0; i < workCount; ++i)
+            ReleaseOwnedHandle(workItems[i].entityHandle, "native-highlight-work");
 
         if (g_cleanupRequested.load(std::memory_order_acquire))
         {
@@ -2486,6 +2544,7 @@ namespace Game::EntityTracker
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_cleanupGeneration.store(0, std::memory_order_release);
+        g_highlightRuntime = {};
     }
 
     Stats GetStats()

@@ -2190,3 +2190,31 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
 - 검증: healthy `explorer.exe` 1-poll 실행은 output 0/exit 0, synthetic appended unhandled fatal은 CRASH 한 줄,
   정지된 synthetic heartbeat는 FREEZE 한 줄, 없는 PID는 PROCESS_EXIT 한 줄을 각각 확인했다.
 
+## 2026-08-30 - Issue #2 Phase 2A native highlight lifetime 수정
+
+- PID 29084에 `%LOCALAPPDATA%\cbpk\config.ini`의 `native_highlight=0`을 확인한 뒤 기존 Release DLL을
+  14:02:07에 주입하고 `tools/scripts/watchdog.ps1 -TargetPid 29084`를 PID 268로 부착했다. 기존 빌드의
+  격리 세션은 실제 플레이와 14:15경 save/world transition(`snapshots=29~32 -> 0 -> 29`)을 통과했고,
+  watchdog 출력/오류 0바이트, `nativeHighlight[queued=0 cleared=0 failures=0]`, 프로세스 응답 정상 상태를
+  유지했다. 이 결과는 문제 기능을 끈 격리 기준선이며 수정 DLL의 검증은 아니다.
+- 사고 보고서의 두 lifetime 결함을 Phase 2A 범위로 고정했다. 첫째, static RTTI metadata와 검증된
+  `SetBraindanceMode` 함수 주소만 캐시하고 raw `gameIVisionModeSystem*`는 절대 틱 사이에 보존하지 않는다.
+  실제 mode-on/off 호출 직전에 게임 메인 틱에서 현재 `gameInstance`와 vision system을 다시 얻으며,
+  획득 실패 시 이벤트를 큐잉하지 않고 다음 틱에 재시도한다. 새 월드에서 이전 `modeActive=true`가 남는
+  경우를 위해 owned work batch가 있으면 fresh system에 mode-on을 idempotent하게 재확인한다.
+- 둘째, `HighlightWork`가 tracker slot의 Entity strong Handle을 `g_puppetListLock` 아래에서 복사해
+  `QueueEvent`와 결과 publication이 끝날 때까지 소유한다. raw Entity는 이 owner의 instance에서만 얻고,
+  결과는 slot/entity/entityId/sequence가 모두 일치할 때만 반영한다. Handle 획득 실패는 fail-closed이며
+  unknown enable transition만으로 braindance mode가 켜지지 않는다. 모든 work Handle은 게임 호출과 tracker
+  lock/SEH 범위가 끝난 뒤 `ReleaseOwnedHandle`로 exact-release한다.
+- 실제 코드는 `codex-luna-swarm`의 native `luna_worker`에게 `src/game/entity_tracker.cpp` 단독 소유권으로
+  위임했다. 메인 검토에서 새 월드 mode-on 재확인 누락을 찾아 같은 worker에 보완시킨 뒤 전체 diff의
+  fresh-system 경계, work Handle drain, cleanup 재시도 경로를 다시 확인했다.
+- 검증: `git diff --check` 통과, `cmake --build build-next --config Release` 통과. 산출물은
+  `build-next/bin/Release/cp2077_trainer.dll`이며 SHA-256은
+  `EE083CDAA66F1A5FAD37FC12D6168D1C6E8DC1A97DD29ED87C10F5D9E3670768`이다.
+- 후속 system-lifetime 감사에서 health의 `statPoolsSystem`, attitude/aim의 `playerSystem`, visibility의
+  `spatialQueriesSystem`, no-recoil의 player/stats/transaction system에도 장기 raw 캐시가 있음을 확인했다.
+  main-tick 경로는 함수 metadata만 캐시하고 bounded batch 직전에 system을 fresh-acquire하는 별도 Phase
+  2B로, Present 경로는 엔진 호출을 메인 틱 snapshot으로 옮기는 더 큰 Phase 2C로 분리한다.
+
