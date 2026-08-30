@@ -338,10 +338,10 @@ namespace Widgets
 
         ImGui::TextUnformatted("Show FPS");
         ImGui::SameLine(430.0f);
-        ToggleSwitch("##show_fps", &settings.showFps);
+        ToggleSwitch("##show_fps", &settings.debug.showFps);
         ImGui::TextUnformatted("No recoil");
         ImGui::SameLine(430.0f);
-        ToggleSwitch("##no_recoil", &settings.noRecoil);
+        ToggleSwitch("##no_recoil", &settings.misc.noRecoil);
         ImGui::Separator();
 
         ImGui::TextUnformatted("ESP");
@@ -450,7 +450,7 @@ namespace Widgets
         ToggleSwitch("##aimbot_limit_health", &settings.aimbot.limitHealthPool);
         if (settings.aimbot.limitHealthPool)
             FilledSliderFloat("Max health pool", &settings.aimbot.maxHealthPool, 500.0f, 6000.0f, "%.0f HP");
-        FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusPixels, 40.0f, 2500.0f, "%.0f px");
+        FilledSliderFloat("FOV radius", &settings.aimbot.fovRadiusDegrees, 1.0f, 60.0f, "%.1f deg");
         if (!settings.aimbot.silentAim)
             FilledSliderFloat("Smoothing", &settings.aimbot.smoothing, 0.0f, 30.0f, "%.1f");
         FilledSliderFloat("Aim distance", &settings.aimbot.maxDistanceMeters, 10.0f, 300.0f, "%.0f m");
@@ -501,7 +501,7 @@ namespace Widgets
         {
             ImGui::TextUnformatted("Headless (skip overlay draw)");
             ImGui::SameLine(430.0f);
-            ToggleSwitch("##aimbot_headless", &settings.aimbot.headlessDiagnostics);
+            ToggleSwitch("##aimbot_headless", &settings.debug.headlessAimbot);
             Hint("Diagnostics only: stops every overlay GPU submission while the menu is closed, so a render-side "
                  "crash can be ruled out without losing target selection. Insert still reopens the menu.");
             ImGui::TextDisabled("Crosshair core: calls %llu | redirects %llu",

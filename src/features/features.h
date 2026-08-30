@@ -18,6 +18,25 @@ namespace Features
         std::size_t count = 0;
     };
 
+    // 오버레이 표시 언어. 저장은 정수로 하므로 값 순서를 바꾸지 말 것.
+    enum class Language : unsigned
+    {
+        Korean = 0,
+        English = 1,
+    };
+
+    enum class Theme : unsigned
+    {
+        Dark = 0,
+        Light = 1,
+    };
+
+    struct UiSettings
+    {
+        Language language = Language::Korean;
+        Theme theme = Theme::Dark;
+    };
+
     struct EspSettings
     {
         bool enabled = false;
@@ -44,9 +63,6 @@ namespace Features
         bool silentAim = false;
         // 에임을 걸어둘 키의 가상 키 코드. 기본값 0x02는 VK_RBUTTON(마우스 오른쪽 버튼).
         unsigned int activationKey = 0x02;
-        // 진단용: 오버레이 GPU 제출을 멈추고 타겟 선택만 CPU에서 돌린다. 메뉴가 닫혀 있고 오버레이가 이미
-        // 한 번 초기화된 뒤에만 적용되므로, 켜둔 채로도 Insert로 메뉴를 다시 열 수 있다.
-        bool headlessDiagnostics = false;
         bool drawFovCircle = true;
         bool targetEnemies = true;
         bool targetPolice = false;
@@ -59,17 +75,51 @@ namespace Features
         // 최대 체력 4,343짜리 대상이 사일런트 에임에 걸린 것이었다.
         bool limitHealthPool = true;
         float maxHealthPool = 2500.0f;
-        float fovRadiusPixels = 180.0f;
+        // 화면 픽셀이 아니라 카메라 기준 각반경(도). 픽셀 반경은 ADS/줌으로 초점거리가 바뀌면 같은 원이
+        // 전혀 다른 월드 범위를 덮는다 — 줌을 당길수록 실제 포착 범위가 좁아졌다. 각도로 두면 줌 배율과
+        // 무관하게 범위가 일정하고, 화면 위의 링은 줌인하면 커지고 줌아웃하면 작아진다.
+        float fovRadiusDegrees = 13.0f;
         float smoothing = 8.0f;
         float maxDistanceMeters = 150.0f;
     };
 
-    struct Settings
+    struct MiscSettings
+    {
+        bool noRecoil = false;
+        bool noSpread = false;
+        bool autoPistol = false;
+        bool infiniteHealth = false;
+        bool infiniteStamina = false;
+    };
+
+    // 예전에는 config.ini의 [diagnostics] 섹션에서만 바꿀 수 있었던 계측/로깅 스위치들. 오버레이
+    // Debug 탭에 그대로 노출하되, fatal_log와 veh처럼 사용자 입장에서 하나인 것은 한 토글로 합쳤다.
+    // 실제 적용은 Config::Update가 Diagnostics::ApplyRuntimeToggles로 넘긴다.
+    struct DebugSettings
     {
         bool showFps = true;
-        bool noRecoil = false;
+        // FPS/프레임타임/트레이너 CPU 시간 그래프.
+        bool showGraph = false;
+        // 오버레이에 엔티티 피드/에임봇 후보/시야 캐시 등 내부 카운터를 표시한다.
+        bool showInternalStats = false;
+        // 진단용: 오버레이 GPU 제출을 멈추고 타겟 선택만 CPU에서 돌린다. 메뉴가 닫혀 있고 오버레이가
+        // 이미 한 번 초기화된 뒤에만 적용되므로, 켜둔 채로도 Insert로 메뉴를 다시 열 수 있다.
+        bool headlessAimbot = false;
+
+        // ── Diagnostics 런타임 토글 (config.ini [diagnostics]와 같은 값) ──────────────
+        bool diagnosticLogging = true;   // logging
+        bool crashReporting = true;      // fatal_log + veh
+        bool performanceProfiling = true;  // profiling
+        bool debuggerOutput = false;     // debug_output
+    };
+
+    struct Settings
+    {
+        UiSettings ui;
         EspSettings esp;
         AimbotSettings aimbot;
+        MiscSettings misc;
+        DebugSettings debug;
     };
 
     Settings& GetSettings();

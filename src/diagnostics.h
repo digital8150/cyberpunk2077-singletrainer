@@ -26,6 +26,25 @@ namespace Diagnostics
     void Initialize(HMODULE module);
     void Shutdown();
 
+    // 오버레이 Debug 탭이 읽고 쓰는 런타임 토글. Initialize가 환경 변수 > ini > 기본값 순으로 정한
+    // 값이 시작 상태이고, 이후 사용자가 메뉴에서 바꾸면 ApplyRuntimeToggles가 그 자리에서 반영한다.
+    //
+    // 크래시 기록(VEH + 마지막 기회 필터)은 등록을 해제하지 않는다. 예외가 이미 디스패치 중일 때
+    // 핸들러를 빼면 그 자체가 우리가 없애려던 종류의 사고이기 때문이다. 대신 핸들러 첫 줄에서 원자
+    // 하나를 읽고 곧장 EXCEPTION_CONTINUE_SEARCH로 빠진다 — 꺼져 있으면 링 기록도 디스크 쓰기도
+    // 일어나지 않는다. 반대로 초기화 시점에 꺼져 있어서 아예 등록되지 않았던 경우에는, 켜는 순간
+    // 지연 등록한다(등록 자체는 안전한 연산이다).
+    struct RuntimeToggles
+    {
+        bool diagnosticLogging = true;
+        bool crashReporting = true;
+        bool performanceProfiling = true;
+        bool debuggerOutput = false;
+    };
+
+    RuntimeToggles GetRuntimeToggles();
+    void ApplyRuntimeToggles(const RuntimeToggles& toggles);
+
     void Log(const char* format, ...);
     // 큐에 쌓인 줄을 디스크까지 밀어낸다. 평소에는 부를 필요가 없다 (writer 스레드가 1초
     // cadence로 알아서 한다). 덤프 직전, 종료 직전처럼 이 다음이 없을지도 모르는 지점에서만 쓴다.

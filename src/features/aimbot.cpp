@@ -63,6 +63,28 @@ namespace Aimbot
             return false;
         }
 
+        // 카메라 초점거리를 못 읽는 프레임(투영 미초기화, 컷신 등)에서 쓰는 근사값. 시네마틱이 아닌
+        // 일반 1인칭 화각을 수직 70도로 가정한다 — 정확할 필요는 없고, 이 프레임의 FOV 링과 후보 필터가
+        // 통째로 죽지 않게만 하면 된다.
+        constexpr float kFallbackVerticalFovDegrees = 70.0f;
+        constexpr float kPi = 3.14159265358979323846f;
+
+        float ResolveFovRadiusPixels(const Features::AimbotSettings& settings, float displayWidth,
+                                     float displayHeight)
+        {
+            const float radians = std::clamp(settings.fovRadiusDegrees, 0.25f, 80.0f) * kPi / 180.0f;
+            float pixelsPerTangent = 0.0f;
+            if (!Game::Projection::GetPixelsPerTangent(displayWidth, displayHeight, pixelsPerTangent))
+            {
+                pixelsPerTangent =
+                    displayHeight * 0.5f / std::tan(kFallbackVerticalFovDegrees * 0.5f * kPi / 180.0f);
+            }
+            const float radius = std::tan(radians) * pixelsPerTangent;
+            // 화면 밖까지 나가는 반경은 의미가 없고, 너무 작으면 클릭 한 번도 못 맞춘다.
+            const float maximum = std::sqrt(displayWidth * displayWidth + displayHeight * displayHeight) * 0.5f;
+            return std::clamp(radius, 6.0f, maximum);
+        }
+
         void GetAimPoint(const Game::EntityTracker::PuppetSnapshot& puppet, float output[3])
         {
             if (puppet.visual.hasHeadPosition)
@@ -102,10 +124,15 @@ namespace Aimbot
             return;
 
         const ImVec2 center(displayWidth * 0.5f, displayHeight * 0.5f);
+
+        // FOV는 각반경(도)으로 저장하고 매 프레임 지금 카메라의 초점거리로 픽셀 반경을 만든다. 예전처럼
+        // 픽셀로 두면 ADS/줌으로 초점거리가 바뀔 때 같은 원이 전혀 다른 월드 각도를 덮었다 — 줌을 당길수록
+        // 실제 포착 각도가 좁아졌다. 이제는 각도가 고정이고 화면의 링이 줌에 따라 커지거나 작아진다.
+        const float fovRadiusPixels = ResolveFovRadiusPixels(settings, displayWidth, displayHeight);
         if (drawList && settings.drawFovCircle)
         {
-            drawList->AddCircle(center, settings.fovRadiusPixels, IM_COL32(0, 0, 0, 180), 128, 2.8f);
-            drawList->AddCircle(center, settings.fovRadiusPixels, IM_COL32(62, 157, 255, 220), 128, 1.4f);
+            drawList->AddCircle(center, fovRadiusPixels, IM_COL32(0, 0, 0, 180), 128, 2.8f);
+            drawList->AddCircle(center, fovRadiusPixels, IM_COL32(62, 157, 255, 220), 128, 1.4f);
         }
 
         g_stats = Stats{};
@@ -168,7 +195,7 @@ namespace Aimbot
             {
                 const float torso[3] = {puppet.position[0], puppet.position[1], puppet.position[2] + 1.1f};
                 const bool priority =
-                    screenDistance <= settings.fovRadiusPixels || puppet.entityId == g_lockedEntityId;
+                    screenDistance <= fovRadiusPixels || puppet.entityId == g_lockedEntityId;
                 if (Game::Visibility::Query(puppet.entityId, camera, aimWorld, torso, priority) ==
                     Game::Visibility::State::Occluded)
                 {
@@ -184,7 +211,7 @@ namespace Aimbot
                 lockedPoint = point;
                 std::copy(std::begin(aimWorld), std::end(aimWorld), lockedWorld);
             }
-            if (screenDistance <= settings.fovRadiusPixels && screenDistance < bestScreenDistance)
+            if (screenDistance <= fovRadiusPixels && screenDistance < bestScreenDistance)
             {
                 bestScreenDistance = screenDistance;
                 bestPoint = point;

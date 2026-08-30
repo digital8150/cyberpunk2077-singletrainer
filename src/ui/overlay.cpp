@@ -617,7 +617,7 @@ namespace Overlay
         // Insert까지 죽어서 설정을 되돌릴 방법이 없었다. 이제는 별도 진단 토글로 분리하고, 오버레이가 한 번
         // 초기화된 뒤 메뉴가 닫혀 있을 때만 적용한다.
         if (swapChain && g_initialized && swapChain == g_swapChain && !g_visible &&
-            Features::GetSettings().aimbot.headlessDiagnostics)
+            Features::GetSettings().debug.headlessAimbot)
         {
             RunHeadlessSilentAimFrame(swapChain);
             return;

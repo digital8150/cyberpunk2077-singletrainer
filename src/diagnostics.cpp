@@ -61,6 +61,11 @@ namespace
     HANDLE g_fatalFile = INVALID_HANDLE_VALUE;
     wchar_t g_fatalPath[MAX_PATH]{};
     std::atomic<bool> g_fatalEnabled{false};
+    // 크래시 기록 카테고리(VEH 관측 + 치명적 폴트 직기록)의 런타임 스위치. 핸들러는 등록된 채로
+    // 남지만, 꺼져 있으면 첫 줄에서 이 원자만 읽고 빠진다.
+    std::atomic<bool> g_crashReportingEnabled{false};
+    // 지연 등록용. Initialize가 받은 모듈 핸들을 그대로 들고 있는다 (fatal 헤더의 모듈 표에 쓰인다).
+    HMODULE g_selfModule = nullptr;
     std::atomic<int> g_fatalBudget{kFatalRecordBudget};
     volatile LONG g_fatalBufferGate = 0;
     char g_fatalBuffer[kFatalRecordCapacity]{};
@@ -916,7 +921,8 @@ namespace
     // 앞서 복구된 예외들에게 예산을 다 뺏기면 정작 죽는 순간의 기록이 없어진다.
     void RecordFatalException(PEXCEPTION_POINTERS exceptionInfo, const char* origin, bool ignoreBudget)
     {
-        if (!g_fatalEnabled.load(std::memory_order_relaxed) || g_fatalFile == INVALID_HANDLE_VALUE)
+        if (!g_crashReportingEnabled.load(std::memory_order_relaxed) ||
+            !g_fatalEnabled.load(std::memory_order_relaxed) || g_fatalFile == INVALID_HANDLE_VALUE)
             return;
 
         // 정적 버퍼 하나를 두 스레드가 동시에 쓰지 못하게 막는다. 잡지 못하면 기다리지 않고 포기한다.
@@ -1093,6 +1099,10 @@ namespace
         if (!exceptionInfo || !exceptionInfo->ExceptionRecord)
             return EXCEPTION_CONTINUE_SEARCH;
 
+        // 꺼져 있으면 링 기록도 디스크 쓰기도 하지 않는다. 등록만 남기고 비용은 원자 로드 하나로 줄인다.
+        if (!g_crashReportingEnabled.load(std::memory_order_relaxed))
+            return EXCEPTION_CONTINUE_SEARCH;
+
         const DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
         if (!IsFatalException(code) || t_insideVeh)
             return EXCEPTION_CONTINUE_SEARCH;
@@ -1188,6 +1198,7 @@ namespace Diagnostics
 {
     void Initialize(HMODULE module)
     {
+        g_selfModule = module;
         ResolveConfigPath();
         g_loggingEnabled.store(ReadToggle(L"CBPK_LOG", L"logging", true), std::memory_order_relaxed);
         g_debugOutputEnabled.store(ReadToggle(L"CBPK_DBGOUT", L"debug_output", false), std::memory_order_relaxed);
@@ -1229,6 +1240,10 @@ namespace Diagnostics
         // 않는다 -- 실제로 쓰기가 일어나는 것은 프로세스를 죽일 만한 폴트가 났을 때뿐이고, 그마저
         // 예산으로 묶여 있다. 끄려면 CBPK_FATAL=0 또는 ini의 fatal_log=0.
         const bool fatalRequested = ReadToggle(L"CBPK_FATAL", L"fatal_log", true);
+        const bool vehRequested = ReadToggle(L"CBPK_VEH", L"veh", false);
+        // 두 스위치는 오버레이에서 "크래시 기록" 하나로 합쳐 노출된다. 어느 쪽이든 켜져 있으면 카테고리가
+        // 켜진 상태로 시작한다.
+        g_crashReportingEnabled.store(fatalRequested || vehRequested, std::memory_order_release);
         if (fatalRequested)
             OpenFatalSink(module);
 
@@ -1243,7 +1258,6 @@ namespace Diagnostics
 
         // VEH는 기본으로 끈다(관측 용도). 다만 치명적 폴트 직기록이 켜져 있으면 first-chance를 볼
         // 유일한 통로라서 같이 등록한다.
-        const bool vehRequested = ReadToggle(L"CBPK_VEH", L"veh", false);
         if (vehRequested || fatalActive)
             g_vehHandle = AddVectoredExceptionHandler(0, VectoredExceptionHandler);
 
@@ -1266,6 +1280,57 @@ namespace Diagnostics
             vehRequested ? 1 : 0, g_debugOutputEnabled.load(std::memory_order_relaxed) ? 1 : 0,
             fatalRequested ? 1 : 0, g_configPath[0] != L'\0' ? g_configPath : L"<unavailable>");
         Flush();
+    }
+
+    RuntimeToggles GetRuntimeToggles()
+    {
+        RuntimeToggles toggles;
+        toggles.diagnosticLogging = g_loggingEnabled.load(std::memory_order_relaxed);
+        toggles.crashReporting = g_crashReportingEnabled.load(std::memory_order_relaxed);
+        toggles.performanceProfiling = Profile::Enabled();
+        toggles.debuggerOutput = g_debugOutputEnabled.load(std::memory_order_relaxed);
+        return toggles;
+    }
+
+    void ApplyRuntimeToggles(const RuntimeToggles& toggles)
+    {
+        const RuntimeToggles previous = GetRuntimeToggles();
+
+        g_loggingEnabled.store(toggles.diagnosticLogging, std::memory_order_relaxed);
+        g_debugOutputEnabled.store(toggles.debuggerOutput, std::memory_order_relaxed);
+        Profile::SetEnabled(toggles.performanceProfiling);
+
+        // 켜는 방향으로만 지연 등록한다. 끄는 방향에서는 아무것도 해제하지 않는다 — 예외 디스패치가
+        // 진행 중일 때 핸들러/파일 핸들을 빼는 것이 정확히 이 프로젝트가 없애려는 사고 유형이다.
+        if (toggles.crashReporting && !previous.crashReporting)
+        {
+            g_crashReportingEnabled.store(true, std::memory_order_release);
+            if (!g_fatalEnabled.load(std::memory_order_acquire) && g_selfModule)
+                OpenFatalSink(g_selfModule);
+            if (g_fatalEnabled.load(std::memory_order_acquire) &&
+                !g_unhandledFilterInstalled.load(std::memory_order_acquire))
+            {
+                g_previousUnhandledFilter = SetUnhandledExceptionFilter(FatalUnhandledExceptionFilter);
+                g_unhandledFilterInstalled.store(true, std::memory_order_release);
+            }
+            if (!g_vehHandle)
+                g_vehHandle = AddVectoredExceptionHandler(0, VectoredExceptionHandler);
+        }
+        else
+        {
+            g_crashReportingEnabled.store(toggles.crashReporting, std::memory_order_release);
+        }
+
+        if (previous.diagnosticLogging != toggles.diagnosticLogging ||
+            previous.crashReporting != toggles.crashReporting ||
+            previous.performanceProfiling != toggles.performanceProfiling ||
+            previous.debuggerOutput != toggles.debuggerOutput)
+        {
+            Log("diagnostics toggles changed: logging=%d crash=%d profiling=%d dbgout=%d veh=%p fatal=%d",
+                toggles.diagnosticLogging ? 1 : 0, toggles.crashReporting ? 1 : 0,
+                toggles.performanceProfiling ? 1 : 0, toggles.debuggerOutput ? 1 : 0, g_vehHandle,
+                g_fatalEnabled.load(std::memory_order_relaxed) ? 1 : 0);
+        }
     }
 
     void Shutdown()
