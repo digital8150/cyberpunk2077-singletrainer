@@ -68,6 +68,19 @@ namespace
         return GetPrivateProfileIntW(section, key, fallback ? 1 : 0, g_configPath) != 0;
     }
 
+    // v1은 show_fps와 no_recoil을 [trainer]에 두었다. M2에서 둘이 [debug]/[misc]로 옮겨갔으므로, 새 키가
+    // 아직 없는 파일에서는 옛 자리를 한 번 읽어 이어받는다. 그러지 않으면 기존 사용자의 no_recoil=1이
+    // 조용히 기본값(꺼짐)으로 되돌아간다. 새 키가 한 번 쓰이고 나면 이 경로는 다시 타지 않는다.
+    bool ReadBoolMigrated(const wchar_t* section, const wchar_t* key, const wchar_t* legacySection,
+                          const wchar_t* legacyKey, bool fallback)
+    {
+        constexpr UINT kMissing = 0xFFFF;
+        const UINT stored = GetPrivateProfileIntW(section, key, kMissing, g_configPath);
+        if (stored != kMissing)
+            return stored != 0;
+        return GetPrivateProfileIntW(legacySection, legacyKey, fallback ? 1 : 0, g_configPath) != 0;
+    }
+
     unsigned int ReadKey(const wchar_t* section, const wchar_t* key, unsigned int fallback)
     {
         const UINT value = GetPrivateProfileIntW(section, key, static_cast<INT>(fallback), g_configPath);
@@ -253,17 +266,20 @@ namespace Config
         settings.aimbot.maxDistanceMeters =
             ReadFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters, 10.0f, 300.0f);
 
-        settings.misc.noRecoil = ReadBool(L"misc", L"no_recoil", settings.misc.noRecoil);
+        settings.misc.noRecoil =
+            ReadBoolMigrated(L"misc", L"no_recoil", L"trainer", L"no_recoil", settings.misc.noRecoil);
         settings.misc.noSpread = ReadBool(L"misc", L"no_spread", settings.misc.noSpread);
         settings.misc.autoPistol = ReadBool(L"misc", L"auto_pistol", settings.misc.autoPistol);
         settings.misc.infiniteHealth = ReadBool(L"misc", L"infinite_health", settings.misc.infiniteHealth);
         settings.misc.infiniteStamina = ReadBool(L"misc", L"infinite_stamina", settings.misc.infiniteStamina);
 
-        settings.debug.showFps = ReadBool(L"debug", L"show_fps", settings.debug.showFps);
+        settings.debug.showFps =
+            ReadBoolMigrated(L"debug", L"show_fps", L"trainer", L"show_fps", settings.debug.showFps);
         settings.debug.showGraph = ReadBool(L"debug", L"show_graph", settings.debug.showGraph);
         settings.debug.showInternalStats =
             ReadBool(L"debug", L"show_internal_stats", settings.debug.showInternalStats);
-        settings.debug.headlessAimbot = ReadBool(L"debug", L"headless_aimbot", settings.debug.headlessAimbot);
+        settings.debug.headlessAimbot = ReadBoolMigrated(L"debug", L"headless_aimbot", L"aimbot",
+                                                         L"headless_diagnostics", settings.debug.headlessAimbot);
 
         // 진단 토글은 ini에서 직접 읽지 않는다. Diagnostics::Initialize가 이미 환경 변수 > ini >
         // 기본값 순으로 결정했고, 그 결정이 이 세션의 진실이다 (환경 변수로 덮어쓴 세션에서 ini 값을
