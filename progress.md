@@ -2684,3 +2684,22 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   target `0x9B7E02`에서 세 번 timeout되어 강제 해제 없이 중단했다. 따라서 새 DLL의 인게임 검증은 게임
   재시작 후 남아 있다. 최종 clean-build DLL SHA-256은
   `BBBE4D116DDAE24DFCD6EF6D91F6DACFBB9EB4F0848AA74D57B3AF95FE3BAB97`이다.
+
+## 2026-08-30 — Pose 메인 틱 이관 인게임 주입 검증 (PID 27680)
+
+- 사용자가 기존 DLL의 안전 언로드 완료를 알려 준 뒤 module 목록에서 trainer가 실제로 빠진 것을 확인했다.
+  정식 `cmake --build build --config Release`가 링크까지 통과했고 새 DLL(SHA-256
+  `6FBE9A17B269338416115D6C5560EA39EBB4E86CB5583AF0359C1B87FD4963C2`)을 PID 27680에 주입했다.
+- 새 세션에서 `tracker requirements ... pose=1` 다음 메인 틱 TID 32564가 `pose capture activated:
+  path=main-tick maxPerTick=24 intervalMs=33 requestLifetimeMs=250`를 기록했다. 가장 중요한 검증으로,
+  `profile present`에서는 `poseSlots`가 완전히 사라졌고 `profile tick`의 `pose` 및
+  `profile tickdetail`의 `poseSlots`로만 나타났다. 즉 실제 실행에서도 Present가 포즈 RTTI 호출을 하지
+  않고 메인 틱 캐시만 읽는다.
+- NPC snapshot 수가 8개에서 약 108개까지 늘어나는 구간을 관찰했다. 100명 안팎의 안정 구간에서 pose는
+  평균 약 0.30~0.35 ms/tick, 통상 최대 약 0.6~1.4 ms였고 한 차례 2.39 ms spike가 있었다. Present
+  snapshot은 같은 규모에서 약 43~46 us로 내려갔다. 프로세스는 계속 `Responding=True`였고 새 세션의
+  unhandled/fatal 레코드는 없었다.
+- 주입 후 약 45초 관찰 동안 `[POSE-ANOMALY]`와 `[POSE-AIM-CORRELATION]`은 0건이었다. 메인 틱 이관이
+  원래의 순간 압축을 제거했을 가능성이 높지만, 사용자가 같은 시야/Classic Aimbot 조건에서 육안으로
+  재현을 시도해 보는 것이 최종 판정이다. 다시 발생하면 이제 같은 entity/sample의 원시 슬롯 값이
+  자동으로 남는다.
