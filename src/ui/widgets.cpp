@@ -612,11 +612,6 @@ namespace Widgets
             SectionHeader(Loc::Text(Loc::Str::CardWeapon));
             ToggleRow(Loc::Str::NoRecoil, "no_recoil", &settings.misc.noRecoil);
             ToggleRow(Loc::Str::NoSpread, "no_spread", &settings.misc.noSpread);
-            ToggleRow(Loc::Str::AutoPistol, "auto_pistol", &settings.misc.autoPistol);
-
-            SectionHeader(Loc::Text(Loc::Str::CardPlayer));
-            ToggleRow(Loc::Str::InfiniteHealth, "infinite_health", &settings.misc.infiniteHealth);
-            ToggleRow(Loc::Str::InfiniteStamina, "infinite_stamina", &settings.misc.infiniteStamina);
         }
 
         // 런타임 통계는 설정이 아니다. 예전에는 마지막 토글 아래에 원시 텍스트가 그대로 이어져서

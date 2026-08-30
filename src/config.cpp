@@ -50,9 +50,6 @@ namespace
                lhs.aimbot.maxDistanceMeters == rhs.aimbot.maxDistanceMeters &&
                lhs.misc.noRecoil == rhs.misc.noRecoil &&
                lhs.misc.noSpread == rhs.misc.noSpread &&
-               lhs.misc.autoPistol == rhs.misc.autoPistol &&
-               lhs.misc.infiniteHealth == rhs.misc.infiniteHealth &&
-               lhs.misc.infiniteStamina == rhs.misc.infiniteStamina &&
                lhs.debug.showFps == rhs.debug.showFps &&
                lhs.debug.showGraph == rhs.debug.showGraph &&
                lhs.debug.showInternalStats == rhs.debug.showInternalStats &&
@@ -127,6 +124,11 @@ namespace
         return WriteValue(section, key, text);
     }
 
+    bool DeleteValue(const wchar_t* section, const wchar_t* key)
+    {
+        return WritePrivateProfileStringW(section, key, nullptr, g_configPath) != FALSE;
+    }
+
     bool Save(const Features::Settings& settings)
     {
         bool ok = true;
@@ -165,9 +167,11 @@ namespace
 
         ok &= WriteBool(L"misc", L"no_recoil", settings.misc.noRecoil);
         ok &= WriteBool(L"misc", L"no_spread", settings.misc.noSpread);
-        ok &= WriteBool(L"misc", L"auto_pistol", settings.misc.autoPistol);
-        ok &= WriteBool(L"misc", L"infinite_health", settings.misc.infiniteHealth);
-        ok &= WriteBool(L"misc", L"infinite_stamina", settings.misc.infiniteStamina);
+        // M2의 미완성/불안정 기능은 제거됐다. 기존 config에 남은 키도 한 번의 저장으로 정리해
+        // 다음 세션에서 죽은 설정이 다시 살아 있는 것처럼 보이지 않게 한다.
+        ok &= DeleteValue(L"misc", L"auto_pistol");
+        ok &= DeleteValue(L"misc", L"infinite_health");
+        ok &= DeleteValue(L"misc", L"infinite_stamina");
 
         ok &= WriteBool(L"debug", L"show_fps", settings.debug.showFps);
         ok &= WriteBool(L"debug", L"show_graph", settings.debug.showGraph);
@@ -269,9 +273,6 @@ namespace Config
         settings.misc.noRecoil =
             ReadBoolMigrated(L"misc", L"no_recoil", L"trainer", L"no_recoil", settings.misc.noRecoil);
         settings.misc.noSpread = ReadBool(L"misc", L"no_spread", settings.misc.noSpread);
-        settings.misc.autoPistol = ReadBool(L"misc", L"auto_pistol", settings.misc.autoPistol);
-        settings.misc.infiniteHealth = ReadBool(L"misc", L"infinite_health", settings.misc.infiniteHealth);
-        settings.misc.infiniteStamina = ReadBool(L"misc", L"infinite_stamina", settings.misc.infiniteStamina);
 
         settings.debug.showFps =
             ReadBoolMigrated(L"debug", L"show_fps", L"trainer", L"show_fps", settings.debug.showFps);

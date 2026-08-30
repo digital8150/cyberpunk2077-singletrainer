@@ -1,18 +1,16 @@
 #include "player_modifiers.h"
 
+#include "entity_tracker.h"
 #include "rtti_invoker.h"
 #include "../diagnostics.h"
 #include "../features/features.h"
 #include "../framework.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
-#include <cmath>
 
 namespace
 {
@@ -25,11 +23,6 @@ namespace
     constexpr std::size_t kModifierCount = kRecoilModifierCount + kSpreadModifierCount;
     constexpr std::uint32_t kNoRecoilMask = 1u << 0;
     constexpr std::uint32_t kNoSpreadMask = 1u << 1;
-    // Values are from the 2.31 enum map (cp2077-extractor's generated enums.py), not executable offsets.
-    constexpr std::int32_t kStaminaPool = 35; // gamedataStatPoolType::Stamina.
-    constexpr std::int32_t kInvulnerableGodMode = 0; // gameGodModeType::Invulnerable.
-    constexpr std::uint64_t kGodModeSource = Game::Rtti::Hash("cp2077_trainer");
-    constexpr ULONGLONG kStaminaRefreshIntervalMilliseconds = 250;
 
     struct TweakDbId
     {
@@ -66,8 +59,6 @@ namespace
         kPlayerSystem = 1u << 0,
         kStatsSystem = 1u << 1,
         kTransactionSystem = 1u << 2,
-        kGodModeSystem = 1u << 3,
-        kStatPoolsSystem = 1u << 4,
     };
 
     struct SystemContext
@@ -77,8 +68,6 @@ namespace
         void* playerSystem = nullptr;
         void* statsSystem = nullptr;
         void* transactionSystem = nullptr;
-        void* godModeSystem = nullptr;
-        void* statPoolsSystem = nullptr;
     };
 
     struct Runtime
@@ -96,47 +85,9 @@ namespace
         std::uint64_t systemAcquireFailures = 0;
     };
 
-    struct HealthRuntime
-    {
-        bool attempted = false;
-        ULONGLONG lastResolveAttempt = 0;
-        Game::Rtti::Function* addGodMode = nullptr;
-        Game::Rtti::Function* removeGodMode = nullptr;
-        // 이 빌드의 AddGodMode/RemoveGodMode는 반환값이 있다. 관측한 값을 그대로 들고 있다가 호출 시
-        // 결과 저장소를 넘길지 결정한다 — 다른 빌드에서 Void가 되어도 코드를 고칠 필요가 없다.
-        bool godModeReturnsValue = false;
-    };
-
-    struct StaminaRuntime
-    {
-        bool attempted = false;
-        ULONGLONG lastResolveAttempt = 0;
-        Game::Rtti::Function* getValue = nullptr;
-        Game::Rtti::Function* getMaxValue = nullptr;
-        Game::Rtti::Function* setValue = nullptr;
-    };
-
-    struct StaminaState
-    {
-        std::uintptr_t ownerGameInstance = 0;
-        std::uintptr_t ownerStatPoolsSystem = 0;
-        std::uintptr_t ownerPlayerInstance = 0;
-        std::uint64_t playerId = 0;
-        float restoreValue = 0.0f;
-        float maximumValue = 0.0f;
-        ULONGLONG lastRefresh = 0;
-    };
-
     Runtime g_runtime;
-    HealthRuntime g_healthRuntime;
-    StaminaRuntime g_staminaRuntime;
-    StaminaState g_staminaState;
     std::array<ModifierEntry, kModifierCount> g_modifiers{};
     std::atomic_uint32_t g_desiredModifierMask{0};
-    std::atomic_bool g_desiredAutoPistol{false};
-    std::atomic_bool g_desiredHealth{false};
-    std::atomic_bool g_desiredStamina{false};
-    std::atomic_bool g_autoPistolWarningLogged{false};
     std::atomic_bool g_cleanupRequested{false};
     std::atomic_bool g_cleanupAcknowledged{false};
     std::atomic_uint64_t g_playerId{0};
@@ -144,13 +95,20 @@ namespace
     std::atomic_uint64_t g_weaponId{0};
     std::atomic_bool g_active{false};
     std::atomic_uint32_t g_activeModifierMask{0};
-    std::atomic_bool g_healthActive{false};
-    std::atomic_bool g_staminaActive{false};
-    // These are main-tick-only owner tokens. They are never dereferenced and are cleared before Shutdown returns.
-    std::uintptr_t g_healthRuntimeOwnerGameInstance = 0;
-    std::uintptr_t g_healthRuntimeOwnerGodModeSystem = 0;
-    std::uintptr_t g_healthRuntimeOwnerPlayerInstance = 0;
-    std::uint64_t g_healthRuntimeOwnerPlayerId = 0;
+    std::atomic_bool g_worldRetirementPending{false};
+    // Dump-visible, logging-independent stage marker. A hang inside a reflected call leaves the last stage intact.
+    enum class MainTickStage : std::uint32_t
+    {
+        Idle,
+        WorldGate,
+        ReleaseRetiredHandles,
+        ResolveRuntime,
+        AcquireSystems,
+        GetPlayer,
+        ProcessModifiers,
+        ReleasePlayer,
+    };
+    std::atomic_uint32_t g_mainTickStage{static_cast<std::uint32_t>(MainTickStage::Idle)};
     std::atomic_uint64_t g_applied{0};
     std::atomic_uint64_t g_removed{0};
     std::atomic_uint64_t g_retiredOwnerResets{0};
@@ -164,6 +122,11 @@ namespace
     std::atomic_uintptr_t g_ownerStatsSystem{0};
     std::atomic_uintptr_t g_ownerPlayerInstance{0};
     ULONGLONG g_lastPathLogTick = 0;
+
+    void SetMainTickStage(MainTickStage stage)
+    {
+        g_mainTickStage.store(static_cast<std::uint32_t>(stage), std::memory_order_release);
+    }
 
     constexpr std::array<std::int32_t, kRecoilModifierCount> kRecoilStats = {
         1212, // RecoilAngle
@@ -286,10 +249,6 @@ namespace
             available |= kStatsSystem;
         if (context.transactionSystem)
             available |= kTransactionSystem;
-        if (context.godModeSystem)
-            available |= kGodModeSystem;
-        if (context.statPoolsSystem)
-            available |= kStatPoolsSystem;
         return available;
     }
 
@@ -319,22 +278,6 @@ namespace
                     if (!context.transactionSystem)
                         context.transactionSystem = GetSystemOnMainTick(
                             context.gameInstance, Game::Rtti::Hash("gameITransactionSystem"));
-                }
-                if ((required & kGodModeSystem) != 0)
-                {
-                    context.godModeSystem = GetSystemOnMainTick(
-                        context.gameInstance, Game::Rtti::Hash("gameGodModeSystem"));
-                    if (!context.godModeSystem)
-                        context.godModeSystem = GetSystemOnMainTick(
-                            context.gameInstance, Game::Rtti::Hash("gameIGodModeSystem"));
-                }
-                if ((required & kStatPoolsSystem) != 0)
-                {
-                    context.statPoolsSystem = GetSystemOnMainTick(
-                        context.gameInstance, Game::Rtti::Hash("gameStatPoolsSystem"));
-                    if (!context.statPoolsSystem)
-                        context.statPoolsSystem = GetSystemOnMainTick(
-                            context.gameInstance, Game::Rtti::Hash("gameIStatPoolsSystem"));
                 }
             }
         }
@@ -373,15 +316,14 @@ namespace
         return ~value;
     }
 
-    bool ResolveRuntimeOnMainTick(bool modifierPathRequired)
+    bool ResolveRuntimeOnMainTick()
     {
         const ULONGLONG now = GetTickCount64();
         const bool playerResolved = g_runtime.getLocalPlayer != nullptr;
         const bool modifierResolved = playerResolved && g_runtime.addModifier && g_runtime.removeModifier &&
                                       g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize &&
                                       g_runtime.exactHandleOwnership;
-        const bool resolved = modifierPathRequired ? modifierResolved : playerResolved;
-        if (resolved)
+        if (modifierResolved)
         {
             g_runtimeAvailable.store(modifierResolved, std::memory_order_release);
             return true;
@@ -389,7 +331,7 @@ namespace
         if (g_runtime.attempted && now - g_runtime.lastResolveAttempt < 1000)
         {
             g_runtimeAvailable.store(modifierResolved, std::memory_order_release);
-            return resolved;
+            return modifierResolved;
         }
 
         g_runtime.attempted = true;
@@ -399,10 +341,7 @@ namespace
         SystemContext systems;
         // The systems below are temporary resolver inputs only. They are discarded when this function returns;
         // only verified reflected metadata is retained in Runtime.
-        std::uint32_t requiredSystems = kPlayerSystem;
-        if (modifierPathRequired)
-            requiredSystems |= kStatsSystem | kTransactionSystem;
-        AcquireSystemContextOnMainTick(requiredSystems, systems);
+        AcquireSystemContextOnMainTick(kPlayerSystem | kStatsSystem | kTransactionSystem, systems);
 
         __try
         {
@@ -458,17 +397,15 @@ namespace
                                                   g_runtime.removeModifier && g_runtime.modifierDataClass &&
                                                   g_runtime.modifierDataSize == kModifierDataSize &&
                                                   g_runtime.exactHandleOwnership;
-        const bool resolvedAfterAttempt = modifierPathRequired ? modifierResolvedAfterAttempt : playerResolvedAfterAttempt;
         g_runtimeAvailable.store(modifierResolvedAfterAttempt, std::memory_order_release);
         Diagnostics::Log("player modifier resolver: getPlayer=%p add=%p remove=%p getItem=%p modifierClass=%p "
-                         "size=0x%zX exactHandle=%d modifierPath=%d resolved=%d",
+                         "size=0x%zX exactHandle=%d resolved=%d",
                          g_runtime.getLocalPlayer, g_runtime.addModifier, g_runtime.removeModifier,
                          g_runtime.getItemInSlot, g_runtime.modifierDataClass, g_runtime.modifierDataSize,
-                         g_runtime.exactHandleOwnership ? 1 : 0, modifierPathRequired ? 1 : 0,
-                         resolvedAfterAttempt ? 1 : 0);
-        if (!resolvedAfterAttempt)
+                         g_runtime.exactHandleOwnership ? 1 : 0, modifierResolvedAfterAttempt ? 1 : 0);
+        if (!modifierResolvedAfterAttempt)
             g_failures.fetch_add(1, std::memory_order_relaxed);
-        return resolvedAfterAttempt;
+        return modifierResolvedAfterAttempt;
     }
 
     bool ReadEntityId(void* object, std::uint64_t& entityId)
@@ -675,6 +612,47 @@ namespace
         g_ownerPlayerInstance.store(0, std::memory_order_release);
     }
 
+    void RetireModifiersForWorldTransition()
+    {
+        const std::uint64_t targetId = g_targetId.load(std::memory_order_relaxed);
+        std::size_t tracked = 0;
+        for (ModifierEntry& modifier : g_modifiers)
+        {
+            if (!modifier.cleanupTracked)
+                continue;
+            // Do not call RemoveModifier or touch a refcount while the old world is draining. The local strong
+            // handles are released only after the replacement world has passed the shared settle gate.
+            modifier.active = false;
+            ++tracked;
+        }
+        ClearPublishedModifierState();
+        g_worldRetirementPending.store(tracked != 0, std::memory_order_release);
+        if (tracked != 0)
+        {
+            g_retiredOwnerResets.fetch_add(1, std::memory_order_relaxed);
+            Diagnostics::Log("player modifiers retired by world gate: targetId=0x%llX handles=%zu",
+                             static_cast<unsigned long long>(targetId), tracked);
+        }
+    }
+
+    void ReleaseWorldRetiredHandlesAfterSettle()
+    {
+        if (!g_worldRetirementPending.load(std::memory_order_acquire))
+            return;
+
+        std::size_t released = 0;
+        for (ModifierEntry& modifier : g_modifiers)
+        {
+            if (!modifier.cleanupTracked)
+                continue;
+            ReleaseLocalHandle(modifier.handle);
+            modifier = {};
+            ++released;
+        }
+        g_worldRetirementPending.store(false, std::memory_order_release);
+        Diagnostics::Log("player modifier retired handles released after world settle: count=%zu", released);
+    }
+
     std::uintptr_t HandleInstanceIdentity(const Game::Rtti::Handle& handle)
     {
         __try
@@ -717,7 +695,7 @@ namespace
         }
         ClearPublishedModifierState();
         g_retiredOwnerResets.fetch_add(1, std::memory_order_relaxed);
-        Diagnostics::Log("no-recoil retired owner reset: targetId=0x%llX handles=%zu "
+        Diagnostics::Log("player modifiers retired owner reset: targetId=0x%llX handles=%zu "
                          "old[game=%p stats=%p player=%p] new[game=%p stats=%p player=%p]",
                          static_cast<unsigned long long>(targetId), released,
                          reinterpret_cast<void*>(ownerGame), reinterpret_cast<void*>(ownerStats),
@@ -849,431 +827,6 @@ namespace
         return true;
     }
 
-    // 이름 추측이 빗나갔을 때 조용히 기능만 죽지 않도록, 그 타입이 실제로 노출하는 리플렉션 표면을 한 번
-    // 찍는다. AGENTS.md가 정한 원칙 — 틀린 추측은 보고되어야지 무증상으로 사라지면 안 된다.
-    void LogReflectedSurfaceOnce(const char* label, void* systemInstance, bool& alreadyLogged)
-    {
-        if (alreadyLogged || !systemInstance)
-            return;
-        alreadyLogged = true;
-
-        const Game::Rtti::Class* type = Game::Rtti::NativeType(systemInstance);
-        for (unsigned depth = 0; type && depth < 6; ++depth)
-        {
-            const std::size_t count = Game::Rtti::FunctionCount(type);
-            Diagnostics::Log("%s reflected surface: depth=%u class=%s functions=%zu", label, depth,
-                             Game::Rtti::ResolveName(Game::Rtti::ClassNameHash(type)), count);
-            for (std::size_t i = 0; i < count; ++i)
-            {
-                Game::Rtti::Function* function = Game::Rtti::FunctionAt(type, i);
-                Game::Rtti::FunctionInfo info;
-                if (!function || !Game::Rtti::InspectFunction(function, info))
-                    continue;
-                char parameters[256]{};
-                int offset = 0;
-                for (std::size_t p = 0; p < info.parameterCount && offset >= 0 &&
-                                        offset < static_cast<int>(sizeof(parameters)) - 1; ++p)
-                {
-                    Game::Rtti::ParameterInfo parameter;
-                    if (!Game::Rtti::ParameterAt(function, p, parameter))
-                        break;
-                    const int written = snprintf(parameters + offset, sizeof(parameters) - offset, "%s%s(0x%llX)",
-                                                 p == 0 ? "" : ", ",
-                                                 Game::Rtti::ResolveName(parameter.nameHash),
-                                                 static_cast<unsigned long long>(parameter.flags));
-                    if (written < 0)
-                        break;
-                    offset += written;
-                }
-                Diagnostics::Log("%s   [%zu] %s params=%zu return=%d (%s)", label, i,
-                                 Game::Rtti::ResolveName(info.shortNameHash), info.parameterCount,
-                                 info.hasReturnValue ? 1 : 0, parameters);
-            }
-            type = Game::Rtti::ParentClass(type);
-        }
-    }
-
-    bool ResolveHealthRuntimeOnMainTick()
-    {
-        if (g_healthRuntime.addGodMode && g_healthRuntime.removeGodMode)
-            return true;
-
-        const ULONGLONG now = GetTickCount64();
-        if (g_healthRuntime.attempted && now - g_healthRuntime.lastResolveAttempt < 1000)
-            return false;
-        g_healthRuntime.attempted = true;
-        g_healthRuntime.lastResolveAttempt = now;
-
-        SystemContext systems;
-        const bool hasSystem = AcquireSystemContextOnMainTick(kGodModeSystem, systems);
-        Game::Rtti::Function* addGodMode = nullptr;
-        Game::Rtti::Function* removeGodMode = nullptr;
-        bool resolved = false;
-        __try
-        {
-            const Game::Rtti::Class* type = hasSystem ? Game::Rtti::NativeType(systems.godModeSystem) : nullptr;
-            addGodMode = Game::Rtti::FindFunction(type, Game::Rtti::Hash("AddGodMode"));
-            removeGodMode = Game::Rtti::FindFunction(type, Game::Rtti::Hash("RemoveGodMode"));
-            bool addHasReturn = true;
-            bool removeHasReturn = true;
-            if (addGodMode)
-                addHasReturn = Game::Rtti::HasReturnValue(addGodMode);
-            if (removeGodMode)
-                removeHasReturn = Game::Rtti::HasReturnValue(removeGodMode);
-            // 관측된 2.31 표면: AddGodMode/RemoveGodMode(entID, gmType, sourceInfo)이고 둘 다 반환값이 있다.
-            // 예전에는 Void라고 가정하고 반환값이 있으면 거절해서, 이름과 인자 수가 다 맞는데도 기능이
-            // 통째로 죽어 있었다. 반환 여부는 여기서 기록해 두고 호출 시 결과 버퍼를 넘긴다.
-            resolved = addGodMode && removeGodMode && Game::Rtti::ParameterCount(addGodMode) == 3 &&
-                       Game::Rtti::ParameterCount(removeGodMode) == 3;
-            g_healthRuntime.godModeReturnsValue = addHasReturn || removeHasReturn;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            resolved = false;
-        }
-
-        if (resolved)
-        {
-            g_healthRuntime.addGodMode = addGodMode;
-            g_healthRuntime.removeGodMode = removeGodMode;
-        }
-        Diagnostics::Log("health GodMode resolver: system=%p add=%p remove=%p found=(%p,%p) resolved=%d",
-                         systems.godModeSystem, g_healthRuntime.addGodMode, g_healthRuntime.removeGodMode,
-                         addGodMode, removeGodMode, resolved ? 1 : 0);
-        if (!resolved)
-        {
-            static bool loggedGodModeSurface = false;
-            LogReflectedSurfaceOnce("GodMode", systems.godModeSystem, loggedGodModeSurface);
-        }
-        return g_healthRuntime.addGodMode && g_healthRuntime.removeGodMode;
-    }
-
-    bool GodModeCall(const SystemContext& systems, Game::Rtti::Function* function, std::uint64_t playerId)
-    {
-        if (!systems.godModeSystem || !function || !playerId)
-            return false;
-
-        std::int32_t mode = kInvulnerableGodMode;
-        std::uint64_t source = kGodModeSource;
-        Game::Rtti::Argument arguments[] = {{&playerId}, {&mode}, {&source}};
-        bool invoked = false;
-        // 관측된 시그니처는 (entID, gmType, sourceInfo)에 반환값이 있다. 반환 저장소를 넘기지 않으면
-        // Invoke가 결과를 쓸 곳이 없다.
-        bool result = false;
-        __try
-        {
-            invoked = Game::Rtti::Invoke(function, systems.godModeSystem, arguments, 3,
-                                         g_healthRuntime.godModeReturnsValue ? &result : nullptr);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            invoked = false;
-        }
-        return invoked;
-    }
-
-    bool HealthOwnerChanged(const SystemContext& systems, std::uintptr_t playerInstance, std::uint64_t playerId)
-    {
-        const std::uintptr_t currentGame = reinterpret_cast<std::uintptr_t>(systems.gameInstance);
-        const std::uintptr_t currentGodMode = reinterpret_cast<std::uintptr_t>(systems.godModeSystem);
-        return (g_healthRuntimeOwnerGameInstance && currentGame &&
-                g_healthRuntimeOwnerGameInstance != currentGame) ||
-               (g_healthRuntimeOwnerGodModeSystem && currentGodMode &&
-                g_healthRuntimeOwnerGodModeSystem != currentGodMode) ||
-               (g_healthRuntimeOwnerPlayerInstance && playerInstance &&
-                g_healthRuntimeOwnerPlayerInstance != playerInstance) ||
-               (g_healthRuntimeOwnerPlayerId && playerId && g_healthRuntimeOwnerPlayerId != playerId);
-    }
-
-    void ClearHealthState()
-    {
-        g_healthActive.store(false, std::memory_order_release);
-        g_healthRuntimeOwnerGameInstance = 0;
-        g_healthRuntimeOwnerGodModeSystem = 0;
-        g_healthRuntimeOwnerPlayerInstance = 0;
-        g_healthRuntimeOwnerPlayerId = 0;
-    }
-
-    void AbandonRetiredHealthOwner(const SystemContext& systems, std::uintptr_t playerInstance,
-                                   std::uint64_t playerId)
-    {
-        Diagnostics::Log("health GodMode retired owner reset: old[game=%p system=%p player=%p id=0x%llX] "
-                         "new[game=%p system=%p player=%p id=0x%llX]",
-                         reinterpret_cast<void*>(g_healthRuntimeOwnerGameInstance),
-                         reinterpret_cast<void*>(g_healthRuntimeOwnerGodModeSystem),
-                         reinterpret_cast<void*>(g_healthRuntimeOwnerPlayerInstance),
-                         static_cast<unsigned long long>(g_healthRuntimeOwnerPlayerId), systems.gameInstance,
-                         systems.godModeSystem, reinterpret_cast<void*>(playerInstance),
-                         static_cast<unsigned long long>(playerId));
-        ClearHealthState();
-    }
-
-    bool ProcessHealthState(const SystemContext& systems, const Game::Rtti::Handle& player,
-                            std::uint64_t playerId, bool hasPlayer, bool requested)
-    {
-        const std::uintptr_t playerInstance = hasPlayer ? HandleInstanceIdentity(player) : 0;
-        if (!requested)
-        {
-            if (!g_healthActive.load(std::memory_order_acquire))
-                return true;
-            if (!hasPlayer)
-            {
-                if (HealthOwnerChanged(systems, 0, 0))
-                    AbandonRetiredHealthOwner(systems, playerInstance, playerId);
-                return false;
-            }
-            if (HealthOwnerChanged(systems, playerInstance, playerId))
-            {
-                AbandonRetiredHealthOwner(systems, playerInstance, playerId);
-                return false;
-            }
-            if (!GodModeCall(systems, g_healthRuntime.removeGodMode, playerId))
-                return false;
-            Diagnostics::Log("health GodMode removed: playerId=0x%llX",
-                             static_cast<unsigned long long>(playerId));
-            ClearHealthState();
-            return true;
-        }
-
-        if (!hasPlayer)
-        {
-            if (g_healthActive.load(std::memory_order_acquire) && HealthOwnerChanged(systems, 0, 0))
-                AbandonRetiredHealthOwner(systems, 0, 0);
-            return false;
-        }
-        if (g_healthActive.load(std::memory_order_acquire) &&
-            HealthOwnerChanged(systems, playerInstance, playerId))
-        {
-            AbandonRetiredHealthOwner(systems, playerInstance, playerId);
-        }
-        if (g_healthActive.load(std::memory_order_acquire))
-            return true;
-
-        if (!GodModeCall(systems, g_healthRuntime.addGodMode, playerId))
-            return false;
-        g_healthRuntimeOwnerGameInstance = reinterpret_cast<std::uintptr_t>(systems.gameInstance);
-        g_healthRuntimeOwnerGodModeSystem = reinterpret_cast<std::uintptr_t>(systems.godModeSystem);
-        g_healthRuntimeOwnerPlayerInstance = playerInstance;
-        g_healthRuntimeOwnerPlayerId = playerId;
-        g_healthActive.store(true, std::memory_order_release);
-        Diagnostics::Log("health GodMode applied: playerId=0x%llX mode=Invulnerable(0)",
-                         static_cast<unsigned long long>(playerId));
-        return true;
-    }
-
-    bool ResolveStaminaRuntimeOnMainTick()
-    {
-        if (g_staminaRuntime.getValue && g_staminaRuntime.getMaxValue && g_staminaRuntime.setValue)
-            return true;
-
-        const ULONGLONG now = GetTickCount64();
-        if (g_staminaRuntime.attempted && now - g_staminaRuntime.lastResolveAttempt < 1000)
-            return false;
-        g_staminaRuntime.attempted = true;
-        g_staminaRuntime.lastResolveAttempt = now;
-
-        SystemContext systems;
-        const bool hasSystem = AcquireSystemContextOnMainTick(kStatPoolsSystem, systems);
-        Game::Rtti::Function* getValue = nullptr;
-        Game::Rtti::Function* getMaxValue = nullptr;
-        Game::Rtti::Function* setValue = nullptr;
-        bool resolved = false;
-        __try
-        {
-            const Game::Rtti::Class* type = hasSystem ? Game::Rtti::NativeType(systems.statPoolsSystem) : nullptr;
-            getValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolValue"));
-            getMaxValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolMaxPointValue"));
-            setValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("RequestSettingStatPoolValue"));
-            bool setterHasReturn = true;
-            if (setValue)
-                setterHasReturn = Game::Rtti::HasReturnValue(setValue);
-            resolved = getValue && getMaxValue && setValue && Game::Rtti::ParameterCount(getValue) == 3 &&
-                       Game::Rtti::ParameterCount(getMaxValue) == 2 &&
-                       Game::Rtti::ParameterCount(setValue) == 6 && !setterHasReturn;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            resolved = false;
-        }
-
-        if (resolved)
-        {
-            g_staminaRuntime.getValue = getValue;
-            g_staminaRuntime.getMaxValue = getMaxValue;
-            g_staminaRuntime.setValue = setValue;
-        }
-        Diagnostics::Log("stamina stat-pool resolver: system=%p value=%p max=%p set=%p found=(%p,%p,%p) resolved=%d",
-                         systems.statPoolsSystem, g_staminaRuntime.getValue, g_staminaRuntime.getMaxValue,
-                         g_staminaRuntime.setValue, getValue, getMaxValue, setValue, resolved ? 1 : 0);
-        if (!resolved)
-        {
-            static bool loggedStatPoolSurface = false;
-            LogReflectedSurfaceOnce("StatPools", systems.statPoolsSystem, loggedStatPoolSurface);
-        }
-        return g_staminaRuntime.getValue && g_staminaRuntime.getMaxValue && g_staminaRuntime.setValue;
-    }
-
-    bool ReadStaminaValue(const SystemContext& systems, std::uint64_t playerId, float& current, float& maximum)
-    {
-        if (!systems.statPoolsSystem || !g_staminaRuntime.getValue || !g_staminaRuntime.getMaxValue || !playerId)
-            return false;
-
-        std::int32_t pool = kStaminaPool;
-        bool asPercentage = false;
-        Game::Rtti::Argument valueArguments[] = {{&playerId}, {&pool}, {&asPercentage}};
-        Game::Rtti::Argument maxArguments[] = {{&playerId}, {&pool}};
-        current = 0.0f;
-        maximum = 0.0f;
-        bool invoked = false;
-        __try
-        {
-            invoked = Game::Rtti::Invoke(g_staminaRuntime.getValue, systems.statPoolsSystem,
-                                         valueArguments, 3, &current) &&
-                      Game::Rtti::Invoke(g_staminaRuntime.getMaxValue, systems.statPoolsSystem,
-                                         maxArguments, 2, &maximum);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            invoked = false;
-        }
-        return invoked && std::isfinite(current) && std::isfinite(maximum) && maximum > 0.001f;
-    }
-
-    bool SetStaminaValue(const SystemContext& systems, const Game::Rtti::Handle& player,
-                         std::uint64_t playerId, float value)
-    {
-        if (!systems.statPoolsSystem || !g_staminaRuntime.setValue || !playerId || !player.instance)
-            return false;
-        std::int32_t pool = kStaminaPool;
-        // 관측된 2.31 시그니처는 여섯 개다:
-        //   RequestSettingStatPoolValue(objID, statPoolType, newValue, instigator, perc, ignoreCustomLimit)
-        // 뒤 두 개는 optional 플래그(0x400)가 붙어 있지만 Invoke는 정확한 개수를 요구하므로 반드시 넘긴다
-        // (이미 동작 중인 GetStatPoolValue의 perc도 같은 optional이고 같은 방식으로 넘기고 있다).
-        // perc=false는 newValue를 퍼센트가 아니라 절대값으로 해석하라는 뜻이다.
-        bool percentage = false;
-        bool ignoreCustomLimit = false;
-        Game::Rtti::Argument arguments[] = {{&playerId}, {&pool}, {&value},
-                                             {const_cast<Game::Rtti::Handle*>(&player)},
-                                             {&percentage}, {&ignoreCustomLimit}};
-        bool invoked = false;
-        __try
-        {
-            invoked = Game::Rtti::Invoke(g_staminaRuntime.setValue, systems.statPoolsSystem, arguments, 6);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            invoked = false;
-        }
-        return invoked;
-    }
-
-    bool StaminaOwnerChanged(const SystemContext& systems, std::uintptr_t playerInstance, std::uint64_t playerId)
-    {
-        return (g_staminaState.ownerGameInstance && systems.gameInstance &&
-                g_staminaState.ownerGameInstance != reinterpret_cast<std::uintptr_t>(systems.gameInstance)) ||
-               (g_staminaState.ownerStatPoolsSystem && systems.statPoolsSystem &&
-                g_staminaState.ownerStatPoolsSystem != reinterpret_cast<std::uintptr_t>(systems.statPoolsSystem)) ||
-               (g_staminaState.ownerPlayerInstance && playerInstance &&
-                g_staminaState.ownerPlayerInstance != playerInstance) ||
-               (g_staminaState.playerId && playerId && g_staminaState.playerId != playerId);
-    }
-
-    void ClearStaminaState()
-    {
-        g_staminaActive.store(false, std::memory_order_release);
-        g_staminaState = {};
-    }
-
-    void AbandonRetiredStaminaOwner(const SystemContext& systems, std::uintptr_t playerInstance,
-                                    std::uint64_t playerId)
-    {
-        Diagnostics::Log("stamina retired owner reset: old[game=%p system=%p player=%p id=0x%llX] "
-                         "new[game=%p system=%p player=%p id=0x%llX]",
-                         reinterpret_cast<void*>(g_staminaState.ownerGameInstance),
-                         reinterpret_cast<void*>(g_staminaState.ownerStatPoolsSystem),
-                         reinterpret_cast<void*>(g_staminaState.ownerPlayerInstance),
-                         static_cast<unsigned long long>(g_staminaState.playerId), systems.gameInstance,
-                         systems.statPoolsSystem, reinterpret_cast<void*>(playerInstance),
-                         static_cast<unsigned long long>(playerId));
-        // Do not write to a replacement StatPoolsSystem with the old world's restore value. The active request is
-        // abandoned and the new owner will capture its own value before the next refresh.
-        ClearStaminaState();
-    }
-
-    bool ProcessStaminaState(const SystemContext& systems, const Game::Rtti::Handle& player,
-                             std::uint64_t playerId, bool hasPlayer, bool requested)
-    {
-        const std::uintptr_t playerInstance = hasPlayer ? HandleInstanceIdentity(player) : 0;
-        if (!requested)
-        {
-            if (!g_staminaActive.load(std::memory_order_acquire))
-                return true;
-            if (!hasPlayer)
-            {
-                if (StaminaOwnerChanged(systems, 0, 0))
-                    AbandonRetiredStaminaOwner(systems, 0, 0);
-                return false;
-            }
-            if (StaminaOwnerChanged(systems, playerInstance, playerId))
-            {
-                AbandonRetiredStaminaOwner(systems, playerInstance, playerId);
-                return true;
-            }
-            if (!SetStaminaValue(systems, player, playerId, g_staminaState.restoreValue))
-                return false;
-            Diagnostics::Log("stamina stat-pool restored: playerId=0x%llX value=%.3f",
-                             static_cast<unsigned long long>(playerId), g_staminaState.restoreValue);
-            ClearStaminaState();
-            return true;
-        }
-
-        if (!hasPlayer)
-        {
-            if (g_staminaActive.load(std::memory_order_acquire) && StaminaOwnerChanged(systems, 0, 0))
-                AbandonRetiredStaminaOwner(systems, 0, 0);
-            return false;
-        }
-        if (g_staminaActive.load(std::memory_order_acquire) &&
-            StaminaOwnerChanged(systems, playerInstance, playerId))
-        {
-            AbandonRetiredStaminaOwner(systems, playerInstance, playerId);
-        }
-
-        const ULONGLONG now = GetTickCount64();
-        if (!g_staminaActive.load(std::memory_order_acquire))
-        {
-            float current = 0.0f;
-            float maximum = 0.0f;
-            if (!ReadStaminaValue(systems, playerId, current, maximum) ||
-                !SetStaminaValue(systems, player, playerId, maximum))
-                return false;
-            g_staminaState.ownerGameInstance = reinterpret_cast<std::uintptr_t>(systems.gameInstance);
-            g_staminaState.ownerStatPoolsSystem = reinterpret_cast<std::uintptr_t>(systems.statPoolsSystem);
-            g_staminaState.ownerPlayerInstance = playerInstance;
-            g_staminaState.playerId = playerId;
-            g_staminaState.restoreValue = current;
-            g_staminaState.maximumValue = maximum;
-            g_staminaState.lastRefresh = now;
-            g_staminaActive.store(true, std::memory_order_release);
-            Diagnostics::Log("stamina stat-pool infinite mode applied: playerId=0x%llX restore=%.3f max=%.3f "
-                             "refreshMs=%llu",
-                             static_cast<unsigned long long>(playerId), current, maximum,
-                             static_cast<unsigned long long>(kStaminaRefreshIntervalMilliseconds));
-            return true;
-        }
-
-        if (now - g_staminaState.lastRefresh < kStaminaRefreshIntervalMilliseconds)
-            return true;
-        float ignoredCurrent = 0.0f;
-        float maximum = 0.0f;
-        if (!ReadStaminaValue(systems, playerId, ignoredCurrent, maximum) ||
-            !SetStaminaValue(systems, player, playerId, maximum))
-            return false;
-        g_staminaState.maximumValue = maximum;
-        g_staminaState.lastRefresh = now;
-        return true;
-    }
-
     bool LogTargetDecision(std::uint64_t playerId, std::uint64_t weaponId, bool usingWeapon,
                            EquippedWeaponResult weaponResult = EquippedWeaponResult::Found)
     {
@@ -1378,108 +931,99 @@ namespace Game::PlayerModifiers
     void PublishDesired(const Features::MiscSettings& misc)
     {
         const std::uint32_t modifierMask = (misc.noRecoil ? kNoRecoilMask : 0u) |
-                                            (misc.noSpread ? kNoSpreadMask : 0u);
-        const bool anyEnabled = modifierMask != 0 || misc.autoPistol || misc.infiniteHealth ||
-                                misc.infiniteStamina;
+                                           (misc.noSpread ? kNoSpreadMask : 0u);
         // Once unload cleanup starts it owns the desired state. Present/headless publication must not continually
-        // flip the atomic back to true while the unload worker is waiting for its main-tick acknowledgement.
-        if (anyEnabled && g_cleanupRequested.load(std::memory_order_acquire))
+        // re-enable modifiers while the unload worker waits for its main-tick acknowledgement.
+        if (modifierMask != 0 && g_cleanupRequested.load(std::memory_order_acquire))
             return;
-        const std::uint32_t previousMask = g_desiredModifierMask.exchange(modifierMask, std::memory_order_acq_rel);
-        const bool previousAutoPistol = g_desiredAutoPistol.exchange(misc.autoPistol, std::memory_order_acq_rel);
-        const bool previousHealth = g_desiredHealth.exchange(misc.infiniteHealth, std::memory_order_acq_rel);
-        const bool previousStamina = g_desiredStamina.exchange(misc.infiniteStamina, std::memory_order_acq_rel);
-        if (previousMask != modifierMask || previousAutoPistol != misc.autoPistol ||
-            previousHealth != misc.infiniteHealth || previousStamina != misc.infiniteStamina)
-        {
-            Diagnostics::Log("misc desired settings published: modifierMask=0x%X autoPistol=%d health=%d stamina=%d",
-                             modifierMask, misc.autoPistol ? 1 : 0, misc.infiniteHealth ? 1 : 0,
-                             misc.infiniteStamina ? 1 : 0);
-        }
-        if (misc.autoPistol && !g_autoPistolWarningLogged.exchange(true, std::memory_order_acq_rel))
-        {
-            Diagnostics::Log("auto pistol unavailable: safe RTTI path requires the WeaponTransition state-machine "
-                             "hook used by redscript TriggerModeControl; no native memory write was attempted");
-        }
-        else if (!misc.autoPistol)
-        {
-            g_autoPistolWarningLogged.store(false, std::memory_order_release);
-        }
+        const std::uint32_t previousMask =
+            g_desiredModifierMask.exchange(modifierMask, std::memory_order_acq_rel);
+        if (previousMask != modifierMask)
+            Diagnostics::Log("player modifier settings published: mask=0x%X", modifierMask);
     }
 
     void OnGameMainTick()
     {
+        SetMainTickStage(MainTickStage::WorldGate);
         const bool cleanupRequested = g_cleanupRequested.load(std::memory_order_acquire);
         const std::uint32_t desiredModifierMask = cleanupRequested
                                                        ? 0u
                                                        : g_desiredModifierMask.load(std::memory_order_acquire);
-        const bool healthRequested = !cleanupRequested && g_desiredHealth.load(std::memory_order_acquire);
-        const bool staminaRequested = !cleanupRequested && g_desiredStamina.load(std::memory_order_acquire);
         const bool modifierActive = g_active.load(std::memory_order_acquire);
-        const bool healthActive = g_healthActive.load(std::memory_order_acquire);
-        const bool staminaActive = g_staminaActive.load(std::memory_order_acquire);
-        const bool modifierPathNeeded = desiredModifierMask != 0 || modifierActive;
-        const bool healthPathNeeded = healthRequested || healthActive;
-        const bool staminaPathNeeded = staminaRequested || staminaActive;
-        if (!modifierPathNeeded && !healthPathNeeded && !staminaPathNeeded)
+        const bool retirementPending = g_worldRetirementPending.load(std::memory_order_acquire);
+        const bool modifierPathNeeded = desiredModifierMask != 0 || modifierActive || retirementPending;
+        if (!modifierPathNeeded)
         {
             if (cleanupRequested)
                 g_cleanupAcknowledged.store(true, std::memory_order_release);
+            SetMainTickStage(MainTickStage::Idle);
             return;
         }
 
-        if (!ResolveRuntimeOnMainTick(modifierPathNeeded))
+        // EntityTracker runs first in the same detour and publishes this bit without entering an engine system.
+        // During world drain/settle, make zero RTTI/system/refcount calls. Active old-world state is retired locally;
+        // its exact handles remain owned until a later stable tick.
+        if (!Game::EntityTracker::IsWorldReadyForMainTickConsumers())
+        {
+            if (modifierActive)
+                RetireModifiersForWorldTransition();
+            if (cleanupRequested)
+                g_cleanupAcknowledged.store(false, std::memory_order_release);
+            SetMainTickStage(MainTickStage::Idle);
+            return;
+        }
+
+        SetMainTickStage(MainTickStage::ReleaseRetiredHandles);
+        ReleaseWorldRetiredHandlesAfterSettle();
+        if (cleanupRequested && !g_active.load(std::memory_order_acquire))
+        {
+            g_cleanupAcknowledged.store(true, std::memory_order_release);
+            SetMainTickStage(MainTickStage::Idle);
+            return;
+        }
+
+        SetMainTickStage(MainTickStage::ResolveRuntime);
+        if (!ResolveRuntimeOnMainTick())
         {
             if (cleanupRequested)
                 g_cleanupAcknowledged.store(false, std::memory_order_release);
+            SetMainTickStage(MainTickStage::Idle);
             return;
         }
 
-        const bool healthRuntimeReady = !healthPathNeeded || ResolveHealthRuntimeOnMainTick();
-        const bool staminaRuntimeReady = !staminaPathNeeded || ResolveStaminaRuntimeOnMainTick();
-        std::uint32_t requiredSystems = kPlayerSystem;
-        if (modifierPathNeeded)
-        {
-            requiredSystems |= kStatsSystem;
-            if (g_runtime.getItemInSlot)
-                requiredSystems |= kTransactionSystem;
-        }
-        if (healthPathNeeded && healthRuntimeReady)
-            requiredSystems |= kGodModeSystem;
-        if (staminaPathNeeded && staminaRuntimeReady)
-            requiredSystems |= kStatPoolsSystem;
+        std::uint32_t requiredSystems = kPlayerSystem | kStatsSystem;
+        if (g_runtime.getItemInSlot)
+            requiredSystems |= kTransactionSystem;
 
+        SetMainTickStage(MainTickStage::AcquireSystems);
         SystemContext systems;
         AcquireSystemContextOnMainTick(requiredSystems, systems);
+
+        SetMainTickStage(MainTickStage::GetPlayer);
         Game::Rtti::Handle player;
         std::uint64_t playerId = 0;
         const bool hasPlayer = GetLocalPlayer(systems, player, playerId);
 
+        SetMainTickStage(MainTickStage::ProcessModifiers);
         ProcessModifierState(systems, player, playerId, hasPlayer, desiredModifierMask);
-        if (healthPathNeeded && healthRuntimeReady)
-            ProcessHealthState(systems, player, playerId, hasPlayer, healthRequested);
-        if (staminaPathNeeded && staminaRuntimeReady)
-            ProcessStaminaState(systems, player, playerId, hasPlayer, staminaRequested);
 
+        SetMainTickStage(MainTickStage::ReleasePlayer);
         ReleaseLocalHandle(player);
 
-        const bool allClean = !g_active.load(std::memory_order_acquire) &&
-                              !g_healthActive.load(std::memory_order_acquire) &&
-                              !g_staminaActive.load(std::memory_order_acquire);
         if (cleanupRequested)
         {
+            const bool allClean = !g_active.load(std::memory_order_acquire) &&
+                                  !g_worldRetirementPending.load(std::memory_order_acquire);
             g_cleanupAcknowledged.store(allClean, std::memory_order_release);
         }
+        SetMainTickStage(MainTickStage::Idle);
     }
 
     bool PrepareForShutdown(std::uint32_t timeoutMilliseconds)
     {
         g_desiredModifierMask.store(0, std::memory_order_release);
-        g_desiredAutoPistol.store(false, std::memory_order_release);
-        g_desiredHealth.store(false, std::memory_order_release);
-        g_desiredStamina.store(false, std::memory_order_release);
-        if (!g_active.load(std::memory_order_acquire) && !g_healthActive.load(std::memory_order_acquire) &&
-            !g_staminaActive.load(std::memory_order_acquire))
+        if (!g_active.load(std::memory_order_acquire) &&
+            !g_worldRetirementPending.load(std::memory_order_acquire))
             return true;
 
         g_cleanupRequested.store(true, std::memory_order_release);
@@ -1489,41 +1033,30 @@ namespace Game::PlayerModifiers
         {
             if (GetTickCount64() >= deadline)
             {
-                Diagnostics::Log("misc cleanup timed out: modifiers=%d health=%d stamina=%d targetId=0x%llX",
+                Diagnostics::Log("player modifier cleanup timed out: active=%d retired=%d targetId=0x%llX stage=%u",
                                  g_active.load(std::memory_order_relaxed) ? 1 : 0,
-                                 g_healthActive.load(std::memory_order_relaxed) ? 1 : 0,
-                                 g_staminaActive.load(std::memory_order_relaxed) ? 1 : 0,
-                                 static_cast<unsigned long long>(g_targetId.load(std::memory_order_relaxed)));
+                                 g_worldRetirementPending.load(std::memory_order_relaxed) ? 1 : 0,
+                                 static_cast<unsigned long long>(g_targetId.load(std::memory_order_relaxed)),
+                                 g_mainTickStage.load(std::memory_order_relaxed));
                 return false;
             }
             Sleep(1);
         }
-        Diagnostics::Log("misc cleanup acknowledged");
+        Diagnostics::Log("player modifier cleanup acknowledged");
         return true;
     }
 
     void Shutdown()
     {
         g_desiredModifierMask.store(0, std::memory_order_release);
-        g_desiredAutoPistol.store(false, std::memory_order_release);
-        g_desiredHealth.store(false, std::memory_order_release);
-        g_desiredStamina.store(false, std::memory_order_release);
-        g_autoPistolWarningLogged.store(false, std::memory_order_release);
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_runtime = {};
-        g_healthRuntime = {};
-        g_staminaRuntime = {};
-        g_staminaState = {};
         g_modifiers = {};
         g_active.store(false, std::memory_order_release);
         g_activeModifierMask.store(0, std::memory_order_release);
-        g_healthActive.store(false, std::memory_order_release);
-        g_staminaActive.store(false, std::memory_order_release);
-        g_healthRuntimeOwnerGameInstance = 0;
-        g_healthRuntimeOwnerGodModeSystem = 0;
-        g_healthRuntimeOwnerPlayerInstance = 0;
-        g_healthRuntimeOwnerPlayerId = 0;
+        g_worldRetirementPending.store(false, std::memory_order_release);
+        g_mainTickStage.store(static_cast<std::uint32_t>(MainTickStage::Idle), std::memory_order_release);
         g_playerId.store(0, std::memory_order_release);
         g_targetId.store(0, std::memory_order_release);
         g_weaponId.store(0, std::memory_order_release);

@@ -87,9 +87,6 @@ namespace Features
     {
         bool noRecoil = false;
         bool noSpread = false;
-        bool autoPistol = false;
-        bool infiniteHealth = false;
-        bool infiniteStamina = false;
     };
 
     // 예전에는 config.ini의 [diagnostics] 섹션에서만 바꿀 수 있었던 계측/로깅 스위치들. 오버레이

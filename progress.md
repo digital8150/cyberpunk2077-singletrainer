@@ -2555,3 +2555,23 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   확정할 수 없다.
 - 상세 판정과 아티팩트 목록은 `reports/2026-08-30_freeze_analysis_pid29968.md`, 재사용 가능한 판정법은
   `reports/INSIGHTS.md` 1.3/2.5에 기록했다. 소스 수정과 PID 29968 종료는 하지 않았다.
+
+## 2026-08-30 — 불안정 M2 기능 제거와 recoil/spread 공통 월드 게이트
+
+- 사용자 판단에 따라 실제 효용이 없고 별도 엔진 서브시스템을 호출하던 `infinite_health`,
+  `infinite_stamina`, 미구현 설정 스텁 `auto_pistol`을 제거했다. `MiscSettings`, config read/write, UI,
+  localization뿐 아니라 PlayerModifiers의 GodMode/StatPools resolver, apply/restore 상태, owner 추적,
+  언로드 cleanup까지 삭제했다. 기존 ini의 세 키는 다음 config 저장 때 tombstone 삭제한다.
+- 실제 동작하는 `no_spread`는 `no_recoil`과 같은 `gameConstantStatModifierData` apply/remove 배열에 남겼다.
+  두 기능을 별도 생명주기로 나누지 않고 modifier mask(`0x1/0x2`)만 달리하는 기존 구조를 유지한다.
+- EntityTracker에 main-tick 공통 world readiness를 추가했다. 트래커가 비면 즉시 닫고, 다시 채워진 뒤
+  1초 동안 settle한 다음 연다. Native Highlight의 기존 국소 게이트도 이 공통 상태로 교체했다.
+- PlayerModifiers는 게이트가 닫힌 동안 `GetLocalPlayer`, `GetItemInSlot`, StatsSystem Add/Remove와 handle
+  refcount 작업을 전부 건너뛴다. 기존 modifier가 있으면 old-world 엔진에 remove를 보내지 않고 로컬
+  퇴역 표시만 남기며, 새 월드가 settle한 뒤 trainer 소유 handle을 해제하고 새 target에 재적용한다.
+  로깅을 꺼도 덤프에서 중단 위치를 볼 수 있도록 `g_mainTickStage` atomic도 추가했다.
+- `cmake -S . -B build-verify-removal -G "Visual Studio 18 2026" -A x64` 및
+  `cmake --build build-verify-removal --config Release` 통과. 빌드 경고 0, 새 DLL에서 제거 기능의 UI/RTTI
+  문자열이 사라진 것도 확인했다. PID 29968이 기존 `build/bin/Release/cp2077_trainer.dll`을 잡은 채
+  프리즈 중이라 원본 build tree는 덮어쓰지 않았고 프로세스도 종료하지 않았다. 따라서 clean-process
+  save-load 반복 검증은 다음 실행에서 필요하다.

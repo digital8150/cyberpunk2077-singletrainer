@@ -518,6 +518,12 @@ namespace
     std::atomic_bool g_cleanupClearQueued{false};
     std::atomic_bool g_cleanupAcknowledged{false};
     std::atomic_uint64_t g_cleanupGeneration{0};
+    // Shared, main-tick-owned world gate for world-owned engine consumers that opt into transition protection.
+    // The published bit is read only after EntityTracker::OnGameMainTick updates it for the current tick.
+    std::atomic_bool g_worldReadyForConsumers{false};
+    bool g_worldWasEmpty = true;
+    ULONGLONG g_worldSettleUntil = 0;
+    ULONGLONG g_lastWorldGateLog = 0;
     std::uint64_t g_healthRoundRobin = 0;
     std::uint64_t g_attitudeRoundRobin = 0;
     ULONGLONG g_attitudePathLogTick = 0;
@@ -532,9 +538,6 @@ namespace
         SetBraindanceModeFn setBraindanceMode = nullptr;
         ULONGLONG lastSystemAcquireFailureLog = 0;
         std::uint64_t systemAcquireFailures = 0;
-        bool worldWasEmpty = false;
-        ULONGLONG worldSettleUntil = 0;
-        ULONGLONG lastWorldGateLog = 0;
         std::size_t leakedEvents = 0;
     };
     NativeHighlightRuntime g_highlightRuntime;
@@ -1368,7 +1371,67 @@ namespace
     constexpr std::uint32_t kHighlightPoliceBit = 1u << 3;
     constexpr std::uint32_t kHighlightOtherBit = 1u << 4;
     constexpr std::uint32_t kHighlightHideDeadBit = 1u << 5;
-    constexpr ULONGLONG kNativeHighlightWorldSettleMilliseconds = 1000;
+    constexpr ULONGLONG kWorldSettleMilliseconds = 1000;
+
+    void UpdateWorldReadinessOnMainTick()
+    {
+        std::size_t trackedCount = 0;
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
+        {
+            if (IsPuppetOccupied(slot) && g_puppetList[slot].entity)
+                ++trackedCount;
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+
+        const ULONGLONG now = GetTickCount64();
+        if (trackedCount == 0)
+        {
+            g_worldReadyForConsumers.store(false, std::memory_order_release);
+            g_worldSettleUntil = 0;
+            if (!g_worldWasEmpty)
+            {
+                g_worldWasEmpty = true;
+                if (g_lastWorldGateLog == 0 || now - g_lastWorldGateLog >= kWorldSettleMilliseconds)
+                {
+                    g_lastWorldGateLog = now;
+                    Diagnostics::Log("world consumer gate: empty tracked=0");
+                }
+            }
+            return;
+        }
+
+        if (g_worldWasEmpty)
+        {
+            g_worldWasEmpty = false;
+            g_worldSettleUntil = now + kWorldSettleMilliseconds;
+            g_worldReadyForConsumers.store(false, std::memory_order_release);
+            if (g_lastWorldGateLog == 0 || now - g_lastWorldGateLog >= kWorldSettleMilliseconds)
+            {
+                g_lastWorldGateLog = now;
+                Diagnostics::Log("world consumer gate: repopulated tracked=%zu settleMs=%llu", trackedCount,
+                                 static_cast<unsigned long long>(kWorldSettleMilliseconds));
+            }
+            return;
+        }
+
+        if (g_worldSettleUntil != 0 && now < g_worldSettleUntil)
+        {
+            g_worldReadyForConsumers.store(false, std::memory_order_release);
+            return;
+        }
+
+        if (g_worldSettleUntil != 0)
+        {
+            g_worldSettleUntil = 0;
+            if (g_lastWorldGateLog == 0 || now - g_lastWorldGateLog >= kWorldSettleMilliseconds)
+            {
+                g_lastWorldGateLog = now;
+                Diagnostics::Log("world consumer gate: settled tracked=%zu", trackedCount);
+            }
+        }
+        g_worldReadyForConsumers.store(true, std::memory_order_release);
+    }
 
     struct HighlightWork
     {
@@ -1610,7 +1673,6 @@ namespace
         const bool enabled = (settings & kHighlightEnabledBit) != 0;
         std::array<HighlightWork, kMaxTrackedPuppets> workItems{};
         std::size_t workCount = 0;
-        std::size_t trackedCount = 0;
         bool anyDesired = false;
 
         const std::int64_t collectStart = Diagnostics::Profile::Now();
@@ -1622,7 +1684,6 @@ namespace
             const TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity)
                 continue;
-            ++trackedCount;
             const bool desired = enabled && IsCategoryEnabled(tracked.category, tracked.hostility, settings) &&
                                  !((settings & kHighlightHideDeadBit) != 0 && tracked.isDead);
             // Queue only a state transition: unknown+desired=true is the first enable, while known entries queue
@@ -1657,70 +1718,18 @@ namespace
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HighlightCollect,
                                      Diagnostics::Profile::Now() - collectStart);
 
-        // A zero-entry tracker is a world/session drain, not a request to call mode=0 on the retired vision
-        // system. Drop the local mode latch and let the existing cleanup acknowledgement finish without any engine
-        // calls. If entries repopulate, hold all highlight calls for one bounded settle window so their owners and
-        // the new world system have had a chance to stabilize. Work handles copied during that window are released
-        // by the common drain below; no transition cache is updated until QueueEvent succeeds.
-        const ULONGLONG now = GetTickCount64();
-        const bool worldEmpty = trackedCount == 0;
-        bool worldSettling = false;
-        if (worldEmpty)
-        {
-            g_highlightRuntime.worldSettleUntil = 0;
+        // The shared gate is updated before any feature consumer runs this tick. A false gate means world drain
+        // or the bounded post-load settle window: drop only the local latch and make no engine-system calls.
+        const bool worldReady = g_worldReadyForConsumers.load(std::memory_order_acquire);
+        if (!worldReady)
             g_nativeHighlightModeActive.store(false, std::memory_order_release);
-            if (!g_highlightRuntime.worldWasEmpty)
-            {
-                g_highlightRuntime.worldWasEmpty = true;
-                if (g_highlightRuntime.lastWorldGateLog == 0 ||
-                    now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
-                {
-                    g_highlightRuntime.lastWorldGateLog = now;
-                    Diagnostics::Log("native highlight world gate: empty tracked=0");
-                }
-            }
-        }
-        else
-        {
-            if (g_highlightRuntime.worldWasEmpty)
-            {
-                g_highlightRuntime.worldWasEmpty = false;
-                g_highlightRuntime.worldSettleUntil = now + kNativeHighlightWorldSettleMilliseconds;
-                if (g_highlightRuntime.lastWorldGateLog == 0 ||
-                    now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
-                {
-                    g_highlightRuntime.lastWorldGateLog = now;
-                    Diagnostics::Log("native highlight world gate: repopulated tracked=%zu settleMs=%llu",
-                                     trackedCount,
-                                     static_cast<unsigned long long>(kNativeHighlightWorldSettleMilliseconds));
-                }
-            }
-            if (g_highlightRuntime.worldSettleUntil != 0)
-            {
-                if (now < g_highlightRuntime.worldSettleUntil)
-                {
-                    worldSettling = true;
-                }
-                else
-                {
-                    g_highlightRuntime.worldSettleUntil = 0;
-                    if (g_highlightRuntime.lastWorldGateLog == 0 ||
-                        now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
-                    {
-                        g_highlightRuntime.lastWorldGateLog = now;
-                        Diagnostics::Log("native highlight world gate: settled tracked=%zu", trackedCount);
-                    }
-                }
-            }
-        }
-
         // Keep mode enabled while a clear transition is pending. This prevents a failed clear from being hidden by
         // an eager mode=0 call and lets the next main tick retry the same transition.
         const bool cachedDesired = HasDesiredHighlightState();
         const bool modeDesired = anyDesired || cachedDesired;
         const bool modeActive = g_nativeHighlightModeActive.load(std::memory_order_acquire);
         const bool clearRetryNeeded = !enabled && cachedDesired;
-        if (!worldEmpty && !worldSettling && (workCount > 0 || modeActive != modeDesired || clearRetryNeeded))
+        if (worldReady && (workCount > 0 || modeActive != modeDesired || clearRetryNeeded))
         {
             if (ResolveNativeHighlightOnMainTick())
             {
@@ -2735,6 +2744,10 @@ namespace Game::EntityTracker
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_cleanupGeneration.store(0, std::memory_order_release);
+        g_worldReadyForConsumers.store(false, std::memory_order_release);
+        g_worldWasEmpty = true;
+        g_worldSettleUntil = 0;
+        g_lastWorldGateLog = 0;
         g_highlightRuntime = {};
         g_healthRuntime.lastSystemAcquireFailureLog = 0;
         g_healthRuntime.systemAcquireFailures = 0;
@@ -2822,6 +2835,11 @@ namespace Game::EntityTracker
         return result;
     }
 
+    bool IsWorldReadyForMainTickConsumers()
+    {
+        return g_worldReadyForConsumers.load(std::memory_order_acquire);
+    }
+
     std::size_t GetPuppetSnapshots(PuppetSnapshot* output, std::size_t capacity)
     {
         if (!output || capacity == 0)
@@ -2888,6 +2906,7 @@ namespace Game::EntityTracker
     {
         const std::uint64_t tickCount = g_mainTickCalls.fetch_add(1, std::memory_order_relaxed) + 1;
         ObserveThread(g_mainTickThread, "OnGameMainTick");
+        UpdateWorldReadinessOnMainTick();
         if ((tickCount & 0x7Fu) == 0)
             MaybeLogPhase1Summary();
 
