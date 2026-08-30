@@ -37,11 +37,15 @@ namespace
     constexpr std::size_t kComponentDetailLogLimit = 8;
     constexpr ULONGLONG kPhase1SummaryIntervalMilliseconds = 3000;
 
-    // Phase 1 deliberately leaves the raw attitude-component RTTI path disabled. This compile-time gate is kept
-    // closed until Phase 2 supplies a lifetime-bearing component access mechanism; the runtime gate is also closed
-    // so a stale binary/configuration cannot accidentally re-enable the path.
-    constexpr bool kPhase1AttitudeRttiCompileGate = false;
-    static_assert(!kPhase1AttitudeRttiCompileGate, "Phase 1 attitude RTTI must remain fail-closed");
+    // Phase 2 deliberately leaves attitude disabled until both sides of the ownership contract are live-proved:
+    // a source component Handle must be acquired without a DynArray-entry TOCTOU, and every resulting Handle must
+    // use the exact final-owner release path. The runtime gate is also closed so stale configuration cannot reopen
+    // a path that the source-storage contract has not earned.
+    constexpr bool kPhase2AttitudeLifetimeCompileGate = false;
+    constexpr bool kPhase2AttitudeSourceContractCompileGate = false;
+    constexpr bool kPhase2AttitudeRttiCompileGate = kPhase2AttitudeLifetimeCompileGate &&
+                                                     kPhase2AttitudeSourceContractCompileGate;
+    static_assert(!kPhase2AttitudeRttiCompileGate, "Phase 2 attitude must remain fail-closed until proven");
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
@@ -269,6 +273,12 @@ namespace
     std::atomic_uint64_t g_attitudeValid{0};
     std::atomic_uint64_t g_attitudeInvalid{0};
     std::atomic_uint64_t g_attitudeFailClosedTicks{0};
+    std::atomic_uint64_t g_attitudeLookupAttempts{0};
+    std::atomic_uint64_t g_attitudeSourceContractBlocked{0};
+    std::atomic_uint64_t g_attitudeLifetimeAcquisitionSuccess{0};
+    std::atomic_uint64_t g_attitudeExpiredOrInvalidReference{0};
+    std::atomic_uint64_t g_attitudeAgentLookupSuccess{0};
+    std::atomic_uint64_t g_attitudeAgentLookupUnknown{0};
     std::atomic_uint64_t g_pendingPosition{0};
     std::atomic_uint64_t g_staleRemoved{0};
     std::atomic_uint64_t g_healthValid{0};
@@ -331,9 +341,9 @@ namespace
         return (g_puppetOccupancy[slot / 64] & (1ull << (slot % 64))) != 0;
     }
 
-    bool IsPhase1AttitudeRttiEnabled() noexcept
+    bool IsPhase2AttitudeEnabled() noexcept
     {
-        return kPhase1AttitudeRttiCompileGate && g_attitudeRttiRuntimeGate.load(std::memory_order_acquire);
+        return kPhase2AttitudeRttiCompileGate && g_attitudeRttiRuntimeGate.load(std::memory_order_acquire);
     }
 
     std::uint64_t ObserveThread(ThreadObservation& observation, const char* path)
@@ -412,7 +422,9 @@ namespace
             "unregisterNoId=%llu "
             "lastRegister=(%p,0x%llX) lastUnregister=(%p,0x%llX) unregisterHook=%d "
             "componentEntities=%llu componentSkipped=%llu componentSamples=%llu layoutRejects=%llu "
-            "nullInstance=%llu nullRefCount=%llu truncated=%llu attitudeFailClosed=1",
+            "nullInstance=%llu nullRefCount=%llu truncated=%llu "
+            "attitudeAttempts=%llu attitudeSourceBlocked=%llu attitudeAcquire=%llu attitudeExpiredInvalid=%llu "
+            "attitudeAgent=%llu attitudeUnknown=%llu attitudeFailClosed=1",
             static_cast<unsigned long long>(g_registerCallbacks.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_registered.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_registerThread.lastThreadId.load(std::memory_order_relaxed)),
@@ -442,7 +454,13 @@ namespace
             static_cast<unsigned long long>(g_componentHandleLayoutRejects.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_componentHandleNullInstances.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_componentHandleNullRefCounts.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_componentHandleTruncated.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(g_componentHandleTruncated.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeLookupAttempts.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeSourceContractBlocked.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeLifetimeAcquisitionSuccess.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeExpiredOrInvalidReference.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeAgentLookupSuccess.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_attitudeAgentLookupUnknown.load(std::memory_order_relaxed)));
     }
 
     std::uint64_t g_puppetSequence = 0;
@@ -1652,29 +1670,13 @@ namespace
         PublishHealthBatch(workItems.data(), workCount);
     }
 
-    struct AttitudeRuntime
-    {
-        bool attempted = false;
-        ULONGLONG lastResolveAttempt = 0;
-        void* playerSystem = nullptr;
-        Game::Rtti::Function* getLocalPlayer = nullptr;
-        Game::Rtti::Function* getAttitudeTowards = nullptr;
-        // Held as a handle rather than a raw pointer so GetAttitudeTowards can take it directly, and refreshed on
-        // an interval so the reference count is not churned once per pass.
-        Game::Rtti::Handle playerAgent;
-        ULONGLONG playerAgentResolvedAt = 0;
-        bool dumped = false;
-        bool logged = false;
-    };
-    AttitudeRuntime g_attitudeRuntime;
-
     void ApplyAttitudeFailClosed()
     {
         const std::uint64_t blocked = g_attitudeFailClosedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_attitudeFailClosedLogged.exchange(true, std::memory_order_acq_rel))
         {
-            Diagnostics::Log("PHASE1 FAIL-CLOSED: attitude RTTI disabled; raw component walk and "
-                             "GetAttitudeTowards Invoke skipped; hostility remains Unknown");
+            Diagnostics::Log("PHASE2 FAIL-CLOSED: attitude disabled; no component Handle source acquisition or "
+                             "GetAttitudeTowards Invoke; hostility remains Unknown");
         }
 
         if (!g_attitudeFailClosedStateCleared.exchange(true, std::memory_order_acq_rel))
@@ -1694,155 +1696,34 @@ namespace
             MaybeLogPhase1Summary();
     }
 
-    // Phase 1 keeps the entire attitude path fail-closed. The implementation below remains compiled for a later
-    // lifetime-bearing replacement, but FindAttitudeAgent/ReadHostility/ResolveAttitudeOnMainTick all reject entry
-    // while the compile-time and runtime gates are closed; no raw component walk or attitude RTTI call executes.
-    void* FindAttitudeAgent(const EntityLayout* entity)
-    {
-        if (!IsPhase1AttitudeRttiEnabled())
-            return nullptr;
-
-        constexpr std::uint64_t agentName = Fnv1a64("gameAttitudeAgent");
-        void* found = nullptr;
-        ForEachComponent(entity, [&](std::byte* component) {
-            if (found)
-                return;
-            if (Game::Rtti::IsClassOrDerived(Game::Rtti::NativeType(component), agentName))
-                found = component;
-        });
-        return found;
-    }
-
-    // Discovery aid. Reflected names are the one part of this path that cannot be verified offline, so a failed
-    // lookup prints the reflected surface of the type instead of leaving hostility at Unknown with no explanation.
-    void DumpClassFunctions(const char* className, const char* filter, unsigned maxDepth)
-    {
-        const Game::Rtti::Class* type = Game::Rtti::GetClass(Game::Rtti::Hash(className));
-        if (!type)
-        {
-            Diagnostics::Log("attitude rtti dump: class %s not found", className);
-            return;
-        }
-        for (unsigned depth = 0; type && depth < maxDepth; ++depth, type = Game::Rtti::ParentClass(type))
-        {
-            const char* owner = Game::Rtti::ResolveName(Game::Rtti::ClassNameHash(type));
-            const std::size_t count = Game::Rtti::FunctionCount(type);
-            for (std::size_t i = 0; i < count; ++i)
-            {
-                Game::Rtti::FunctionInfo info;
-                if (!Game::Rtti::InspectFunction(Game::Rtti::FunctionAt(type, i), info))
-                    continue;
-                const char* name = Game::Rtti::ResolveName(info.shortNameHash);
-                if (filter && (!name || !strstr(name, filter)))
-                    continue;
-                Diagnostics::Log("attitude rtti dump: %s::%s params=%zu return=%d flags=0x%X",
-                                 owner && *owner ? owner : "?", name && *name ? name : "?",
-                                 info.parameterCount, info.hasReturnValue ? 1 : 0, info.flags);
-            }
-        }
-    }
-
-    bool ResolveAttitudeOnMainTick()
-    {
-        if (!IsPhase1AttitudeRttiEnabled())
-            return false;
-
-        if (g_attitudeRuntime.playerSystem && g_attitudeRuntime.getLocalPlayer &&
-            g_attitudeRuntime.getAttitudeTowards)
-            return true;
-
-        const ULONGLONG now = GetTickCount64();
-        if (g_attitudeRuntime.attempted && now - g_attitudeRuntime.lastResolveAttempt < 2000)
-            return false;
-        g_attitudeRuntime.attempted = true;
-        g_attitudeRuntime.lastResolveAttempt = now;
-
-        __try
-        {
-            void* gameInstance = ResolveGameInstanceOnMainTick();
-            g_attitudeRuntime.playerSystem = GetSystemOnMainTick(gameInstance,
-                                                                 Game::Rtti::Hash("gameIPlayerSystem"));
-            g_attitudeRuntime.getLocalPlayer = Game::Rtti::FindFunction(
-                Game::Rtti::NativeType(g_attitudeRuntime.playerSystem),
-                Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
-            g_attitudeRuntime.getAttitudeTowards = Game::Rtti::FindFunction(
-                Game::Rtti::GetClass(Game::Rtti::Hash("gameAttitudeAgent")),
-                Game::Rtti::Hash("GetAttitudeTowards"));
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            g_attitudeRuntime.playerSystem = nullptr;
-            g_attitudeRuntime.getLocalPlayer = nullptr;
-            g_attitudeRuntime.getAttitudeTowards = nullptr;
-            Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
-        }
-
-        // Invoke() requires an exact parameter match, so reject a signature that does not match the one hardcoded
-        // below instead of letting every call fail silently at runtime.
-        if (g_attitudeRuntime.getAttitudeTowards &&
-            (Game::Rtti::ParameterCount(g_attitudeRuntime.getAttitudeTowards) != 1 ||
-             !Game::Rtti::HasReturnValue(g_attitudeRuntime.getAttitudeTowards)))
-            g_attitudeRuntime.getAttitudeTowards = nullptr;
-
-        const bool resolved = g_attitudeRuntime.playerSystem && g_attitudeRuntime.getLocalPlayer &&
-                              g_attitudeRuntime.getAttitudeTowards;
-        if (!g_attitudeRuntime.logged || resolved)
-        {
-            Diagnostics::Log("attitude resolver: playerSystem=%p getLocalPlayer=%p getAttitudeTowards=%p "
-                             "resolved=%d",
-                             g_attitudeRuntime.playerSystem, g_attitudeRuntime.getLocalPlayer,
-                             g_attitudeRuntime.getAttitudeTowards, resolved ? 1 : 0);
-            g_attitudeRuntime.logged = true;
-        }
-        if (!resolved && !g_attitudeRuntime.dumped)
-        {
-            g_attitudeRuntime.dumped = true;
-            DumpClassFunctions("gameObject", "ttitude", 4);
-            DumpClassFunctions("gameAttitudeAgent", nullptr, 1);
-        }
-        return resolved;
-    }
-
-    // Historical implementation retained for Phase 2 review only. Phase 1 never enters it: a component's strong
-    // Handle lifetime is not yet carried into this work item, so the fail-closed gate above returns Unknown before
-    // any raw component walk or reflected invocation can occur.
-    Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, Game::Rtti::Handle& playerAgent)
+    // This is the only Phase 2 attitude boundary. It owns no raw component pointer and performs no engine/VM call
+    // until a source-entry acquisition contract is proven. In the current build the contract is intentionally
+    // closed: the live Phase 1 observer measured concurrent off-main UnregisterEntity callbacks, and no engine API
+    // has yet been proved to make a component DynArray entry stable while its strong count is copied. A generation
+    // check or same-thread assumption would leave that TOCTOU open, so those fallbacks are not attempted.
+    Game::EntityTracker::Hostility TryResolveAttitudeAgentSafely(const EntityLayout* entity,
+                                                                 const Game::Rtti::Handle* playerAgent)
     {
         using Game::EntityTracker::Hostility;
-        if (!IsPhase1AttitudeRttiEnabled())
-            return Hostility::Unknown;
+        g_attitudeLookupAttempts.fetch_add(1, std::memory_order_relaxed);
 
-        std::int32_t attitude = -1;
-        bool called = false;
-        __try
+        if (!IsPhase2AttitudeEnabled())
         {
-            void* npcAgent = FindAttitudeAgent(entity);
-            if (npcAgent)
-            {
-                Game::Rtti::Argument arguments[] = {{&playerAgent}};
-                called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, npcAgent, arguments, 1,
-                                            &attitude);
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            called = false;
-        }
-        if (!called)
+            (void)entity;
+            (void)playerAgent;
+            g_attitudeSourceContractBlocked.fetch_add(1, std::memory_order_relaxed);
+            g_attitudeAgentLookupUnknown.fetch_add(1, std::memory_order_relaxed);
             return Hostility::Unknown;
+        }
 
-        // EAIAttitude: AIA_Friendly = 0, AIA_Neutral = 1, AIA_Hostile = 2.
-        switch (attitude)
-        {
-        case 0:
-            return Hostility::Friendly;
-        case 1:
-            return Hostility::Neutral;
-        case 2:
-            return Hostility::Hostile;
-        default:
-            return Hostility::Unknown;
-        }
+        // kPhase2AttitudeRttiCompileGate is a compile-time conjunction that remains false until both acquisition
+        // and release/source-storage evidence are independently accepted. Keep this branch fail-closed if a future
+        // edit changes only the runtime gate instead of supplying the retained-handle implementation.
+        (void)entity;
+        (void)playerAgent;
+        g_attitudeExpiredOrInvalidReference.fetch_add(1, std::memory_order_relaxed);
+        g_attitudeAgentLookupUnknown.fetch_add(1, std::memory_order_relaxed);
+        return Hostility::Unknown;
     }
 
     struct AttitudeWork
@@ -1876,14 +1757,12 @@ namespace
 
     void ProcessAttitudeOnMainTick()
     {
-        if (!IsPhase1AttitudeRttiEnabled())
-        {
+        if (!IsPhase2AttitudeEnabled())
             ApplyAttitudeFailClosed();
-            return;
-        }
 
-        // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second and a
-        // tick never spends more than a handful of reflected calls on it.
+        // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second. While
+        // the Phase 2 ownership gate is closed, the bounded calls below are bookkeeping-only and make no engine/VM
+        // calls.
         constexpr std::size_t kAttitudePerTick = 4;
         constexpr ULONGLONG kAttitudeIntervalMs = 250;
 
@@ -1914,62 +1793,30 @@ namespace
                                      Diagnostics::Profile::Now() - collectStart);
         g_attitudeRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
 
-        const bool resolved = ResolveAttitudeOnMainTick();
         const bool shouldLog = now - g_attitudePathLogTick >= 3000;
-        if (!resolved || workCount == 0)
+        const std::int64_t invokeStart = Diagnostics::Profile::Now();
+        for (std::size_t i = 0; i < workCount; ++i)
+            workItems[i].hostility = TryResolveAttitudeAgentSafely(workItems[i].entity, nullptr);
+        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
+                                     Diagnostics::Profile::Now() - invokeStart);
+
+        if (workCount == 0)
         {
             if (shouldLog)
             {
                 g_attitudePathLogTick = now;
-                Diagnostics::Log("attitude path: work=%zu resolved=%d", workCount, resolved ? 1 : 0);
+                Diagnostics::Log("attitude path: work=%zu phase2Enabled=%d", workCount,
+                                 IsPhase2AttitudeEnabled() ? 1 : 0);
             }
             return;
-        }
-
-        // Attitude is directional, so the player's own agent is the required argument. The player object still
-        // needs one reflected call, so its agent is cached briefly rather than fetched for every pass.
-        if (!g_attitudeRuntime.playerAgent.instance || now - g_attitudeRuntime.playerAgentResolvedAt >= 500)
-        {
-            Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
-            Game::Rtti::Handle player;
-            void* agent = nullptr;
-            __try
-            {
-                if (Game::Rtti::Invoke(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, nullptr,
-                                       0, &player) &&
-                    player.instance)
-                {
-                    agent = FindAttitudeAgent(static_cast<const EntityLayout*>(player.instance));
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                agent = nullptr;
-            }
-            Game::Rtti::ReleaseHandle(&player);
-            if (agent)
-                Game::Rtti::ConstructHandle(&g_attitudeRuntime.playerAgent, agent);
-            g_attitudeRuntime.playerAgentResolvedAt = now;
         }
 
         if (shouldLog)
         {
             g_attitudePathLogTick = now;
-            Diagnostics::Log("attitude path: work=%zu playerAgent=%p", workCount,
-                             g_attitudeRuntime.playerAgent.instance);
+            Diagnostics::Log("attitude path: work=%zu phase2Enabled=%d", workCount,
+                             IsPhase2AttitudeEnabled() ? 1 : 0);
         }
-        // No player during loading screens and menus. Leave the cached values alone instead of flipping every
-        // tracked NPC back to Unknown.
-        if (!g_attitudeRuntime.playerAgent.instance)
-            return;
-
-        const std::int64_t invokeStart = Diagnostics::Profile::Now();
-        for (std::size_t i = 0; i < workCount; ++i)
-        {
-            workItems[i].hostility = ReadHostility(workItems[i].entity, g_attitudeRuntime.playerAgent);
-        }
-        Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
-                                     Diagnostics::Profile::Now() - invokeStart);
         PublishHostilityBatch(workItems.data(), workCount);
     }
 
@@ -2242,8 +2089,6 @@ namespace Game::EntityTracker
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_cleanupGeneration.store(0, std::memory_order_release);
-        Game::Rtti::ReleaseHandle(&g_attitudeRuntime.playerAgent);
-        g_attitudeRuntime.playerAgentResolvedAt = 0;
     }
 
     Stats GetStats()
@@ -2251,7 +2096,7 @@ namespace Game::EntityTracker
         Stats result;
         result.hookCreated = g_hookCreated.load(std::memory_order_acquire);
         result.unregisterHookCreated = g_unregisterHookCreated.load(std::memory_order_acquire);
-        result.attitudeRttiFailClosed = !IsPhase1AttitudeRttiEnabled();
+        result.attitudeRttiFailClosed = !IsPhase2AttitudeEnabled();
         result.registered = g_registered.load(std::memory_order_relaxed);
         result.registerCallbacks = g_registerCallbacks.load(std::memory_order_relaxed);
         result.registerThreadId = g_registerThread.lastThreadId.load(std::memory_order_relaxed);
@@ -2271,6 +2116,15 @@ namespace Game::EntityTracker
         result.attitudeValid = g_attitudeValid.load(std::memory_order_relaxed);
         result.attitudeInvalid = g_attitudeInvalid.load(std::memory_order_relaxed);
         result.attitudeFailClosedTicks = g_attitudeFailClosedTicks.load(std::memory_order_relaxed);
+        result.attitudeLookupAttempts = g_attitudeLookupAttempts.load(std::memory_order_relaxed);
+        result.attitudeSourceContractBlocked =
+            g_attitudeSourceContractBlocked.load(std::memory_order_relaxed);
+        result.attitudeLifetimeAcquisitionSuccess =
+            g_attitudeLifetimeAcquisitionSuccess.load(std::memory_order_relaxed);
+        result.attitudeExpiredOrInvalidReference =
+            g_attitudeExpiredOrInvalidReference.load(std::memory_order_relaxed);
+        result.attitudeAgentLookupSuccess = g_attitudeAgentLookupSuccess.load(std::memory_order_relaxed);
+        result.attitudeAgentLookupUnknown = g_attitudeAgentLookupUnknown.load(std::memory_order_relaxed);
         result.pendingPosition = g_pendingPosition.load(std::memory_order_relaxed);
         result.unregistered = g_unregisterCallbacks.load(std::memory_order_relaxed);
         result.unregisterThreadId = g_unregisterThread.lastThreadId.load(std::memory_order_relaxed);

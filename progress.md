@@ -2076,3 +2076,35 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   - 분석 보고서: `reports/2026-08-30_freeze_analysis_pid13248.md`
   - 아티팩트 디렉터리: `reports/artifacts/2026-08-30_freeze_pid13248/`
 
+## 2026-08-30 - Issue #1 Phase 1 라이브 검증 및 Phase 2 ownership 경계
+
+- Phase 1 진단 빌드를 라이브 게임 PID 30148에 09:56:10(KST) 주입하고 외부 watchdog을 시작했다.
+  10:31:11까지 프로세스 응답과 trainer heartbeat가 유지됐고 `cp2077_fatal.log` 크기는 84,663 byte에서
+  증가하지 않았다. 이 시점의 관측치는 Register 4,980회 중 main tick 밖 4,917회, Unregister 4,379회 중
+  main tick 밖 4,321회였다. 따라서 Unregister와 attitude lookup이 같은 스레드에서 직렬화된다는 Phase 3
+  전제는 실제 런타임에서 성립하지 않으며 generation/invalidation만으로는 check-after-free TOCTOU를 막지
+  못한다.
+- component entry 표본은 64 entity × 8 entry = 512개였고 `layoutRejects=0`, `nullInstance=0`,
+  `nullRefCount=0`이었다. 64개 entity 모두 8개를 넘는 component를 가져 표본이 bounded limit에서 잘렸다.
+  이 결과는 0x10-byte `{instance, RefCnt*}` 레이아웃과 일치하지만, source DynArray entry가 복사되는 동안
+  안정적이라는 증거는 아니다.
+- 공식 `WopsS/RED4ext.SDK`의 `Handle.hpp`/`SharedPtr.hpp`와 로컬 2.31 실행 파일을 대조해 ownership ABI를
+  재검증했다. strong copy는 atomic increment 뒤 2-word copy이며, final release는 `DecRef`가 0을 만든 뒤
+  `Handle_DecWeakRef`, `ISerializable::CanBeDestructed`, `Memory::Delete` 순서다. 로컬 helper RVA는 ctor
+  `0x1456C0`, DecWeakRef `0x1444F0`, CanBeDestructed wrapper `0xB80848`, destroy wrapper `0xB807F8`이다.
+  마지막 두 wrapper는 각각 handle의 `instance`를 꺼내 vtable `+0xD0` 호출, 동적 allocator 조회 → virtual
+  destructor → allocator Free를 수행하는 것을 독립 disassembly로 확인했다.
+- `rtti_invoker`에 stable source Handle 전용 `CopyHandle`과 정확한 final-owner 경로인
+  `ReleaseHandleExact`를 추가했다. 다만 entity component DynArray source entry가 다른 스레드에서 제거되는
+  동안 qword 두 개와 refcount를 안전하게 획득하는 계약은 아직 증명되지 않았다. 이 helper를 raw component
+  entry에 직접 적용하지 않으며 현재 attitude 코드에서는 호출하지 않는다.
+- 기존 raw `FindAttitudeAgent`/player-agent cache/RTTI invoke 경로를 제거하고
+  `TryResolveAttitudeAgentSafely` 하나로 Phase 2 ownership 경계를 만들었다. source contract compile gate는
+  닫혀 있어 component pointer, RTTI, Script VM 호출이 모두 불가능하며 결과는 `Hostility::Unknown`이다.
+  lookup/source-blocked/acquire/expired-or-invalid/agent-success/unknown 카운터를 분리했다. 본 모델 검토에서
+  gate 차단을 expired reference로 잘못 집계하던 부분, 미래에 gate가 열려도 fail-closed 초기화를 무조건
+  실행하던 부분, strong count 증가 overflow 경계를 수정했다.
+- `build-next` Release 빌드와 `git diff --check`가 통과했다. 라이브 Phase 1 DLL이 잠근 `build/bin/Release`
+  산출물은 건드리지 않았다. Phase 2는 release 쪽 계약과 lifetime-aware 경계/계측까지 완료했지만,
+  source acquisition proof가 없으므로 기능 활성화 단계로 판정하지 않는다.
+

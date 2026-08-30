@@ -79,9 +79,17 @@ namespace Game::Rtti
     std::size_t ClassSize(const Class* type);
     void* CreateInstance(Class* type);
     bool ConstructHandle(Handle* handle, void* instance);
+    // Copies a handle whose two-word source storage is owned by the caller for the whole operation. This is the
+    // SDK Handle copy-constructor operation (strong increment followed by the two-word copy); it is deliberately
+    // not a component-array accessor because an unretained DynArray entry can change between those operations.
+    bool CopyHandle(const Handle* source, Handle* destination);
     // Drops only a demonstrably non-final strong reference. The SDK's final Handle destructor also calls the
     // object's CanBeDestructed()/Memory::Delete path, whose ABI is not exposed here; final refs are retained.
     void ReleaseHandle(Handle* handle);
+    // Exact RED4ext Handle release for a handle obtained from a verified, stable source. The 2.31 helper ABI is
+    // resolved independently from the SDK relocations: DecWeakRef, CanBeDestructed, and Memory::Delete all take
+    // the same two-word Handle storage. Returns false without touching the handle when that contract is unavailable.
+    bool ReleaseHandleExact(Handle* handle);
     bool HasReturnValue(const Function* function);
 
     // Reflected parameter count, including optional and out parameters. Invoke() requires an exact match, so

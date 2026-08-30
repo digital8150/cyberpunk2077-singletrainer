@@ -15,6 +15,13 @@ namespace
     constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
     constexpr std::uint32_t kCClassCreateInstanceAddressHash = 0x5A800F1Du;
     constexpr std::uint32_t kHandleCtorAddressHash = 0xBA0C115Du;
+    // RED4ext 2.31 address-map entries for the exact Handle destructor helpers. These entries are unnamed in the
+    // map, so their ABI is pinned by the primary SDK source plus the matching executable disassembly: image RVA
+    // 0xB80848 calls ISerializable::CanBeDestructed (vtable +0xD0), and image RVA 0xB807F8 performs
+    // Memory::Delete (GetAllocator, virtual destructor, allocator Free). Both helpers take Handle* storage.
+    constexpr std::uint32_t kHandleCanBeDestructedAddressHash = 766120943u;
+    constexpr std::uint32_t kHandleDestroyAddressHash = 4071502685u;
+    constexpr std::uint32_t kHandleDecWeakRefAddressHash = 0x333B1404u;
     constexpr std::uint8_t kParamOpcode = 27;
     constexpr std::uint8_t kParamEndOpcode = 38;
 
@@ -96,7 +103,17 @@ namespace
     // CClass::CreateInstance is the RED4ext SDK three-argument relocation: (class, size, zeroMemory).
     using CClassCreateInstanceFn = void* (*)(ClassLayout*, std::uint32_t, bool);
     using HandleCtorFn = void (*)(Game::Rtti::Handle*, void*);
+    using HandleDecWeakRefFn = void (*)(Game::Rtti::Handle*);
+    using HandleCanBeDestructedFn = bool (*)(Game::Rtti::Handle*);
+    using HandleDestroyFn = void (*)(Game::Rtti::Handle*);
     using CNamePoolGetFn = const char* (*)(const std::uint64_t&);
+
+    struct RefCountLayout
+    {
+        volatile LONG strong;
+        volatile LONG weak;
+    };
+    static_assert(sizeof(RefCountLayout) == 0x8);
 
     void* VirtualFunction(void* object, std::size_t index)
     {
@@ -400,6 +417,37 @@ namespace Game::Rtti
         }
     }
 
+    bool CopyHandle(const Handle* source, Handle* destination)
+    {
+        // The caller must own the source Handle storage for this entire operation. In particular, this is not safe
+        // for a raw pointer into an entity's concurrently mutating DynArray: reading qword1 and incrementing it
+        // cannot be made atomic with an engine-side erase of that entry.
+        if (!source || !destination || source == destination || destination->instance || destination->refCount)
+            return false;
+
+        const void* instance = source->instance;
+        void* refCount = source->refCount;
+        if (!IsValidUserPointer(instance) || !IsValidUserPointer(refCount))
+            return false;
+
+        auto* refs = static_cast<RefCountLayout*>(refCount);
+        LONG observed = InterlockedCompareExchange(&refs->strong, 0, 0);
+        while (observed > 0 && observed < (std::numeric_limits<LONG>::max)())
+        {
+            const LONG previous = InterlockedCompareExchange(&refs->strong, observed + 1, observed);
+            if (previous == observed)
+            {
+                // This is the SDK CopyConstructFrom sequence (strong increment, then the two-word copy), with an
+                // additional zero-count check so a caller cannot resurrect an expired source accidentally.
+                destination->instance = const_cast<void*>(instance);
+                destination->refCount = refCount;
+                return true;
+            }
+            observed = previous;
+        }
+        return false;
+    }
+
     void ReleaseHandle(Handle* handle)
     {
         if (!handle || !handle->refCount)
@@ -433,6 +481,58 @@ namespace Game::Rtti
         {
         }
         *handle = {};
+    }
+
+    bool ReleaseHandleExact(Handle* handle)
+    {
+        if (!handle)
+            return false;
+        if (!handle->instance && !handle->refCount)
+            return true;
+        if (!IsValidUserPointer(handle->instance) || !IsValidUserPointer(handle->refCount))
+            return false;
+
+        ResolveAddressFn resolve = ResolveAddress();
+        if (!resolve)
+            return false;
+
+        const std::uintptr_t decWeakAddress = resolve(kHandleDecWeakRefAddressHash);
+        const std::uintptr_t canBeDestructedAddress = resolve(kHandleCanBeDestructedAddressHash);
+        const std::uintptr_t destroyAddress = resolve(kHandleDestroyAddressHash);
+        if (!decWeakAddress || !canBeDestructedAddress || !destroyAddress)
+            return false;
+
+        // RefCnt::DecRef() is an atomic decrement that must not underflow. A valid Handle owns one of the strong
+        // references, so the CAS loop is equivalent to the SDK's InterlockedExchangeAdd while rejecting an expired
+        // or corrupt handle before touching its count.
+        auto* refs = static_cast<RefCountLayout*>(handle->refCount);
+        LONG observed = InterlockedCompareExchange(&refs->strong, 0, 0);
+        while (observed > 0)
+        {
+            const LONG previous = InterlockedCompareExchange(&refs->strong, observed - 1, observed);
+            if (previous == observed)
+                break;
+            observed = previous;
+        }
+        if (observed <= 0)
+            return false;
+
+        if (observed != 1)
+        {
+            *handle = {};
+            return true;
+        }
+
+        // Exact SDK Handle::~Handle order: final strong release drops the weak owner first, then asks the object
+        // whether destruction is allowed, and finally runs Memory::Delete. The two unnamed 2.31 helpers were
+        // matched to their map entries and disassembled independently; no destructor ABI is inferred here.
+        reinterpret_cast<HandleDecWeakRefFn>(decWeakAddress)(handle);
+        const bool canBeDestructed =
+            reinterpret_cast<HandleCanBeDestructedFn>(canBeDestructedAddress)(handle);
+        if (canBeDestructed)
+            reinterpret_cast<HandleDestroyFn>(destroyAddress)(handle);
+        *handle = {};
+        return true;
     }
 
     bool HasReturnValue(const Function* opaqueFunction)

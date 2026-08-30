@@ -49,6 +49,14 @@ namespace Game::EntityTracker
         std::uint64_t attitudeValid = 0;
         std::uint64_t attitudeInvalid = 0;
         std::uint64_t attitudeFailClosedTicks = 0;
+        // Phase 2 attitude ownership diagnostics. These remain zero for acquisition success while the source
+        // entry contract is gated; unknown counts include candidates deliberately rejected by that gate.
+        std::uint64_t attitudeLookupAttempts = 0;
+        std::uint64_t attitudeSourceContractBlocked = 0;
+        std::uint64_t attitudeLifetimeAcquisitionSuccess = 0;
+        std::uint64_t attitudeExpiredOrInvalidReference = 0;
+        std::uint64_t attitudeAgentLookupSuccess = 0;
+        std::uint64_t attitudeAgentLookupUnknown = 0;
         std::uint64_t pendingPosition = 0;
         // Observed UnregisterEntity calls are zero when the proven 2.31 observer is unavailable; stale
         // identity/transform validation remains authoritative cleanup and is reported separately by staleRemoved.
