@@ -1935,6 +1935,44 @@ NPC가 있다).
   - `src/game/entity_tracker.cpp`: `ForEachComponent`에서 엔티티/컴포넌트 엔트리/컴포넌트 인스턴스 포인터의 유효 범위를 선행 검사하도록 강화하고, 중복/불안전했던 로컬 `IsClassOrDerived`를 제거하고 `IsCorpseDead`가 안전한 `Game::Rtti`를 경유하도록 수정.
   - Release 빌드 정상 통과 (`cp2077_trainer.dll`).
 
+## 2026-08-30 - Issue #1 수명 원인 재검수 + 단계 패치 Phase 1 진단 빌드
+
+- `gh issue view 1 --comments`로 열린 프리징 이슈와 PID 29324/PID 13248 증거를 현재 코드에 다시 대조했다.
+  두 사고 모두 게임 메인 틱의 `ProcessAttitudeOnMainTick -> FindAttitudeAgent -> NativeType/
+  IsClassOrDerived`에서 발생했고, canonical 주소 범위 검사와 SEH는 readable freed/reused object의 수명을
+  보장하지 못한다. 따라서 예외 억제가 아니라 component ownership contract를 먼저 증명한다는 해결 순서는
+  유효하다고 판정했다. PID 13248 포인터가 정확히 UAF였다는 단정은 유지하지 않고 stale/freed/reused/
+  corrupted/transient candidate 범주로 둔다.
+- 공식 `wopss/RED4ext.SDK`의 `entEntity.hpp`, `Handle.hpp`, `SharedPtr.hpp`를 대조해 `ent::Entity+0xA0`이
+  `DynArray<Handle<IComponent>>`이고, 0x10-byte entry가 `instance + RefCnt*`이며 Handle 복사가 strong ref를
+  증가시킨다는 것을 확인했다. 기존 `CollectComponents`는 첫 qword만 복사하므로 RTTI 호출 범위까지 이
+  ownership을 운반하지 않는다. 이 정적 근거로 이슈의 Phase 1B 가설을 확인했지만, 실제 retain/release는
+  Phase 2 전까지 구현하지 않는다.
+- 로컬 Cyberpunk 2077 2.31 실행 파일과 주소 맵을 독립 역어셈블해 RuntimeEntityRegistry 제거 루틴을
+  확인했다. 주소 맵 hash `3878623943`, section-1 offset `0x8B4310`, image RVA `0x8B5310`이며 signature는
+  `.text`에서 1회만 존재한다. 함수는 `(RCX=registry, RDX=entity*)`를 보존하고 `entity+0x48` ID를
+  `registry+0x50`에서 제거한 뒤 Register와 공유하는 notifier를 반대 모드(`R8B=0`)로 호출하고 `AL`을
+  반환한다. 직접 xref `0x8B5123`, `0x1EBFBA6`도 같은 인자 구성을 사용한다. Register 함수 역시 `AL`을
+  반환하므로 기존 `void` trampoline 형식을 `bool` 반환으로 바로잡았다.
+- `src/game/entity_tracker.cpp/.h`에 Phase 1 observer를 구현했다. 실행 중에는 고유 signature와 RED4ext
+  resolver가 모두 주소를 제공할 경우 서로 일치해야 제거 훅을 설치하며, 불일치/미지원/MinHook 실패 시
+  추정 훅을 만들지 않고 Register 추적만 유지한다. 제거 detour는 원본 전 entity ID와 tracked 여부를
+  non-blocking try-lock으로 관측하고, 자체 lock을 모두 놓은 뒤 원본을 정확히 한 번 호출하며, 원본 뒤에는
+  entity를 역참조하지 않는다. 이 훅은 정리 권한을 갖지 않으며 기존 stale validation이 authoritative다.
+- Register/Unregister/OnGameMainTick TID, thread 변화, main-tick affinity, 제거 직전 tracked 상태 및 마지막
+  entity identity를 bounded atomic/cadence 진단으로 추가했다. component handle 샘플은 첫 64개 등록 entity,
+  entity당 8 entry로 제한하고 qword0/qword1만 기록한다. `RefCnt*`의 독립 수명이 아직 증명되지 않았으므로
+  strong/weak count는 역참조하지 않는다.
+- 알려진 위험 경로는 Phase 1 동안 fail-closed했다. `ProcessAttitudeOnMainTick`, resolver,
+  `FindAttitudeAgent`, `ReadHostility`가 raw component RTTI/`GetAttitudeTowards`에 진입하지 않으며 기존 hostility
+  캐시는 한 번 `Unknown`으로 정리된다. health/native highlight/일반 entity snapshot은 계속 동작한다. 이는
+  기능 수정 완료가 아니라 진단 중 재프리즈를 막는 임시 안전 게이트다.
+- 본 모델이 주소 맵 엔트리, 함수/공유 notifier/두 caller 역어셈블과 signature 유일성을 재검증하고 Luna
+  구현을 리뷰했다. 선택적 제거 훅 생성 실패가 Register 추적까지 제거하던 경로를 fail-open으로 수정하고,
+  ID 판독 실패와 tracked-table try-lock 실패 카운터를 분리했으며 occupancy bitmap으로 제거 관측 스캔을
+  줄였다. Release 빌드와 `git diff --check` 통과, 컴파일 경고 없음. 현재 게임 프로세스가 없어 주입/라이브
+  로그 검증은 대기 중이며, 이 빌드만으로 Issue #1을 닫거나 Phase 2 lifetime fix가 끝났다고 보지 않는다.
+
 
 
 ## 2026-08-30 - PID 29324 프리징 수정 검토 + SEH 범위 축소 + 다음 최적화 계획

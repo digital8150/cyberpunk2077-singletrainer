@@ -18,9 +18,12 @@
 
 namespace
 {
-    // RED4ext/CET verified address hash for world::RuntimeEntityRegistry::RegisterEntity.
-    // The UnregisterEntity hash is intentionally not hooked: its native ABI is not verified.
+    // RED4ext/CET address hash for world::RuntimeEntityRegistry::RegisterEntity. The local 2.31 address map names
+    // this entry but does not name an UnregisterEntity symbol. Its complete function table does contain one unique,
+    // unnamed entry at section-1 offset 0x8B4310 (image RVA 0x8B5310), hash 3878623943. The disassembly/xrefs below
+    // independently prove that entry as the entity-removal routine before it is used as an optional observer hook.
     constexpr std::uint32_t kRegisterEntityAddressHash = 2840271332u;
+    constexpr std::uint32_t kRuntimeEntityRegistryRemovalAddressHash = 3878623943u;
     constexpr std::uint32_t kCClassGetPropertyAddressHash = 0x8F031512u;
     constexpr std::uint32_t kVisionModeSetBraindanceModeAddressHash = 1070077985u;
 
@@ -28,9 +31,25 @@ namespace
     constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
     constexpr std::size_t kEntRenderHighlightEventSize = 0x58;
     constexpr std::size_t kMaxLeakedHighlightEvents = 4096;
+    constexpr std::size_t kComponentHandleSize = 0x10;
+    constexpr std::size_t kComponentHandleSampleLimit = 8;
+    constexpr std::size_t kComponentHandleSampleEntityLimit = 64;
+    constexpr std::size_t kComponentDetailLogLimit = 8;
+    constexpr ULONGLONG kPhase1SummaryIntervalMilliseconds = 3000;
+
+    // Phase 1 deliberately leaves the raw attitude-component RTTI path disabled. This compile-time gate is kept
+    // closed until Phase 2 supplies a lifetime-bearing component access mechanism; the runtime gate is also closed
+    // so a stale binary/configuration cannot accidentally re-enable the path.
+    constexpr bool kPhase1AttitudeRttiCompileGate = false;
+    static_assert(!kPhase1AttitudeRttiCompileGate, "Phase 1 attitude RTTI must remain fail-closed");
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
+    // Cyberpunk 2077 2.31 / file version 3.0.5294808: the unique RegisterEntity signature below starts at image RVA
+    // 0x8B57F4
+    // (the address map stores section-1 offset 0x8B47F4 plus its 0x1000 code-constant offset). Its first body
+    // instructions move RCX to RSI, RDX to RDI, and read [RDI+0x48], proving the x64 RegisterEntity ABI used here:
+    // (registry=this, entity).
     constexpr std::uint8_t kRegisterEntityPattern[] = {
         0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18,
         0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x60,
@@ -39,6 +58,23 @@ namespace
     };
     constexpr char kRegisterEntityMask[] = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxx";
     static_assert(sizeof(kRegisterEntityPattern) == sizeof(kRegisterEntityMask) - 1);
+
+    // The local address-map hash 3878623943 resolves to image RVA 0x8B5310 (section-1 offset 0x8B4310). Its .pdata
+    // range is [0x8B5310, 0x8B5380): RCX/RDX are saved as registry/entity, [entity+0x48] is passed as the erase
+    // key to registry+0x50, the erase-success byte is returned in AL, and the shared notifier at 0x8B58A8 receives
+    // R8B=0. The same notifier receives R8B=1 from RegisterEntity at 0x8B57F4. Direct xrefs at RVAs 0x8B5123 and
+    // 0x1EBFBA6 pass the same registry/entity
+    // pair; no EntityID-only call target was found. This signature is a fallback when RED4ext is unavailable and is
+    // unique in the local 2.31 .text section; it is not inferred from adjacency.
+    constexpr std::uint8_t kRuntimeEntityRegistryRemovalPattern[] = {
+        0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20,
+        0x57, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0xE9, 0x48, 0x8B, 0xF2, 0x48, 0x83, 0xC1, 0x48,
+        0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x46, 0x48, 0x48, 0x8D, 0x4D, 0x50, 0x4C, 0x8D,
+        0x44, 0x24, 0x50,
+    };
+    constexpr char kRuntimeEntityRegistryRemovalMask[] =
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxx";
+    static_assert(sizeof(kRuntimeEntityRegistryRemovalPattern) == sizeof(kRuntimeEntityRegistryRemovalMask) - 1);
 
     constexpr std::uint64_t Fnv1a64(const char* text)
     {
@@ -67,6 +103,18 @@ namespace
         std::uint32_t size;
     };
     static_assert(sizeof(DynArrayLayout) == 0x10);
+
+    // RED4ext.SDK entEntity.hpp (wopss/RED4ext.SDK) declares components as DynArray<Handle<IComponent>> at 0xA0.
+    // Handle/SharedPtrBase is two pointers: qword0=instance and qword1=RefCnt*. RefCnt's strongRefs/weakRefs are
+    // at offsets 0/4, but Phase 1 does not dereference qword1 because its independent liveness is not proven.
+    struct ComponentHandleLayout
+    {
+        void* instance;
+        void* refCount;
+    };
+    static_assert(sizeof(ComponentHandleLayout) == kComponentHandleSize);
+    static_assert(offsetof(ComponentHandleLayout, instance) == 0x00);
+    static_assert(offsetof(ComponentHandleLayout, refCount) == 0x08);
 
     struct PropertyLayout
     {
@@ -181,12 +229,35 @@ namespace
     constexpr std::size_t kReservedHighlightClearEvents = kMaxTrackedPuppets;
     static_assert(kReservedHighlightClearEvents < kMaxLeakedHighlightEvents);
 
-    using RegisterEntityFn = void (*)(void* registry, EntityLayout* entity);
+    using RegisterEntityFn = bool (*)(void* registry, EntityLayout* entity);
+    using UnregisterEntityFn = bool (*)(void* registry, EntityLayout* entity);
     using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
     RegisterEntityFn g_originalRegisterEntity = nullptr;
+    UnregisterEntityFn g_originalUnregisterEntity = nullptr;
 
     std::atomic_bool g_hookCreated{false};
+    std::atomic_bool g_unregisterHookCreated{false};
+    std::atomic_bool g_attitudeRttiRuntimeGate{false};
+    std::atomic_bool g_attitudeFailClosedLogged{false};
+    std::atomic_bool g_attitudeFailClosedStateCleared{false};
+    std::atomic_bool g_unregisterDiagnosticLogged{false};
     std::atomic<void*> g_registry{nullptr};
+    std::atomic_uint64_t g_registerCallbacks{0};
+    std::atomic_uint64_t g_registerThreadAffinityMatches{0};
+    std::atomic_uint64_t g_registerThreadAffinityMismatches{0};
+    std::atomic_uint64_t g_unregisterCallbacks{0};
+    std::atomic_uint64_t g_unregisterThreadAffinityMatches{0};
+    std::atomic_uint64_t g_unregisterThreadAffinityMismatches{0};
+    std::atomic_uint64_t g_unregisterTracked{0};
+    std::atomic_uint64_t g_unregisterUntracked{0};
+    std::atomic_uint64_t g_unregisterTrackingUnknown{0};
+    std::atomic_uint64_t g_unregisterWithoutIdentity{0};
+    std::atomic_uint64_t g_lastRegisteredEntityAddress{0};
+    std::atomic_uint64_t g_lastRegisteredEntityId{0};
+    std::atomic_uint64_t g_lastUnregisteredEntityAddress{0};
+    std::atomic_uint64_t g_lastUnregisteredEntityId{0};
+    std::atomic_bool g_lastUnregisteredTrackingKnown{false};
+    std::atomic_bool g_lastUnregisteredTracked{false};
     std::atomic_uint64_t g_registered{0};
     std::atomic_uint64_t g_positioned{0};
     std::atomic_uint64_t g_puppets{0};
@@ -197,6 +268,7 @@ namespace
     std::atomic_uint64_t g_trackedHostile{0};
     std::atomic_uint64_t g_attitudeValid{0};
     std::atomic_uint64_t g_attitudeInvalid{0};
+    std::atomic_uint64_t g_attitudeFailClosedTicks{0};
     std::atomic_uint64_t g_pendingPosition{0};
     std::atomic_uint64_t g_staleRemoved{0};
     std::atomic_uint64_t g_healthValid{0};
@@ -204,6 +276,31 @@ namespace
     std::atomic_uint64_t g_nativeHighlightQueued{0};
     std::atomic_uint64_t g_nativeHighlightCleared{0};
     std::atomic_uint64_t g_nativeHighlightFailures{0};
+    std::atomic_uint64_t g_componentHandleSampleEntities{0};
+    std::atomic_uint64_t g_componentHandleSampleOrdinal{0};
+    std::atomic_uint64_t g_componentHandleSamplingSkipped{0};
+    std::atomic_uint64_t g_componentHandleSamples{0};
+    std::atomic_uint64_t g_componentHandleLayoutRejects{0};
+    std::atomic_uint64_t g_componentHandleNullInstances{0};
+    std::atomic_uint64_t g_componentHandleNullRefCounts{0};
+    std::atomic_uint64_t g_componentHandleTruncated{0};
+    std::atomic_uint64_t g_componentHandleDetailLogs{0};
+    std::atomic_uint64_t g_mainTickCalls{0};
+
+    struct ThreadObservation
+    {
+        // firstThreadId is the stable affinity baseline; lastThreadId remains mutable so thread migrations are
+        // visible in the diagnostics without changing the baseline used by per-callback comparisons.
+        std::atomic_uint64_t firstThreadId{0};
+        std::atomic_uint64_t lastThreadId{0};
+        std::atomic_uint64_t changes{0};
+        std::atomic_uint64_t changeLogs{0};
+    };
+    ThreadObservation g_registerThread;
+    ThreadObservation g_unregisterThread;
+    ThreadObservation g_mainTickThread;
+
+    std::atomic_uint64_t g_phase1SummaryTick{0};
     SRWLOCK g_lastEntityLock = SRWLOCK_INIT;
     std::uint64_t g_lastEntityId = 0;
     float g_lastPosition[3]{};
@@ -233,6 +330,121 @@ namespace
     {
         return (g_puppetOccupancy[slot / 64] & (1ull << (slot % 64))) != 0;
     }
+
+    bool IsPhase1AttitudeRttiEnabled() noexcept
+    {
+        return kPhase1AttitudeRttiCompileGate && g_attitudeRttiRuntimeGate.load(std::memory_order_acquire);
+    }
+
+    std::uint64_t ObserveThread(ThreadObservation& observation, const char* path)
+    {
+        const std::uint64_t current = static_cast<std::uint64_t>(GetCurrentThreadId());
+        std::uint64_t first = observation.firstThreadId.load(std::memory_order_acquire);
+        if (first == 0 &&
+            observation.firstThreadId.compare_exchange_strong(first, current, std::memory_order_release,
+                                                              std::memory_order_relaxed))
+        {
+            Diagnostics::Log("phase1 lifecycle thread first: path=%s tid=%llu", path,
+                             static_cast<unsigned long long>(current));
+        }
+
+        std::uint64_t previous = observation.lastThreadId.load(std::memory_order_relaxed);
+        if (previous == current)
+            return current;
+
+        if (previous == 0 && observation.lastThreadId.compare_exchange_strong(previous, current,
+                                                                                std::memory_order_release,
+                                                                                std::memory_order_relaxed))
+        {
+            return current;
+        }
+
+        if (previous == current)
+            return current;
+        if (!observation.lastThreadId.compare_exchange_strong(previous, current, std::memory_order_release,
+                                                              std::memory_order_relaxed))
+            return current;
+
+        const std::uint64_t changes = observation.changes.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::uint64_t logIndex = observation.changeLogs.fetch_add(1, std::memory_order_relaxed);
+        if (logIndex < kComponentDetailLogLimit)
+        {
+            Diagnostics::Log("phase1 lifecycle thread changed: path=%s oldTid=%llu newTid=%llu changes=%llu", path,
+                             static_cast<unsigned long long>(previous), static_cast<unsigned long long>(current),
+                             static_cast<unsigned long long>(changes));
+        }
+        else if (logIndex == kComponentDetailLogLimit)
+        {
+            Diagnostics::Log("phase1 lifecycle thread changed: path=%s further changes summarized", path);
+        }
+        return current;
+    }
+
+    void ObserveThreadAffinity(std::uint64_t currentThread, std::atomic_uint64_t& matches,
+                               std::atomic_uint64_t& mismatches)
+    {
+        // Compare this callback's captured TID against the first observed main-tick TID. A mutable last-register
+        // value would let another concurrent callback overwrite the identity being classified.
+        const std::uint64_t mainTickThread = g_mainTickThread.firstThreadId.load(std::memory_order_acquire);
+        if (currentThread == 0 || mainTickThread == 0)
+            return;
+        if (currentThread == mainTickThread)
+            matches.fetch_add(1, std::memory_order_relaxed);
+        else
+            mismatches.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void MaybeLogPhase1Summary()
+    {
+        const ULONGLONG now = GetTickCount64();
+        std::uint64_t previous = g_phase1SummaryTick.load(std::memory_order_relaxed);
+        if (previous != 0 && now - previous < kPhase1SummaryIntervalMilliseconds)
+            return;
+        if (!g_phase1SummaryTick.compare_exchange_strong(previous, now, std::memory_order_relaxed,
+                                                          std::memory_order_relaxed))
+            return;
+
+        Diagnostics::Log(
+            "phase1 lifetime summary: registerCallbacks=%llu registered=%llu registerTid=%llu registerChanges=%llu "
+            "registerOnMain=%llu registerOffMain=%llu mainTickCalls=%llu mainTickTid=%llu mainTickChanges=%llu "
+            "unregisterCalls=%llu unregisterTid=%llu unregisterChanges=%llu unregisterOnMain=%llu "
+            "unregisterOffMain=%llu unregisterTracked=%llu unregisterUntracked=%llu unregisterTrackingUnknown=%llu "
+            "unregisterNoId=%llu "
+            "lastRegister=(%p,0x%llX) lastUnregister=(%p,0x%llX) unregisterHook=%d "
+            "componentEntities=%llu componentSkipped=%llu componentSamples=%llu layoutRejects=%llu "
+            "nullInstance=%llu nullRefCount=%llu truncated=%llu attitudeFailClosed=1",
+            static_cast<unsigned long long>(g_registerCallbacks.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_registered.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_registerThread.lastThreadId.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_registerThread.changes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_registerThreadAffinityMatches.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_registerThreadAffinityMismatches.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_mainTickCalls.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_mainTickThread.firstThreadId.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_mainTickThread.changes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterCallbacks.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterThread.lastThreadId.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterThread.changes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterThreadAffinityMatches.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterThreadAffinityMismatches.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterTracked.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterUntracked.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterTrackingUnknown.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_unregisterWithoutIdentity.load(std::memory_order_relaxed)),
+            reinterpret_cast<void*>(g_lastRegisteredEntityAddress.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_lastRegisteredEntityId.load(std::memory_order_relaxed)),
+            reinterpret_cast<void*>(g_lastUnregisteredEntityAddress.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_lastUnregisteredEntityId.load(std::memory_order_relaxed)),
+            g_unregisterHookCreated.load(std::memory_order_relaxed) ? 1 : 0,
+            static_cast<unsigned long long>(g_componentHandleSampleEntities.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleSamplingSkipped.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleSamples.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleLayoutRejects.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleNullInstances.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleNullRefCounts.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(g_componentHandleTruncated.load(std::memory_order_relaxed)));
+    }
+
     std::uint64_t g_puppetSequence = 0;
     ClassificationLayout g_classificationLayout;
     using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
@@ -502,6 +714,103 @@ namespace
     }
 
     constexpr std::uint32_t kMaxComponentsPerEntity = 512;
+
+    bool IsBoundedUserRange(std::uintptr_t address, std::size_t byteCount) noexcept
+    {
+        constexpr std::uintptr_t kMinUserAddress = 0x10000ull;
+        constexpr std::uintptr_t kMaxUserAddress = 0x00007FFFFFFEFFFFull;
+        return address >= kMinUserAddress && address <= kMaxUserAddress && byteCount <= kMaxUserAddress - address;
+    }
+
+    // This is an observation made immediately after RegisterEntity returns, while the registration argument is
+    // still owned by the engine. It intentionally does not copy Handle values, call a Handle constructor, mutate
+    // refcounts, dereference qword1, or use SEH/VirtualQuery as a lifetime test. qword1 counts are deferred until a
+    // separately proven-live RefCnt source exists.
+    void SampleComponentHandles(const EntityLayout* entity, std::uint64_t entityId)
+    {
+        if (!entity)
+            return;
+
+        const std::uint64_t sampleOrdinal =
+            g_componentHandleSampleOrdinal.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (sampleOrdinal > kComponentHandleSampleEntityLimit)
+        {
+            const std::uint64_t skipped =
+                g_componentHandleSamplingSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (sampleOrdinal == kComponentHandleSampleEntityLimit + 1)
+            {
+                Diagnostics::Log("phase1 component handle sampling cap reached: entities=%zu; later registrations "
+                                 "skip component-array reads",
+                                 kComponentHandleSampleEntityLimit);
+            }
+            if ((skipped & 0xFFu) == 0)
+                MaybeLogPhase1Summary();
+            return;
+        }
+
+        const std::uint64_t sampleEntity =
+            g_componentHandleSampleEntities.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::byte* entries = entity->components.entries;
+        const std::uint32_t capacity = entity->components.capacity;
+        const std::uint32_t size = entity->components.size;
+        if (sampleEntity == 1)
+        {
+            Diagnostics::Log("phase1 component layout sample: entity=%p id=0x%llX entries=%p size=%u capacity=%u",
+                             entity, static_cast<unsigned long long>(entityId), entries, size, capacity);
+        }
+
+        if (size == 0)
+        {
+            if (capacity > kMaxComponentsPerEntity)
+                g_componentHandleLayoutRejects.fetch_add(1, std::memory_order_relaxed);
+            if ((sampleEntity & 0xFFu) == 0)
+                MaybeLogPhase1Summary();
+            return;
+        }
+
+        const std::size_t sampleCount = (std::min)(static_cast<std::size_t>(size), kComponentHandleSampleLimit);
+        const std::size_t byteCount = sampleCount * kComponentHandleSize;
+        if (!entries || size > capacity || capacity > kMaxComponentsPerEntity ||
+            !IsBoundedUserRange(reinterpret_cast<std::uintptr_t>(entries), byteCount))
+        {
+            g_componentHandleLayoutRejects.fetch_add(1, std::memory_order_relaxed);
+            if ((sampleEntity & 0xFFu) == 0)
+                MaybeLogPhase1Summary();
+            return;
+        }
+
+        if (size > sampleCount)
+            g_componentHandleTruncated.fetch_add(1, std::memory_order_relaxed);
+
+        for (std::size_t index = 0; index < sampleCount; ++index)
+        {
+            const std::uintptr_t handleAddress = reinterpret_cast<std::uintptr_t>(entries) +
+                                                 index * kComponentHandleSize;
+            const auto* handle = reinterpret_cast<const ComponentHandleLayout*>(handleAddress);
+            const void* instance = handle->instance;
+            const void* refCount = handle->refCount;
+            g_componentHandleSamples.fetch_add(1, std::memory_order_relaxed);
+            if (!instance)
+                g_componentHandleNullInstances.fetch_add(1, std::memory_order_relaxed);
+            if (!refCount)
+                g_componentHandleNullRefCounts.fetch_add(1, std::memory_order_relaxed);
+
+            const std::uint64_t detailIndex = g_componentHandleDetailLogs.fetch_add(1, std::memory_order_relaxed);
+            if (detailIndex < kComponentDetailLogLimit)
+            {
+                Diagnostics::Log("phase1 component handle: entity=%p id=0x%llX index=%zu instance=%p "
+                                 "refCount=%p strongRefs=deferred weakRefs=deferred",
+                                 entity, static_cast<unsigned long long>(entityId), index, instance, refCount);
+            }
+            else if (detailIndex == kComponentDetailLogLimit)
+            {
+                Diagnostics::Log("phase1 component handle: detail log cap reached; later entries summarized");
+            }
+        }
+
+        if ((sampleEntity & 0xFFu) == 0)
+            MaybeLogPhase1Summary();
+    }
 
     // 컴포넌트 포인터를 한 번에 걷어 온다. 여기서 읽는 것은 전부 게임 소유 메모리라 스트리밍 중에
     // 사라질 수 있어 SEH로 감싼다. 중간에 폴트가 나면 그때까지 모은 것만 쓴다.
@@ -851,6 +1160,9 @@ namespace
             // g_lastEntityLock permanently now that this body is inside __except, and GetStats would then block
             // forever on it. Nothing under the lock touches game memory.
             const std::uint64_t entityId = entity->entityId;
+            g_lastRegisteredEntityAddress.store(reinterpret_cast<std::uint64_t>(entity), std::memory_order_relaxed);
+            g_lastRegisteredEntityId.store(entityId, std::memory_order_relaxed);
+            SampleComponentHandles(entity, entityId);
 
             AcquireSRWLockExclusive(&g_lastEntityLock);
             g_lastEntityId = entityId;
@@ -1356,12 +1668,40 @@ namespace
     };
     AttitudeRuntime g_attitudeRuntime;
 
-    // GetAttitudeAgent is a scripted function. Running script bytecode from the main-tick detour at per-NPC rates
-    // hung the game, so the agent is located as a plain component instead: the attitude agent is an ordinary
-    // entity component, and finding it is pure memory reads. Only GetAttitudeTowards, which is native, is still
-    // invoked.
+    void ApplyAttitudeFailClosed()
+    {
+        const std::uint64_t blocked = g_attitudeFailClosedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!g_attitudeFailClosedLogged.exchange(true, std::memory_order_acq_rel))
+        {
+            Diagnostics::Log("PHASE1 FAIL-CLOSED: attitude RTTI disabled; raw component walk and "
+                             "GetAttitudeTowards Invoke skipped; hostility remains Unknown");
+        }
+
+        if (!g_attitudeFailClosedStateCleared.exchange(true, std::memory_order_acq_rel))
+        {
+            AcquireSRWLockExclusive(&g_puppetListLock);
+            for (TrackedPuppet& tracked : g_puppetList)
+            {
+                if (!tracked.entity)
+                    continue;
+                tracked.hostility = Game::EntityTracker::Hostility::Unknown;
+                tracked.hostilityUpdatedAt = 0;
+            }
+            ReleaseSRWLockExclusive(&g_puppetListLock);
+        }
+
+        if ((blocked & 0xFFu) == 0)
+            MaybeLogPhase1Summary();
+    }
+
+    // Phase 1 keeps the entire attitude path fail-closed. The implementation below remains compiled for a later
+    // lifetime-bearing replacement, but FindAttitudeAgent/ReadHostility/ResolveAttitudeOnMainTick all reject entry
+    // while the compile-time and runtime gates are closed; no raw component walk or attitude RTTI call executes.
     void* FindAttitudeAgent(const EntityLayout* entity)
     {
+        if (!IsPhase1AttitudeRttiEnabled())
+            return nullptr;
+
         constexpr std::uint64_t agentName = Fnv1a64("gameAttitudeAgent");
         void* found = nullptr;
         ForEachComponent(entity, [&](std::byte* component) {
@@ -1404,6 +1744,9 @@ namespace
 
     bool ResolveAttitudeOnMainTick()
     {
+        if (!IsPhase1AttitudeRttiEnabled())
+            return false;
+
         if (g_attitudeRuntime.playerSystem && g_attitudeRuntime.getLocalPlayer &&
             g_attitudeRuntime.getAttitudeTowards)
             return true;
@@ -1460,15 +1803,15 @@ namespace
         return resolved;
     }
 
-    // The gameAttitudeAgent component is deliberately NOT cached across ticks. Phase 5 did cache it, and that
-    // is what froze the game: the component belongs to the NPC, so it is freed when the NPC streams out, and the
-    // stale pointer was still being passed to a reflected VM call as `this`. Once that memory is recycled into
-    // another object the pointer is readable, so the __try below never fires - the call simply lands on the wrong
-    // object and corrupts it. Re-resolving per pass costs one component walk and is the only safe option without
-    // a liveness signal for the component itself.
+    // Historical implementation retained for Phase 2 review only. Phase 1 never enters it: a component's strong
+    // Handle lifetime is not yet carried into this work item, so the fail-closed gate above returns Unknown before
+    // any raw component walk or reflected invocation can occur.
     Game::EntityTracker::Hostility ReadHostility(const EntityLayout* entity, Game::Rtti::Handle& playerAgent)
     {
         using Game::EntityTracker::Hostility;
+        if (!IsPhase1AttitudeRttiEnabled())
+            return Hostility::Unknown;
+
         std::int32_t attitude = -1;
         bool called = false;
         __try
@@ -1533,6 +1876,12 @@ namespace
 
     void ProcessAttitudeOnMainTick()
     {
+        if (!IsPhase1AttitudeRttiEnabled())
+        {
+            ApplyAttitudeFailClosed();
+            return;
+        }
+
         // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second and a
         // tick never spends more than a handful of reflected calls on it.
         constexpr std::size_t kAttitudePerTick = 4;
@@ -1624,10 +1973,96 @@ namespace
         PublishHostilityBatch(workItems.data(), workCount);
     }
 
-    void HookRegisterEntity(void* registry, EntityLayout* entity)
+    bool TryReadEntityIdBeforeRemoval(const EntityLayout* entity, std::uint64_t& entityId) noexcept
+    {
+        if (!entity)
+            return false;
+
+        __try
+        {
+            entityId = entity->entityId;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            entityId = 0;
+            return false;
+        }
+    }
+
+    bool ObserveTrackedBeforeRemoval(EntityLayout* entity, std::uint64_t entityId, bool& tracked) noexcept
+    {
+        tracked = false;
+        if (!TryAcquireSRWLockShared(&g_puppetListLock))
+            return false;
+
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
+        {
+            if (!IsPuppetOccupied(slot))
+                continue;
+            const TrackedPuppet& candidate = g_puppetList[slot];
+            if (candidate.entity == entity && (entityId == 0 || candidate.entityId == entityId))
+            {
+                tracked = true;
+                break;
+            }
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+        return true;
+    }
+
+    bool HookUnregisterEntity(void* registry, EntityLayout* entity)
     {
         HookLifecycle::CallbackGuard callback;
-        g_originalRegisterEntity(registry, entity);
+        const std::uint64_t callbackCount = g_unregisterCallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::uint64_t currentThread = ObserveThread(g_unregisterThread, "UnregisterEntity");
+        ObserveThreadAffinity(currentThread, g_unregisterThreadAffinityMatches, g_unregisterThreadAffinityMismatches);
+        const std::uint64_t entityAddress = reinterpret_cast<std::uint64_t>(entity);
+
+        std::uint64_t entityId = 0;
+        const bool identityKnown = TryReadEntityIdBeforeRemoval(entity, entityId);
+        bool tracked = false;
+        const bool trackedKnown = ObserveTrackedBeforeRemoval(entity, identityKnown ? entityId : 0, tracked);
+        g_lastUnregisteredEntityAddress.store(entityAddress, std::memory_order_relaxed);
+        g_lastUnregisteredEntityId.store(identityKnown ? entityId : 0, std::memory_order_relaxed);
+        g_lastUnregisteredTrackingKnown.store(trackedKnown, std::memory_order_relaxed);
+        g_lastUnregisteredTracked.store(trackedKnown && tracked, std::memory_order_relaxed);
+        if (!identityKnown)
+            g_unregisterWithoutIdentity.fetch_add(1, std::memory_order_relaxed);
+        if (!trackedKnown)
+            g_unregisterTrackingUnknown.fetch_add(1, std::memory_order_relaxed);
+        else if (tracked)
+            g_unregisterTracked.fetch_add(1, std::memory_order_relaxed);
+        else
+            g_unregisterUntracked.fetch_add(1, std::memory_order_relaxed);
+
+        // Do not hold g_puppetListLock (or any tracker lock) across this game call. The entity is not inspected
+        // after it returns; stale validation remains the authoritative cleanup path for this Phase 1 observer.
+        const bool result = g_originalUnregisterEntity(registry, entity);
+        if (callbackCount <= 5 || (callbackCount & (callbackCount - 1)) == 0)
+        {
+            Diagnostics::Log("entity unregister observed: total=%llu ptr=%p id=0x%llX identity=%d trackedKnown=%d "
+                             "trackedBefore=%d result=%d",
+                             static_cast<unsigned long long>(callbackCount), reinterpret_cast<void*>(entityAddress),
+                             static_cast<unsigned long long>(identityKnown ? entityId : 0), identityKnown ? 1 : 0,
+                             trackedKnown ? 1 : 0, tracked ? 1 : 0, result ? 1 : 0);
+        }
+        if ((callbackCount & 0x7Fu) == 0)
+            MaybeLogPhase1Summary();
+        return result;
+    }
+
+    bool HookRegisterEntity(void* registry, EntityLayout* entity)
+    {
+        HookLifecycle::CallbackGuard callback;
+        const std::uint64_t callbackCount = g_registerCallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+        const std::uint64_t currentThread = ObserveThread(g_registerThread, "RegisterEntity");
+        ObserveThreadAffinity(currentThread, g_registerThreadAffinityMatches, g_registerThreadAffinityMismatches);
+        g_lastRegisteredEntityAddress.store(reinterpret_cast<std::uint64_t>(entity), std::memory_order_relaxed);
+
+        // The original is called exactly once and before any tracker work. No tracker lock is held across this game
+        // call. Shutdown disables all hooks and drains CallbackGuard instances before clearing this pointer.
+        const bool result = g_originalRegisterEntity(registry, entity);
         if (!HookLifecycle::IsShuttingDown())
         {
             void* expected = nullptr;
@@ -1638,6 +2073,9 @@ namespace
             }
             CaptureEntity(entity);
         }
+        if ((callbackCount & 0x7Fu) == 0)
+            MaybeLogPhase1Summary();
+        return result;
     }
 
     std::uint8_t* ResolveRegisterEntity()
@@ -1662,12 +2100,60 @@ namespace
         return scan.matches == 1 ? scan.address : nullptr;
     }
 
+    std::uint8_t* ResolveUnregisterEntity()
+    {
+        const auto scan = Game::Signatures::FindInText(GetModuleHandleW(nullptr),
+                                                       kRuntimeEntityRegistryRemovalPattern,
+                                                       kRuntimeEntityRegistryRemovalMask,
+                                                       sizeof(kRuntimeEntityRegistryRemovalPattern));
+        Diagnostics::Log("RuntimeEntityRegistry removal signature scan: matches=%zu address=%p", scan.matches,
+                         scan.address);
+        if (scan.matches != 1)
+        {
+            if (HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll"))
+            {
+                const auto resolve = reinterpret_cast<ResolveAddressFn>(
+                    GetProcAddress(red4ext, "RED4ext_ResolveAddress"));
+                const std::uintptr_t address = resolve ? resolve(kRuntimeEntityRegistryRemovalAddressHash) : 0;
+                Diagnostics::Log("RuntimeEntityRegistry removal hash lookup not accepted: hash=%u address=%p; "
+                                 "unique proven signature required",
+                                 kRuntimeEntityRegistryRemovalAddressHash, reinterpret_cast<void*>(address));
+            }
+            return nullptr;
+        }
+
+        if (HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll"))
+        {
+            const auto resolve = reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"));
+            if (resolve)
+            {
+                if (const std::uintptr_t address = resolve(kRuntimeEntityRegistryRemovalAddressHash))
+                {
+                    if (reinterpret_cast<std::uint8_t*>(address) != scan.address)
+                    {
+                        Diagnostics::Log("RuntimeEntityRegistry removal rejected: hash address=%p differs from "
+                                         "unique signature address=%p; no inferred detour installed",
+                                         reinterpret_cast<void*>(address), scan.address);
+                        return nullptr;
+                    }
+                    Diagnostics::Log("RuntimeEntityRegistry removal resolved through RED4ext and signature: "
+                                     "hash=%u address=%p",
+                                     kRuntimeEntityRegistryRemovalAddressHash, reinterpret_cast<void*>(address));
+                }
+            }
+        }
+        return scan.matches == 1 ? scan.address : nullptr;
+    }
+
 }
 
 namespace Game::EntityTracker
 {
     bool CreateHook()
     {
+        if (g_hookCreated.load(std::memory_order_acquire))
+            return true;
+
         std::uint8_t* target = ResolveRegisterEntity();
         if (!target)
         {
@@ -1675,29 +2161,82 @@ namespace Game::EntityTracker
             return false;
         }
 
-        const MH_STATUS status = MH_CreateHook(target, &HookRegisterEntity,
-                                               reinterpret_cast<void**>(&g_originalRegisterEntity));
-        if (status != MH_OK)
+        std::uint8_t* removalTarget = ResolveUnregisterEntity();
+
+        const MH_STATUS registerStatus = MH_CreateHook(target, &HookRegisterEntity,
+                                                        reinterpret_cast<void**>(&g_originalRegisterEntity));
+        if (registerStatus != MH_OK || !g_originalRegisterEntity)
         {
-            Diagnostics::Log("MH_CreateHook(RegisterEntity) failed: %s (%d)", MH_StatusToString(status), status);
+            Diagnostics::Log("MH_CreateHook(RegisterEntity) failed: %s (%d)", MH_StatusToString(registerStatus),
+                             registerStatus);
+            if (registerStatus == MH_OK)
+                MH_RemoveHook(target);
+            g_originalRegisterEntity = nullptr;
             return false;
         }
 
-        // The UnregisterEntity address hash is known, but its native ABI is not verified. Do not install a hook
-        // based on an inferred signature. Snapshot identity/transform validation remains the authoritative removal
-        // path; a temporarily unavailable transform stays pending and a stale/mismatched object is removed.
-        Diagnostics::Log("UnregisterEntity hook disabled: ABI is unverified; stale snapshot validation remains active");
+        if (!removalTarget)
+        {
+            // The 2.31 candidate is independently proved, but an older/newer image may not expose its unnamed hash
+            // or its exact fallback signature. Keep the proven RegisterEntity observer alive and fail open for this
+            // optional removal observer rather than installing an inferred target.
+            if (!g_unregisterDiagnosticLogged.exchange(true, std::memory_order_acq_rel))
+            {
+                Diagnostics::Log("PHASE1 UnregisterEntity observer unavailable on this image: proven removal hash "
+                                 "and signature did not resolve; no inferred detour installed; RegisterEntity "
+                                 "observation remains active");
+            }
+            g_unregisterHookCreated.store(false, std::memory_order_release);
+            g_hookCreated.store(true, std::memory_order_release);
+            Diagnostics::Log("entity tracker hook created: RegisterEntity target=%p unregisterHook=0 "
+                             "attitudeRtti=fail-closed",
+                             target);
+            return true;
+        }
 
+        const MH_STATUS unregisterStatus = MH_CreateHook(removalTarget, &HookUnregisterEntity,
+                                                         reinterpret_cast<void**>(&g_originalUnregisterEntity));
+        if (unregisterStatus != MH_OK || !g_originalUnregisterEntity)
+        {
+            Diagnostics::Log("MH_CreateHook(UnregisterEntity) failed: %s (%d)", MH_StatusToString(unregisterStatus),
+                             unregisterStatus);
+            if (unregisterStatus == MH_OK)
+                MH_RemoveHook(removalTarget);
+            g_originalUnregisterEntity = nullptr;
+            g_unregisterHookCreated.store(false, std::memory_order_release);
+            g_hookCreated.store(true, std::memory_order_release);
+            Diagnostics::Log("entity tracker hook created: RegisterEntity target=%p unregisterHook=0 "
+                             "attitudeRtti=fail-closed",
+                             target);
+            return true;
+        }
+
+        if (!g_unregisterDiagnosticLogged.exchange(true, std::memory_order_acq_rel))
+        {
+            Diagnostics::Log("PHASE1 UnregisterEntity observer proved: target=%p hash=%u ABI=(registry=this, "
+                             "entity*) return=bool; original called once, no post-original entity dereference, "
+                             "stale cleanup remains authoritative",
+                             removalTarget, kRuntimeEntityRegistryRemovalAddressHash);
+        }
+
+        g_unregisterHookCreated.store(true, std::memory_order_release);
         g_hookCreated.store(true, std::memory_order_release);
-        Diagnostics::Log("entity tracker hook created: target=%p", target);
+        Diagnostics::Log("entity tracker hooks created: RegisterEntity target=%p UnregisterEntity target=%p "
+                         "attitudeRtti=fail-closed",
+                         target, removalTarget);
         return true;
     }
 
     void Shutdown()
     {
+        // d3d12_hook::Shutdown calls this only after MH_DisableHook(MH_ALL_HOOKS) and the global callback drain.
+        // Keep original pointers valid until that point; clearing one while a detour can still be entered races the
+        // trampoline and is not a safe unload path.
         g_hookCreated.store(false, std::memory_order_release);
+        g_unregisterHookCreated.store(false, std::memory_order_release);
         g_registry.store(nullptr, std::memory_order_release);
         g_originalRegisterEntity = nullptr;
+        g_originalUnregisterEntity = nullptr;
         g_nativeHighlightModeActive.store(false, std::memory_order_release);
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupClearQueued.store(false, std::memory_order_release);
@@ -1711,7 +2250,17 @@ namespace Game::EntityTracker
     {
         Stats result;
         result.hookCreated = g_hookCreated.load(std::memory_order_acquire);
+        result.unregisterHookCreated = g_unregisterHookCreated.load(std::memory_order_acquire);
+        result.attitudeRttiFailClosed = !IsPhase1AttitudeRttiEnabled();
         result.registered = g_registered.load(std::memory_order_relaxed);
+        result.registerCallbacks = g_registerCallbacks.load(std::memory_order_relaxed);
+        result.registerThreadId = g_registerThread.lastThreadId.load(std::memory_order_relaxed);
+        result.registerThreadChanges = g_registerThread.changes.load(std::memory_order_relaxed);
+        result.registerOnMainTickThread = g_registerThreadAffinityMatches.load(std::memory_order_relaxed);
+        result.registerOffMainTickThread = g_registerThreadAffinityMismatches.load(std::memory_order_relaxed);
+        result.mainTickCalls = g_mainTickCalls.load(std::memory_order_relaxed);
+        result.mainTickThreadId = g_mainTickThread.firstThreadId.load(std::memory_order_relaxed);
+        result.mainTickThreadChanges = g_mainTickThread.changes.load(std::memory_order_relaxed);
         result.positioned = g_positioned.load(std::memory_order_relaxed);
         result.puppets = g_puppets.load(std::memory_order_relaxed);
         result.trackedPuppets = g_trackedPuppets.load(std::memory_order_acquire);
@@ -1721,13 +2270,38 @@ namespace Game::EntityTracker
         result.trackedHostile = g_trackedHostile.load(std::memory_order_acquire);
         result.attitudeValid = g_attitudeValid.load(std::memory_order_relaxed);
         result.attitudeInvalid = g_attitudeInvalid.load(std::memory_order_relaxed);
+        result.attitudeFailClosedTicks = g_attitudeFailClosedTicks.load(std::memory_order_relaxed);
         result.pendingPosition = g_pendingPosition.load(std::memory_order_relaxed);
+        result.unregistered = g_unregisterCallbacks.load(std::memory_order_relaxed);
+        result.unregisterThreadId = g_unregisterThread.lastThreadId.load(std::memory_order_relaxed);
+        result.unregisterThreadChanges = g_unregisterThread.changes.load(std::memory_order_relaxed);
+        result.unregisterOnMainTickThread = g_unregisterThreadAffinityMatches.load(std::memory_order_relaxed);
+        result.unregisterOffMainTickThread = g_unregisterThreadAffinityMismatches.load(std::memory_order_relaxed);
+        result.unregisterTracked = g_unregisterTracked.load(std::memory_order_relaxed);
+        result.unregisterUntracked = g_unregisterUntracked.load(std::memory_order_relaxed);
+        result.unregisterTrackingUnknown = g_unregisterTrackingUnknown.load(std::memory_order_relaxed);
+        result.unregisterWithoutIdentity = g_unregisterWithoutIdentity.load(std::memory_order_relaxed);
         result.staleRemoved = g_staleRemoved.load(std::memory_order_relaxed);
         result.healthValid = g_healthValid.load(std::memory_order_relaxed);
         result.healthInvalid = g_healthInvalid.load(std::memory_order_relaxed);
         result.nativeHighlightQueued = g_nativeHighlightQueued.load(std::memory_order_relaxed);
         result.nativeHighlightCleared = g_nativeHighlightCleared.load(std::memory_order_relaxed);
         result.nativeHighlightFailures = g_nativeHighlightFailures.load(std::memory_order_relaxed);
+        result.componentHandleSampleEntities =
+            g_componentHandleSampleEntities.load(std::memory_order_relaxed);
+        result.componentHandleSamplingSkipped = g_componentHandleSamplingSkipped.load(std::memory_order_relaxed);
+        result.componentHandleSamples = g_componentHandleSamples.load(std::memory_order_relaxed);
+        result.componentHandleLayoutRejects = g_componentHandleLayoutRejects.load(std::memory_order_relaxed);
+        result.componentHandleNullInstances = g_componentHandleNullInstances.load(std::memory_order_relaxed);
+        result.componentHandleNullRefCounts = g_componentHandleNullRefCounts.load(std::memory_order_relaxed);
+        result.componentHandleTruncated = g_componentHandleTruncated.load(std::memory_order_relaxed);
+        result.lastRegisteredEntityAddress = g_lastRegisteredEntityAddress.load(std::memory_order_relaxed);
+        result.lastRegisteredEntityId = g_lastRegisteredEntityId.load(std::memory_order_relaxed);
+        result.lastUnregisteredEntityAddress = g_lastUnregisteredEntityAddress.load(std::memory_order_relaxed);
+        result.lastUnregisteredEntityId = g_lastUnregisteredEntityId.load(std::memory_order_relaxed);
+        result.lastUnregisteredTrackingKnown =
+            g_lastUnregisteredTrackingKnown.load(std::memory_order_relaxed);
+        result.lastUnregisteredTracked = g_lastUnregisteredTracked.load(std::memory_order_relaxed);
 
         AcquireSRWLockShared(&g_lastEntityLock);
         result.lastEntityId = g_lastEntityId;
@@ -1798,6 +2372,11 @@ namespace Game::EntityTracker
 
     void OnGameMainTick()
     {
+        const std::uint64_t tickCount = g_mainTickCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+        ObserveThread(g_mainTickThread, "OnGameMainTick");
+        if ((tickCount & 0x7Fu) == 0)
+            MaybeLogPhase1Summary();
+
         // Both operations below are intentionally called only from visibility's single game-main-tick detour.
         // Present publishes requests but never enters these RTTI/engine paths.
         {

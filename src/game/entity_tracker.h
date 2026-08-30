@@ -28,7 +28,17 @@ namespace Game::EntityTracker
     struct Stats
     {
         bool hookCreated = false;
+        bool unregisterHookCreated = false;
+        bool attitudeRttiFailClosed = true;
         std::uint64_t registered = 0;
+        std::uint64_t registerCallbacks = 0;
+        std::uint64_t registerThreadId = 0;
+        std::uint64_t registerThreadChanges = 0;
+        std::uint64_t registerOnMainTickThread = 0;
+        std::uint64_t registerOffMainTickThread = 0;
+        std::uint64_t mainTickCalls = 0;
+        std::uint64_t mainTickThreadId = 0;
+        std::uint64_t mainTickThreadChanges = 0;
         std::uint64_t positioned = 0;
         std::uint64_t puppets = 0;
         std::uint64_t trackedPuppets = 0;
@@ -38,16 +48,42 @@ namespace Game::EntityTracker
         std::uint64_t trackedHostile = 0;
         std::uint64_t attitudeValid = 0;
         std::uint64_t attitudeInvalid = 0;
+        std::uint64_t attitudeFailClosedTicks = 0;
         std::uint64_t pendingPosition = 0;
-        // Compatibility diagnostic only. UnregisterEntity is not hooked because its ABI is unverified, so this
-        // counter is intentionally always zero; stale identity/transform validation is reported separately.
+        // Observed UnregisterEntity calls are zero when the proven 2.31 observer is unavailable; stale
+        // identity/transform validation remains authoritative cleanup and is reported separately by staleRemoved.
         std::uint64_t unregistered = 0;
+        std::uint64_t unregisterThreadId = 0;
+        std::uint64_t unregisterThreadChanges = 0;
+        std::uint64_t unregisterOnMainTickThread = 0;
+        std::uint64_t unregisterOffMainTickThread = 0;
+        std::uint64_t unregisterTracked = 0;
+        std::uint64_t unregisterUntracked = 0;
+        std::uint64_t unregisterTrackingUnknown = 0;
+        std::uint64_t unregisterWithoutIdentity = 0;
         std::uint64_t staleRemoved = 0;
         std::uint64_t healthValid = 0;
         std::uint64_t healthInvalid = 0;
         std::uint64_t nativeHighlightQueued = 0;
         std::uint64_t nativeHighlightCleared = 0;
         std::uint64_t nativeHighlightFailures = 0;
+        // Component handle qwords are inspected for only the first bounded registration sample set; skipped keeps
+        // the total population visible without reading component arrays forever.
+        std::uint64_t componentHandleSampleEntities = 0;
+        std::uint64_t componentHandleSamplingSkipped = 0;
+        std::uint64_t componentHandleSamples = 0;
+        std::uint64_t componentHandleLayoutRejects = 0;
+        std::uint64_t componentHandleNullInstances = 0;
+        std::uint64_t componentHandleNullRefCounts = 0;
+        std::uint64_t componentHandleTruncated = 0;
+        std::uint64_t lastRegisteredEntityAddress = 0;
+        std::uint64_t lastRegisteredEntityId = 0;
+        // Removal identity/tracking are captured before the original returns; the observer never reads entity memory
+        // after that call.
+        std::uint64_t lastUnregisteredEntityAddress = 0;
+        std::uint64_t lastUnregisteredEntityId = 0;
+        bool lastUnregisteredTrackingKnown = false;
+        bool lastUnregisteredTracked = false;
         std::uint64_t lastEntityId = 0;
         float lastPosition[3]{};
         bool hasLastPuppet = false;
@@ -70,7 +106,8 @@ namespace Game::EntityTracker
         AnimationData::VisualData visual;
     };
 
-    // MinHook 초기화 후, MH_EnableHook(MH_ALL_HOOKS) 전에 호출한다.
+    // Called during hook setup before MH_EnableHook(MH_ALL_HOOKS); the optional unregister observer is installed
+    // only when its target and ABI are proven for the running image.
     bool CreateHook();
     void Shutdown();
     // Executes tracker health refreshes and native highlight events on the game main tick. Never call from Present.
