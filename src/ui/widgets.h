@@ -1,21 +1,20 @@
 #pragma once
 
-// AGENTS.md 기술 스택 절에서 정한 "ImGui를 즉시모드 캔버스로만 쓰고 커스텀 드로잉으로 위젯을 그린다"
-// 방식의 구현. 실제 기능 설정은 Features::Settings에 보관하고 이 파일은 표시/상호작용만 담당한다.
+// 오버레이 화면 조립부. 컨트롤과 레이아웃 조각은 전부 `ui_kit.h`가 제공하고, 이 파일은 그것을
+// 페이지로 엮는 일만 한다 — 페이지마다 컨트롤을 따로 그리면 같은 애플리케이션으로 읽히지 않는다.
+// 설정 값 자체는 `Features::Settings`가 소유하며 여기서는 표시와 상호작용만 담당한다.
 namespace Widgets
 {
-    // ImGuiStyle 커스터마이징 (라운딩, 색상 팔레트). ImGui_ImplWin32_Init보다 먼저 호출되어야 폰트 로드
-    // 등 이후 단계에 영향을 준다.
+    // 폰트 아틀라스 구성 + ImGui 스타일. ImGui 백엔드 초기화보다 먼저 호출되어야 한다.
     void ApplyStyle();
 
+    // 메뉴가 열려 있을 때의 창 전체.
     void DrawMainMenu();
+
+    // 주입 직후 잠깐 떠 있는 안내 토스트. 메뉴 표시 여부와 무관하다.
     void DrawStartupHint();
 
-    // pill 모양 토글 스위치. 스톡 위젯이 없어서 InvisibleButton으로 입력만 가져오고 배경/thumb은
-    // ImDrawList로 직접 그린다. 반환값은 "이번 프레임에 눌렸는지"(값 자체는 *value에 반영됨).
-    bool ToggleSwitch(const char* label, bool* value);
-
-    // 값만큼 트랙이 채워지는 커스텀 float 슬라이더. 스톡 SliderFloat의 프레임은 사용하지 않는다.
-    bool FilledSliderFloat(const char* label, float* value, float minimum, float maximum,
-                           const char* format = "%.1f");
+    // 프리뷰 하네스(`tools/ui_preview`)가 페이지를 골라 스크린샷을 찍기 위한 진입점.
+    // 인게임에서는 사이드바 내비게이션이 같은 값을 바꾼다. 0=Aimbot, 1=ESP, 2=Misc, 3=Debug.
+    void SelectPage(int index);
 }

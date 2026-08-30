@@ -51,6 +51,7 @@ add_library(cp2077_trainer SHARED
     src/ui/overlay.cpp
     src/ui/localization.cpp
     src/ui/theme.cpp
+    src/ui/ui_kit.cpp
     src/ui/widgets.cpp
 )
 
@@ -82,3 +83,25 @@ target_link_libraries(cp2077_trainer PRIVATE
 )
 
 set_target_properties(cp2077_trainer PROPERTIES OUTPUT_NAME "cp2077_trainer")
+
+# --- 오버레이 UI 프리뷰 하네스 ---
+# 트레이너 DLL은 게임 프로세스 안에서만 살아 있어서 UI를 눈으로 확인하려면 매번 게임에 주입해야 했다.
+# 이 실행 파일은 같은 D3D12 + ImGui 조합으로 창을 띄우고 src/ui의 화면 코드를 그대로 호출한다
+# (UI 코드는 복제하지 않는다 — tools/ui_preview/stubs.cpp가 게임 측 카운터만 채운다).
+option(CP2077_BUILD_UI_PREVIEW "Build the standalone overlay UI preview harness" ON)
+if(CP2077_BUILD_UI_PREVIEW)
+    add_executable(cp2077_ui_preview
+        tools/ui_preview/main.cpp
+        tools/ui_preview/stubs.cpp
+        src/ui/localization.cpp
+        src/ui/theme.cpp
+        src/ui/ui_kit.cpp
+        src/ui/widgets.cpp
+    )
+    target_include_directories(cp2077_ui_preview PRIVATE src)
+    target_compile_definitions(cp2077_ui_preview PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_options(cp2077_ui_preview PRIVATE /utf-8)
+    endif()
+    target_link_libraries(cp2077_ui_preview PRIVATE imgui d3d12.lib dxgi.lib user32.lib)
+endif()

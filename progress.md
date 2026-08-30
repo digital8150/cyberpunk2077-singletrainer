@@ -2579,3 +2579,43 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   산출물은 `build/bin/Release/cp2077_trainer.dll`(831,488 bytes, SHA-256
   `09E7ECCBD19547EE4F0BAF7C14C254AC6781F70AC469381BC988E6710EFFC6B7`)이다. `%LOCALAPPDATA%\cbpk\config.ini`는
   Win32 ini API 기준 `logging=1`, `no_recoil=1`, `no_spread=1`로 확인했고 제거된 세 기능 키도 삭제했다.
+
+## 2026-08-30 — 오버레이 UI 프레젠테이션 레이어 전면 재구축
+
+- 사용자가 레퍼런스 스크린샷(좌측 내비게이션 + 2열 섹션 패널의 컴팩트한 데스크톱 제어판)을 주고,
+  기존 UI를 "개선"이 아니라 **폐기하고 다시 짓기**를 요구했다. 기능·설정·바인딩·저장·로컬라이제이션·
+  입력 처리는 그대로 두고 표시 계층만 교체했다. `Features::Settings`, `Config`, `Diagnostics`,
+  D3D12 훅(`overlay.cpp`)은 손대지 않았다.
+- 새 구성:
+  - `src/ui/theme.h/.cpp` — 시맨틱 토큰(background/sidebar/surface/border/text/accent/warning/error/
+    success/controlOff/knob) 재정의. **불투명**으로 바꿨다(예전 windowBackground alpha 250). 라이트는
+    다크의 반전이 아니라 별도로 조율한 값이다.
+  - `src/ui/ui_kit.h/.cpp` (신규) — 단일 컴포넌트 시스템. PageHeader, 열 레이아웃, Section(패널),
+    ToggleRow/CheckRow/SliderRow/ComboRow/KeybindRow, MetricRow/MetricGroup, HelperText/WarningText,
+    CollapsibleRow, 아이콘, 비활성 스코프. 페이지 코드는 색이나 좌표를 직접 그리지 않는다.
+  - `src/ui/widgets.cpp` — 창 셸(사이드바 / 페이지 헤더 / 스크롤 본문 / 상태 표시줄)과 네 페이지
+    조립만 남겼다. 예전의 위젯 구현·카드·푸터 배치는 전부 제거했다.
+- 배운 것(다음에 같은 함정을 밟지 않도록):
+  - **테두리 없는 자식 창은 `WindowPadding`을 무시한다**(ImGui 1.90 변경). `ImGuiChildFlags_AlwaysUseWindowPadding`
+    을 주지 않으면 콘텐츠 여백이 통째로 0이 된다 — 섹션이 사이드바에 붙어 있던 원인.
+  - **`PushFont(font, 0.0f)`는 "현재 크기 유지"다.** 예전 코드처럼 크기별로 ImFont를 따로 얹고 0.0f로
+    푸시하면 의도한 타이포 위계가 실제로는 적용되지 않는다. 이제 폰트는 세 벌(본문/굵게/고정폭)만
+    올리고 역할별 크기를 `PushFont(font, size)`로 지정한다.
+  - `ImDrawList::AddRect`/`PathStroke`는 1.92.8에서 `thickness`와 `flags` 인자 순서가 바뀌었다.
+  - 섹션 패널은 높이를 미리 알 수 없으므로 드로우리스트를 두 채널로 나눠 배경/구분선/호버를 뒤에,
+    글자와 컨트롤을 앞에 그린 뒤 섹션이 닫힐 때 합친다.
+  - 열은 자식 창이 아니라 그룹으로 만든다(열마다 스크롤바가 생기지 않게). 폭이 좁아 열이 하나로
+    접히면 `Column()`이 줄을 바꿔야 한다 — 항상 `SameLine`을 걸면 두 번째 묶음이 창 밖으로 나간다.
+  - 열 폭은 470 px에서 자르고 남는 폭은 좌우 여백으로 돌린다. 넓은 창에서 열을 그대로 늘리면 라벨은
+    왼쪽 끝, 컨트롤은 오른쪽 끝에 남아 한 행으로 읽히지 않는다(사용자가 지적한 기존 문제).
+- **`tools/ui_preview/` (신규)** — 게임 없이 UI를 눈으로 확인하는 하네스. 같은 D3D12 + ImGui 조합으로
+  창을 띄우고 `src/ui`의 화면 코드를 그대로 호출하며, `stubs.cpp`가 게임 측 카운터 여섯 개만 채운다
+  (UI 코드는 복제하지 않는다). `--page/--theme/--lang/--width/--height/--variant/--mouse/--scroll/--toast/
+  --shot`으로 무인 캡처가 된다. 이 하네스가 사이드바의 `SetCursorPosY` 경계 오류와 위 열 접힘 버그를
+  바로 잡아냈다. CMake 옵션 `CP2077_BUILD_UI_PREVIEW`(기본 ON)로 끌 수 있다.
+- 검증: 네 페이지 × 다크/라이트 × 한/영, 780×560(열 1개로 접힘)·960×700·1400×900, 비활성 상태
+  (`--variant=off`), 경고·사일런트 조준(`--variant=warn`), 호버(`--mouse`), 스크롤 끝(`--scroll`),
+  시작 토스트(`--toast`)를 캡처해 확인했다. 상태 표시줄이 본문을 덮지 않고 스크롤도 본문 안에서만 돈다.
+- 빌드: `cmake --build build-next --config Release` 전체 통과, 경고 0. 게임(PID 27680)이 여전히
+  `build/bin/Release/cp2077_trainer.dll`을 잡고 있어 정식 `build` 트리는 링크할 수 없었다(LNK1104).
+  게임을 닫은 뒤 `cmake --build build --config Release`를 다시 돌려야 정식 산출물이 갱신된다.
