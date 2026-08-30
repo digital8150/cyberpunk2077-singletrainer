@@ -19,7 +19,6 @@ namespace Loc
         constexpr Entry kText[] = {
             LOC_KO_EN("Cyberpunk 2077 트레이너", "Cyberpunk 2077 Trainer"),
             LOC_KO_EN("CBPK  /  TRAINER", "CBPK  /  TRAINER"),
-            LOC_KO_EN("오프라인 싱글플레이어 오버레이", "Offline single-player overlay"),
             LOC_KO_EN("에임봇", "Aimbot"),
             LOC_KO_EN("ESP", "ESP"),
             LOC_KO_EN("기타", "Misc"),
@@ -142,15 +141,19 @@ namespace Loc
             LOC_KO_EN("필터", "Filters"),
             LOC_KO_EN("무기", "Weapon"),
             LOC_KO_EN("플레이어", "Player"),
-            LOC_KO_EN("오버레이 표시", "Overlay"),
-            LOC_KO_EN("진단 및 계측", "Diagnostics"),
-            LOC_KO_EN("고급", "Advanced"),
+            LOC_KO_EN("오버레이", "Overlay"),
+            LOC_KO_EN("개발자 진단", "Developer diagnostics"),
+            LOC_KO_EN("실험적 기능", "Experimental"),
+            LOC_KO_EN("개발과 진단을 위한 기능입니다.", "Features intended for development and diagnostics."),
+            LOC_KO_EN("평소의 런타임 동작이 달라질 수 있습니다.", "May alter normal runtime behavior."),
+            LOC_KO_EN("런타임 통계", "Runtime statistics"),
+            LOC_KO_EN("LIVE", "LIVE"),
         };
 
 #undef LOC_KO_EN
 
         constexpr std::size_t kTextCount = sizeof(kText) / sizeof(kText[0]);
-        static_assert(kTextCount == static_cast<std::size_t>(Str::CardAdvanced) + 1,
+        static_assert(kTextCount == static_cast<std::size_t>(Str::StatsLive) + 1,
                       "localization table must contain one entry for every Str value");
     }
 

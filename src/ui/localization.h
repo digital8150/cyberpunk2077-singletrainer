@@ -13,7 +13,6 @@ namespace Loc
     {
         WindowTitle,
         BrandName,
-        BrandSubtitle,
         TabAimbot,
         TabEsp,
         TabMisc,
@@ -128,7 +127,11 @@ namespace Loc
         CardPlayer,
         CardOverlay,
         CardDiagnostics,
-        CardAdvanced,
+        CardExperimental,
+        ExperimentalNote,
+        HeadlessAimbotNote,
+        RuntimeStatistics,
+        StatsLive,
     };
 
     const char* Text(Str id);
