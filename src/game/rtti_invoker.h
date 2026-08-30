@@ -17,8 +17,10 @@ namespace Game::Rtti
         std::uint32_t registrationIndex = 0;
         std::size_t parameterCount = 0;
         bool hasReturnValue = false;
-        // CProperty::Flags::isHandle (bit 0x1B) on the reflected return property. This is the
-        // ownership-bearing return contract used by the Phase 2 attitude getter validation.
+        // ERTTIType of CProperty::type. Handle is 9 and WeakHandle is 10 in the RED4ext SDK.
+        // The type category, rather than CProperty::Flags::isHandle, is the ownership-bearing
+        // return contract: ordinary reflected Handle returns do not necessarily set that flag.
+        std::uint8_t returnTypeKind = 0xFF;
         bool returnIsHandle = false;
         void* nativeHandler = nullptr;
     };

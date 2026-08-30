@@ -2059,21 +2059,24 @@ namespace
         {
             Diagnostics::Log(
                 "phase2 attitude resolver: ownership=1 playerSystem=%p GetLocalPlayer=%p "
-                "local=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X) "
-                "GetAttitudeAgent=%p getter=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X) "
-                "GetAttitudeTowards=%p agent=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X native=%p) "
+                "local=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X) "
+                "GetAttitudeAgent=%p getter=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X) "
+                "GetAttitudeTowards=%p agent=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X native=%p) "
                 "resolved=%d",
                 g_attitudeRuntime.playerSystem, g_attitudeRuntime.getLocalPlayer,
                 static_cast<unsigned long long>(Game::Rtti::ClassNameHash(localPlayerInfo.parent)),
                 localPlayerInfo.parameterCount, localPlayerInfo.hasReturnValue ? 1 : 0,
+                static_cast<unsigned>(localPlayerInfo.returnTypeKind),
                 localPlayerInfo.returnIsHandle ? 1 : 0, localPlayerInfo.flags,
                 g_attitudeRuntime.getAttitudeAgent,
                 static_cast<unsigned long long>(Game::Rtti::ClassNameHash(getterInfo.parent)),
                 getterInfo.parameterCount, getterInfo.hasReturnValue ? 1 : 0,
+                static_cast<unsigned>(getterInfo.returnTypeKind),
                 getterInfo.returnIsHandle ? 1 : 0, getterInfo.flags,
                 g_attitudeRuntime.getAttitudeTowards,
                 static_cast<unsigned long long>(Game::Rtti::ClassNameHash(attitudeInfo.parent)),
                 attitudeInfo.parameterCount, attitudeInfo.hasReturnValue ? 1 : 0,
+                static_cast<unsigned>(attitudeInfo.returnTypeKind),
                 attitudeInfo.returnIsHandle ? 1 : 0, attitudeInfo.flags, attitudeInfo.nativeHandler,
                 resolved ? 1 : 0);
             g_attitudeRuntime.logged = true;

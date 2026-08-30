@@ -107,6 +107,7 @@ namespace
     using HandleCanBeDestructedFn = bool (*)(Game::Rtti::Handle*);
     using HandleDestroyFn = void (*)(Game::Rtti::Handle*);
     using CNamePoolGetFn = const char* (*)(const std::uint64_t&);
+    using RttiGetTypeFn = std::uint8_t (*)(const void*);
 
     struct RefCountLayout
     {
@@ -324,11 +325,18 @@ namespace Game::Rtti
             output.registrationIndex = function->regIndex;
             output.parameterCount = function->params.size;
             output.hasReturnValue = function->returnType != nullptr;
-            // RED4ext CProperty::Flags::isHandle is bit 0x1B. Keep this as metadata
-            // validation only; the returned storage is still treated as an opaque 16-byte
-            // Handle and must be released through the exact ABI below.
-            output.returnIsHandle = function->returnType != nullptr &&
-                                    (function->returnType->flags & (1ull << 27)) != 0;
+            if (function->returnType != nullptr && IsValidUserPointer(function->returnType->type))
+            {
+                void** typeVtable = *reinterpret_cast<void***>(function->returnType->type);
+                if (IsValidUserPointer(typeVtable) && IsValidUserPointer(typeVtable[4]))
+                {
+                    // RED4ext rtti::IType::GetType is vtable slot 4. ERTTIType::Handle is 9;
+                    // WeakHandle is deliberately not accepted as a strong ownership result.
+                    output.returnTypeKind = reinterpret_cast<RttiGetTypeFn>(typeVtable[4])(
+                        function->returnType->type);
+                    output.returnIsHandle = output.returnTypeKind == 9;
+                }
+            }
 
             const bool isNative = (function->flags & 1u) != 0;
             const bool isStatic = (function->flags & 2u) != 0;

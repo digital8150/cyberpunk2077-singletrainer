@@ -2137,3 +2137,20 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
 - `build-next` Release 빌드와 `git diff --check`가 통과했다. 아직 라이브 주입 전이므로 runtime resolver가
   실제로 gate를 여는지, hostility valid/unknown 비율과 장시간 streaming 안정성은 다음 세션에서 검증한다.
 
+## 2026-08-30 - Issue #1 Phase 2B 라이브 게이트 교정
+
+- PID 30148의 기존 fail-closed Phase 2 세션은 10:32:40부터 11:27:35까지 약 55분간 응답 정지나
+  `[FATAL][unhandled]` 없이 유지됐고, 안전 언로드 후 fatal 로그에 `[SESSION] closed cleanly`가 남았다.
+- 첫 Phase 2B 주입은 크래시 없이 fail-closed 됐다. 런타임 로그에서
+  `GetLocalPlayerControlledGameObject`의 반환 property flags에 `isHandle` bit가 없어서
+  `returnIsHandle=0`으로 오판한 것이 원인이었다. `CProperty::Flags::isHandle`은 일반 reflected Handle
+  반환마다 반드시 설정되는 타입 판별자가 아니므로 ownership gate로 사용할 수 없다.
+- 공식 RED4ext SDK의 `rtti::IType::GetType`(vtable slot 4)과 `ERTTIType` 열거형을 기준으로 반환 타입을
+  판별하도록 바꿨다. strong `Handle`은 type 9만 허용하고 `WeakHandle` type 10은 허용하지 않는다.
+- 교정 빌드를 11:31:58에 재주입한 결과 runtime resolver는
+  `GetLocalPlayer type=9`, `GetAttitudeAgent type=9`, `GetAttitudeTowards type=5`, `resolved=1`을 기록했다.
+  즉 player/entity attitude getter 양쪽의 반환값이 strong Handle임을 라이브 메타데이터로 확인했고,
+  non-Handle 반환인 `GetAttitudeTowards`도 기존 native signature와 일치했다.
+- 정상 주기 상태를 출력하지 않고 프로세스 종료, 연속 `Responding=False`, trainer heartbeat 정지,
+  `[FATAL][unhandled]`만 알리는 무음 watchdog을 새 세션에 시작했다. Phase 6 장시간 검증은 계속 진행한다.
+
