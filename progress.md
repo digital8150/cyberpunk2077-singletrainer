@@ -2154,3 +2154,24 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
 - 정상 주기 상태를 출력하지 않고 프로세스 종료, 연속 `Responding=False`, trainer heartbeat 정지,
   `[FATAL][unhandled]`만 알리는 무음 watchdog을 새 세션에 시작했다. Phase 6 장시간 검증은 계속 진행한다.
 
+## 2026-08-30 - PID 30148 Phase 6 중 별도 native highlight freeze를 Issue #2로 분리
+
+- Phase 2B 주입 후 약 87분 45초인 12:59:43에 watchdog이 PID 30148의 `Responding=False`를 3회 연속
+  감지했다. 2초 CPU delta도 0이고 trainer heartbeat는 12:59:42에 멈춰 하드 프리즈로 확정했다.
+- fatal record는 main tick TID 29636에서 `Cyberpunk2077.exe+0xA037C8`, WRITE target `0x49`,
+  `fault-in-trainer=no`였다. 다만 stack의 trainer `+0x14748`은 PDB로
+  `SetBraindanceModeOnMainTick+0x38`, `+0x12BC2`는 `ProcessNativeHighlightsOnMainTick+0x382`로 풀렸다.
+  Release disassembly에서 `+0x14748`은 `call rax`로 resolved SetBraindanceMode를 호출한 직후의 복귀
+  주소다.
+- engine manifest는 `IsLoadingSavedSession=true`, invalid streaming observer, teleport distance 2098.31 m를
+  기록했다. 직전 trainer log도 `snapshots=26`에서 `snapshots=0 tracked=0`으로 전환됐다. 따라서 world/save
+  transition 뒤 틱 사이에 캐시한 raw `gameIVisionModeSystem*`가 stale해졌는데, mode-off 전환에서 이를
+  다시 호출한 것이 직접 원인이다.
+- attitude lifetime 경로는 사고 직전까지 `attitudeAttempts=579786`, `attitudeAcquire=579786`,
+  `attitudeExpiredInvalid=0`, `attitudeUnknown=0`이었고 해당 경로의 trainer-origin AV는 0건이었다. 이번
+  사고는 Issue #1의 component/attitude RTTI lifetime 결함과 다른 feature path이므로 GitHub Issue #2로
+  분리했다. #1에는 교차 코멘트를 남겼고, 이번 사이클에서는 #2 코드를 수정하지 않는다.
+- 상세 보고서와 원본 로그/manifest는 `reports/2026-08-30_freeze_analysis_pid30148.md` 및
+  `reports/artifacts/2026-08-30_freeze_pid30148/`에 보존했다. 다음 #1 격리 검증을 위해 로컬
+  `%LOCALAPPDATA%\cbpk\config.ini`의 `native_highlight`를 0으로 바꿨다.
+
