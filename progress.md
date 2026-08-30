@@ -2655,3 +2655,32 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   `player modifiers applied: targetId=0x1 count=27 mask=0x3`를 두 번의 새 빌드 모두 재현했고 프로세스는
   계속 `Responding=True`다. 인게임 캡처로 라이트 테마의 반투명 그래프와 스무딩된 세 곡선을 확인했다.
   최종 DLL은 현재 PID 27680에 주입된 채라 사용자가 recoil/spread 체감을 바로 확인할 수 있다.
+
+## 2026-08-30 — Pose/AABB 순간 압축 계측과 포즈 수집 메인 틱 이관
+
+- 관측 증상은 정상적인 사람 높이의 ESP 박스/스켈레톤이 한 프레임가량 발 근처로 압축되고, Classic
+  Aimbot도 같은 순간 머리에서 발로 내려갔다 복귀하는 형태였다. 코드 경로를 대조하니 박스는 animation
+  AABB보다 `GetSlotTransform(Head/Chest/Hips/RightHand/LegLeft/LegRight)` 결과를 우선 사용하고 에임도 같은
+  Head 값을 직접 사용하므로, 두 현상은 하나의 잘못된 pose sample로 설명된다.
+- 더 중요한 구조 문제로, 이 여섯 RTTI 호출이 `GetPuppetSnapshots` 안, 즉 Present 스레드에서 엔티티별로
+  순차 실행되고 있었다. 기존 실측 로그는 `poseSlots` 평균 8~10 us였지만 군중이 많을 때 5초당 2만 회
+  이상 호출했고, 각 슬롯 사이에 animation 상태가 바뀌는 중간 표본을 읽을 여지도 있었다.
+- pose 수집을 `OnGameMainTick`으로 옮겼다. 메인 틱은 tracker 락 아래에서 exact strong Handle과 identity만
+  짧게 복사하고, 락을 놓은 뒤에만 animation bounds와 여섯 `GetSlotTransform`을 호출한다. 완성된
+  `VisualData`는 다시 짧은 배타 락에서 identity/sequence를 재검증해 한 번에 게시한다. Present는 이제
+  완성된 캐시만 복사하며 Script VM/pose engine 함수를 전혀 호출하지 않는다.
+- 부하는 최근 250 ms 안에 실제 ESP/Aimbot snapshot consumer가 요청한 엔티티만 대상으로, 엔티티별 최소
+  33 ms 간격과 틱당 최대 24개 round-robin 상한을 둔다. 기능을 끄면 메인 틱에서 pose 캐시와 이상 상태를
+  한 번 비우며, 다시 켰을 때 첫 Present 요청 뒤 새 표본부터 채운다. 프로파일 슬롯도 Present 그룹의
+  `poseSlots`를 메인 틱 `pose`/`tickdetail.poseSlots`로 이동했다.
+- `[POSE-ANOMALY]` 로거를 추가했다. 직전 정상 표본 대비 150 ms 안에 vertical span이 절반 이하(<=0.50 m),
+  Head-Hips 또는 Head-root 높이가 함께 급락하고 entity root는 0.40 m 이내로 유지될 때 이벤트를 연다.
+  begin/recovered 외에 여섯 슬롯의 원시 좌표, valid mask, 각 호출의 Invoke/result/finite mask, 실제 선택된
+  SlotComponent index와 component 주소, animation bounds 높이를 남긴다. 로그 레코드는 세션당 768개로
+  제한되고 기존 비동기 ring writer를 사용한다. 이상 표본이 실제 Classic Aimbot 타깃으로 소비되면
+  `[POSE-AIM-CORRELATION]`이 같은 entity/sample 번호와 aim/root 좌표를 남긴다.
+- `cmake --build build-next --config Release` 전체 통과 및 `git diff --check` 통과. 정식 `build` DLL을 잡고
+  있는 PID 27680에 안전 unload를 요청했으나, 이 변경과 무관한 기존 player-modifier cleanup이 stale
+  target `0x9B7E02`에서 세 번 timeout되어 강제 해제 없이 중단했다. 따라서 새 DLL의 인게임 검증은 게임
+  재시작 후 남아 있다. 최종 clean-build DLL SHA-256은
+  `BBBE4D116DDAE24DFCD6EF6D91F6DACFBB9EB4F0848AA74D57B3AF95FE3BAB97`이다.

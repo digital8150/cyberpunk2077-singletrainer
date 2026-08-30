@@ -38,15 +38,16 @@ namespace
         {"snapshot", true},
         {"snapLockWait", true},
         {"snapCount", false},
-        {"poseSlots", true},
         {"esp", true},
         {"aimbot", true},
         {"tickTotal", true},
+        {"pose", true},
         {"health", true},
         {"attitude", true},
         {"highlight", true},
         {"playerMods", true},
         {"visibility", true},
+        {"poseSlots", true},
         {"healthCollect", true},
         {"healthInvoke", true},
         {"attitudeCollect", true},
@@ -213,7 +214,7 @@ namespace Diagnostics::Profile
 
         LogGroup("present", Slot::SnapshotPass, Slot::AimbotFrame, elapsed);
         LogGroup("tick", Slot::TickTotal, Slot::TickVisibility, elapsed);
-        LogGroup("tickdetail", Slot::HealthCollect, Slot::HighlightCollect, elapsed);
+        LogGroup("tickdetail", Slot::PoseSlots, Slot::HighlightCollect, elapsed);
     }
 
     void Reset()

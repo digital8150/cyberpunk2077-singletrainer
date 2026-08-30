@@ -16,6 +16,10 @@ namespace Game::AnimationData
 
     struct VisualData
     {
+        // Monotonic per-entity capture number. The anomaly bit describes this exact sample and lets downstream
+        // consumers correlate an ESP/aimbot artifact with the raw slot-capture diagnostic event.
+        std::uint64_t poseSampleSequence = 0;
+        bool poseAnomalyDetected = false;
         bool hasBounds = false;
         float boundsMinimum[3]{};
         float boundsMaximum[3]{};
@@ -30,6 +34,6 @@ namespace Game::AnimationData
     };
 
     // Reads the active animation-system entry for an entity. All accesses are guarded because streaming can
-    // invalidate an entry between the registry callback and the render frame.
+    // invalidate an entry between the registry callback and the main-tick pose capture.
     bool ReadVisualData(std::uint64_t entityId, const float entityPosition[3], VisualData& output);
 }

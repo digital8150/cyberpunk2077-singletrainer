@@ -23,6 +23,8 @@ namespace Aimbot
         bool g_aimActive = false;
         std::uint64_t g_lockedEntityId = 0;
         ULONGLONG g_lastApplyTick = 0;
+        std::uint64_t g_lastAnomalousAimEntityId = 0;
+        std::uint64_t g_lastAnomalousAimSample = 0;
         Stats g_stats;
 
         void StopAim()
@@ -255,6 +257,22 @@ namespace Aimbot
         {
             StopAim();
             return;
+        }
+
+        if (selected && selected->visual.poseAnomalyDetected &&
+            (g_lastAnomalousAimEntityId != bestEntityId ||
+             g_lastAnomalousAimSample != selected->visual.poseSampleSequence))
+        {
+            Diagnostics::Log(
+                "[POSE-AIM-CORRELATION] target=%016llX sample=%llu locked=%d aim=(%.3f,%.3f,%.3f) "
+                "root=(%.3f,%.3f,%.3f) head=%d bounds=%d",
+                static_cast<unsigned long long>(bestEntityId),
+                static_cast<unsigned long long>(selected->visual.poseSampleSequence),
+                g_lockedEntityId == bestEntityId ? 1 : 0, bestWorld[0], bestWorld[1], bestWorld[2],
+                selected->position[0], selected->position[1], selected->position[2],
+                selected->visual.hasHeadPosition ? 1 : 0, selected->visual.hasBounds ? 1 : 0);
+            g_lastAnomalousAimEntityId = bestEntityId;
+            g_lastAnomalousAimSample = selected->visual.poseSampleSequence;
         }
 
         if (g_lockedEntityId == 0)

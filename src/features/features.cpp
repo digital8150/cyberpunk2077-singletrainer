@@ -39,7 +39,8 @@ namespace
                                   (g_settings.aimbot.requireHealthPool || g_settings.aimbot.limitHealthPool)) ||
                                  (nativeHighlight && g_settings.esp.hideDead);
         const bool needsAttitude = espActive || g_settings.aimbot.enabled || nativeHighlight;
-        Game::EntityTracker::UpdateFeatureRequirements(needsHealth, needsAttitude);
+        const bool needsPose = espActive || g_settings.aimbot.enabled;
+        Game::EntityTracker::UpdateFeatureRequirements(needsHealth, needsAttitude, needsPose);
     }
 
     bool NeedsVisibilityFrame(bool espConsumerActive)

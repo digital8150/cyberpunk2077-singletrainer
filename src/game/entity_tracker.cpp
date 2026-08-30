@@ -207,6 +207,14 @@ namespace
         Player,
     };
 
+    struct PoseMetrics
+    {
+        std::uint8_t validMask = 0;
+        float verticalSpan = 0.0f;
+        float headRelativeZ = 0.0f;
+        float headToHips = 0.0f;
+    };
+
     struct TrackedPuppet
     {
         EntityLayout* entity = nullptr;
@@ -217,6 +225,13 @@ namespace
         std::uint64_t sequence = 0;
         Game::AnimationData::VisualData visual;
         ULONGLONG visualUpdatedAt = 0;
+        ULONGLONG poseRequestedAt = 0;
+        PoseMetrics poseMetrics;
+        float poseEntityPosition[3]{};
+        std::uint64_t poseSampleSequence = 0;
+        std::uint64_t poseAnomalyEvents = 0;
+        ULONGLONG poseAnomalyStartedAt = 0;
+        bool poseAnomalyActive = false;
         Game::EntityTracker::NpcCategory category = Game::EntityTracker::NpcCategory::Other;
         Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
         ULONGLONG hostilityUpdatedAt = 0;
@@ -322,6 +337,8 @@ namespace
     float g_lastPuppetPosition[3]{};
     SRWLOCK g_puppetListLock = SRWLOCK_INIT;
     std::array<TrackedPuppet, kMaxTrackedPuppets> g_puppetList{};
+    std::atomic_uint32_t g_poseAnomalyLogRecords{0};
+    constexpr std::uint32_t kPoseAnomalyLogRecordBudget = 768;
     // Occupancy bits for the slots above. The main-tick round-robins scan this instead of striding the list
     // itself: a TrackedPuppet is over a kilobyte, so touching all 256 slots cost one cache miss per slot and
     // dominated the health pass even with two NPCs on screen (measured 26 us with 2 puppets, 22 us with 45).
@@ -503,9 +520,11 @@ namespace
     bool g_getPropertyAttempted = false;
     constexpr std::uint32_t kFeatureHealthRequirementBit = 1u << 0;
     constexpr std::uint32_t kFeatureAttitudeRequirementBit = 1u << 1;
+    constexpr std::uint32_t kFeaturePoseRequirementBit = 1u << 2;
     std::atomic_uint32_t g_featureRequirements{0};
     bool g_healthRequirementActive = false;
     bool g_attitudeRequirementActive = false;
+    bool g_poseRequirementActive = false;
     // 하이라이트 경로를 완전히 잠재우기 전에 남은 per-entity desired 상태를 반드시 비워야 한다.
     // 게이트가 request/mode만 보면, desired는 남았는데 mode가 아직 안 켜진 좁은 창에서 경로가 잠들어
     // 엔티티가 하이라이트된 채로 영영 남는다. enabled가 내려가는 순간 이 래치를 세우고, 실제로 비울 게
@@ -526,6 +545,7 @@ namespace
     ULONGLONG g_lastWorldGateLog = 0;
     std::uint64_t g_healthRoundRobin = 0;
     std::uint64_t g_attitudeRoundRobin = 0;
+    std::uint64_t g_poseRoundRobin = 0;
     ULONGLONG g_attitudePathLogTick = 0;
 
     struct NativeHighlightRuntime
@@ -971,6 +991,34 @@ namespace
         std::size_t count = 0;
     };
 
+    enum PoseSlot : std::size_t
+    {
+        PoseHead,
+        PoseChest,
+        PoseHips,
+        PoseRightHand,
+        PoseLeftLeg,
+        PoseRightLeg,
+        PoseSlotCount,
+    };
+
+    struct SlotReadTelemetry
+    {
+        bool valid = false;
+        float position[3]{};
+        std::uint8_t invokeMask = 0;
+        std::uint8_t resultMask = 0;
+        std::uint8_t finiteMask = 0;
+        std::uint8_t selectedAccessor = 0xFF;
+    };
+
+    struct PoseReadTelemetry
+    {
+        SlotReadTelemetry slots[PoseSlotCount]{};
+        void* components[kMaxSlotAccessors]{};
+        std::size_t accessorCount = 0;
+    };
+
     // 하나만 찾고 끝내지 않는 이유는 예전 동작을 그대로 두기 위해서다. 예전 코드는 컴포넌트를 순서대로
     // 훑다가 "그 슬롯 이름으로 성공한" 첫 컴포넌트를 채택했으므로, 슬롯 컴포넌트가 둘 이상이면 이름마다
     // 다른 컴포넌트가 뽑힐 수 있었다. 목록으로 들고 있으면 그 순서와 결과가 동일하다.
@@ -997,27 +1045,35 @@ namespace
         return accessors;
     }
 
-    bool ReadSlotPosition(const SlotAccessors& accessors, std::uint64_t slotName, float output[3])
+    bool ReadSlotPosition(const SlotAccessors& accessors, std::uint64_t slotName, SlotReadTelemetry& telemetry)
     {
         for (std::size_t i = 0; i < accessors.count; ++i)
         {
             WorldTransformLayout transform{};
             bool result = false;
             Game::Rtti::Argument arguments[] = {{&slotName}, {&transform}};
-            if (!Game::Rtti::Invoke(accessors.functions[i], accessors.components[i], arguments, 2, &result) ||
-                !result)
-            {
+            const std::uint8_t accessorBit = static_cast<std::uint8_t>(1u << i);
+            if (!Game::Rtti::Invoke(accessors.functions[i], accessors.components[i], arguments, 2, &result))
                 continue;
-            }
+            telemetry.invokeMask |= accessorBit;
+            if (!result)
+                continue;
+            telemetry.resultMask |= accessorBit;
 
             constexpr float fixedPointScale = 1.0f / static_cast<float>(2 << 16);
-            output[0] = static_cast<float>(transform.x) * fixedPointScale;
-            output[1] = static_cast<float>(transform.y) * fixedPointScale;
-            output[2] = static_cast<float>(transform.z) * fixedPointScale;
-            if (std::isfinite(output[0]) && std::isfinite(output[1]) && std::isfinite(output[2]) &&
-                std::abs(output[0]) < 1000000.0f && std::abs(output[1]) < 1000000.0f &&
-                std::abs(output[2]) < 1000000.0f)
+            const float position[3] = {
+                static_cast<float>(transform.x) * fixedPointScale,
+                static_cast<float>(transform.y) * fixedPointScale,
+                static_cast<float>(transform.z) * fixedPointScale,
+            };
+            if (std::isfinite(position[0]) && std::isfinite(position[1]) && std::isfinite(position[2]) &&
+                std::abs(position[0]) < 1000000.0f && std::abs(position[1]) < 1000000.0f &&
+                std::abs(position[2]) < 1000000.0f)
             {
+                telemetry.finiteMask |= accessorBit;
+                telemetry.selectedAccessor = static_cast<std::uint8_t>(i);
+                telemetry.valid = true;
+                memcpy(telemetry.position, position, sizeof(telemetry.position));
                 return true;
             }
         }
@@ -1040,33 +1096,34 @@ namespace
         memcpy(visual.posePoints[visual.posePointCount++], position, sizeof(visual.posePoints[0]));
     }
 
-    void ReadCurrentPoseSlots(const EntityLayout* entity, Game::AnimationData::VisualData& visual)
+    PoseReadTelemetry ReadCurrentPoseSlots(const EntityLayout* entity, Game::AnimationData::VisualData& visual)
     {
         Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::PoseSlots);
 
-        struct PosePoint
-        {
-            bool valid = false;
-            float position[3]{};
-        };
-
         // 컴포넌트 순회와 RTTI 조회는 여기서 한 번이면 된다. 아래 6줄은 Invoke만 남는다.
         const SlotAccessors accessors = FindSlotAccessors(entity);
-
-        PosePoint head, chest, hips, rightHand, leftLeg, rightLeg;
-        head.valid = ReadSlotPosition(accessors, Fnv1a64("Head"), head.position);
-        chest.valid = ReadSlotPosition(accessors, Fnv1a64("Chest"), chest.position);
-        hips.valid = ReadSlotPosition(accessors, Fnv1a64("Hips"), hips.position);
-        rightHand.valid = ReadSlotPosition(accessors, Fnv1a64("RightHand"), rightHand.position);
-        leftLeg.valid = ReadSlotPosition(accessors, Fnv1a64("LegLeft"), leftLeg.position);
-        rightLeg.valid = ReadSlotPosition(accessors, Fnv1a64("LegRight"), rightLeg.position);
+        PoseReadTelemetry telemetry;
+        telemetry.accessorCount = accessors.count;
+        memcpy(telemetry.components, accessors.components, sizeof(telemetry.components));
+        auto& head = telemetry.slots[PoseHead];
+        auto& chest = telemetry.slots[PoseChest];
+        auto& hips = telemetry.slots[PoseHips];
+        auto& rightHand = telemetry.slots[PoseRightHand];
+        auto& leftLeg = telemetry.slots[PoseLeftLeg];
+        auto& rightLeg = telemetry.slots[PoseRightLeg];
+        ReadSlotPosition(accessors, Fnv1a64("Head"), head);
+        ReadSlotPosition(accessors, Fnv1a64("Chest"), chest);
+        ReadSlotPosition(accessors, Fnv1a64("Hips"), hips);
+        ReadSlotPosition(accessors, Fnv1a64("RightHand"), rightHand);
+        ReadSlotPosition(accessors, Fnv1a64("LegLeft"), leftLeg);
+        ReadSlotPosition(accessors, Fnv1a64("LegRight"), rightLeg);
 
         visual.hasHeadPosition = head.valid;
         if (head.valid)
             memcpy(visual.headPosition, head.position, sizeof(visual.headPosition));
         visual.posePointCount = 0;
-        const PosePoint* const ordered[] = {&head, &chest, &hips, &rightHand, &leftLeg, &rightLeg};
-        for (const PosePoint* point : ordered)
+        const SlotReadTelemetry* const ordered[] = {&head, &chest, &hips, &rightHand, &leftLeg, &rightLeg};
+        for (const SlotReadTelemetry* point : ordered)
         {
             if (point->valid)
                 AddPosePoint(visual, point->position);
@@ -1082,6 +1139,278 @@ namespace
             AddSkeletonSegment(visual, hips.position, leftLeg.position);
         if (hips.valid && rightLeg.valid)
             AddSkeletonSegment(visual, hips.position, rightLeg.position);
+        return telemetry;
+    }
+
+    PoseMetrics MeasurePose(const PoseReadTelemetry& telemetry, const float entityPosition[3])
+    {
+        PoseMetrics metrics;
+        float lowest = (std::numeric_limits<float>::max)();
+        float highest = -(std::numeric_limits<float>::max)();
+        for (std::size_t i = 0; i < PoseSlotCount; ++i)
+        {
+            const SlotReadTelemetry& slot = telemetry.slots[i];
+            if (!slot.valid)
+                continue;
+            metrics.validMask |= static_cast<std::uint8_t>(1u << i);
+            lowest = (std::min)(lowest, slot.position[2]);
+            highest = (std::max)(highest, slot.position[2]);
+        }
+        if (metrics.validMask != 0)
+            metrics.verticalSpan = highest - lowest;
+        if (telemetry.slots[PoseHead].valid)
+            metrics.headRelativeZ = telemetry.slots[PoseHead].position[2] - entityPosition[2];
+        if (telemetry.slots[PoseHead].valid && telemetry.slots[PoseHips].valid)
+        {
+            metrics.headToHips = telemetry.slots[PoseHead].position[2] -
+                                 telemetry.slots[PoseHips].position[2];
+        }
+        return metrics;
+    }
+
+    float Distance3(const float lhs[3], const float rhs[3])
+    {
+        const float x = lhs[0] - rhs[0];
+        const float y = lhs[1] - rhs[1];
+        const float z = lhs[2] - rhs[2];
+        return std::sqrt(x * x + y * y + z * z);
+    }
+
+    bool ReservePoseAnomalyLogRecords(std::uint32_t count)
+    {
+        return g_poseAnomalyLogRecords.fetch_add(count, std::memory_order_relaxed) + count <=
+               kPoseAnomalyLogRecordBudget;
+    }
+
+    void LogPoseAnomalyDetails(std::uint64_t entityId, std::uint64_t event, std::uint64_t sample,
+                               const PoseReadTelemetry& telemetry)
+    {
+        const auto& h = telemetry.slots[PoseHead];
+        const auto& c = telemetry.slots[PoseChest];
+        const auto& p = telemetry.slots[PoseHips];
+        const auto& r = telemetry.slots[PoseRightHand];
+        const auto& l = telemetry.slots[PoseLeftLeg];
+        const auto& g = telemetry.slots[PoseRightLeg];
+        Diagnostics::Log(
+            "[POSE-ANOMALY] slots entity=%016llX event=%llu sample=%llu "
+            "H[%u:%X/%X/%X]=(%.3f,%.3f,%.3f) C[%u:%X/%X/%X]=(%.3f,%.3f,%.3f) "
+            "P[%u:%X/%X/%X]=(%.3f,%.3f,%.3f) R[%u:%X/%X/%X]=(%.3f,%.3f,%.3f) "
+            "L[%u:%X/%X/%X]=(%.3f,%.3f,%.3f) G[%u:%X/%X/%X]=(%.3f,%.3f,%.3f)",
+            static_cast<unsigned long long>(entityId), static_cast<unsigned long long>(event),
+            static_cast<unsigned long long>(sample), h.selectedAccessor, h.invokeMask, h.resultMask, h.finiteMask,
+            h.position[0], h.position[1], h.position[2], c.selectedAccessor, c.invokeMask, c.resultMask, c.finiteMask,
+            c.position[0], c.position[1], c.position[2], p.selectedAccessor, p.invokeMask, p.resultMask, p.finiteMask,
+            p.position[0], p.position[1], p.position[2], r.selectedAccessor, r.invokeMask, r.resultMask, r.finiteMask,
+            r.position[0], r.position[1], r.position[2], l.selectedAccessor, l.invokeMask, l.resultMask, l.finiteMask,
+            l.position[0], l.position[1], l.position[2], g.selectedAccessor, g.invokeMask, g.resultMask, g.finiteMask,
+            g.position[0], g.position[1], g.position[2]);
+        Diagnostics::Log(
+            "[POSE-ANOMALY] accessors entity=%016llX event=%llu count=%zu components=[%p,%p,%p,%p]",
+            static_cast<unsigned long long>(entityId), static_cast<unsigned long long>(event),
+            telemetry.accessorCount, telemetry.components[0], telemetry.components[1], telemetry.components[2],
+            telemetry.components[3]);
+    }
+
+    void DiagnosePoseSample(TrackedPuppet& tracked, Game::AnimationData::VisualData& visual,
+                            const PoseReadTelemetry& telemetry, const float entityPosition[3], bool isDead,
+                            ULONGLONG now)
+    {
+        const PoseMetrics current = MeasurePose(telemetry, entityPosition);
+        const PoseMetrics previous = tracked.poseMetrics;
+        const std::uint8_t coreMask = static_cast<std::uint8_t>((1u << PoseHead) | (1u << PoseChest) |
+                                                                (1u << PoseHips));
+        const ULONGLONG sampleInterval = tracked.visualUpdatedAt != 0 ? now - tracked.visualUpdatedAt : 0;
+        const bool comparable = tracked.poseSampleSequence != 0 && sampleInterval <= 150 &&
+                                (current.validMask & coreMask) == coreMask &&
+                                (previous.validMask & coreMask) == coreMask;
+        const float rootTravel = tracked.poseSampleSequence != 0
+                                     ? Distance3(entityPosition, tracked.poseEntityPosition)
+                                     : 0.0f;
+        const bool spanCollapsed = comparable && previous.verticalSpan >= 0.85f &&
+                                   current.verticalSpan <= 0.50f &&
+                                   current.verticalSpan <= previous.verticalSpan * 0.55f;
+        const bool coreCollapsed = comparable && previous.headToHips >= 0.65f &&
+                                   current.headToHips <= 0.32f &&
+                                   current.headToHips <= previous.headToHips * 0.50f;
+        const bool headDropped = comparable && previous.headRelativeZ >= 0.90f &&
+                                 current.headRelativeZ <= 0.65f &&
+                                 previous.headRelativeZ - current.headRelativeZ >= 0.50f;
+        const bool transitionAnomaly = !isDead && rootTravel <= 0.40f && spanCollapsed &&
+                                       (coreCollapsed || headDropped);
+        const bool remainsCollapsed = tracked.poseAnomalyActive && !isDead && rootTravel <= 0.40f &&
+                                      current.verticalSpan <= 0.55f &&
+                                      (current.headToHips <= 0.36f || current.headRelativeZ <= 0.70f);
+        const bool anomaly = transitionAnomaly || remainsCollapsed;
+
+        visual.poseSampleSequence = ++tracked.poseSampleSequence;
+        visual.poseAnomalyDetected = anomaly;
+        const float boundsHeight = visual.hasBounds
+                                       ? visual.boundsMaximum[2] - visual.boundsMinimum[2]
+                                       : 0.0f;
+        if (anomaly && !tracked.poseAnomalyActive)
+        {
+            tracked.poseAnomalyActive = true;
+            tracked.poseAnomalyStartedAt = now;
+            const std::uint64_t event = ++tracked.poseAnomalyEvents;
+            if (ReservePoseAnomalyLogRecords(3))
+            {
+                Diagnostics::Log(
+                    "[POSE-ANOMALY] begin entity=%016llX event=%llu sample=%llu dtMs=%llu rootMove=%.3f "
+                    "valid=%02X->%02X span=%.3f->%.3f headRelZ=%.3f->%.3f headHips=%.3f->%.3f "
+                    "boundsHeight=%.3f root=(%.3f,%.3f,%.3f)",
+                    static_cast<unsigned long long>(tracked.entityId), static_cast<unsigned long long>(event),
+                    static_cast<unsigned long long>(visual.poseSampleSequence),
+                    static_cast<unsigned long long>(sampleInterval), rootTravel, previous.validMask,
+                    current.validMask, previous.verticalSpan, current.verticalSpan, previous.headRelativeZ,
+                    current.headRelativeZ, previous.headToHips, current.headToHips, boundsHeight,
+                    entityPosition[0], entityPosition[1], entityPosition[2]);
+                LogPoseAnomalyDetails(tracked.entityId, event, visual.poseSampleSequence, telemetry);
+            }
+        }
+        else if (!anomaly && tracked.poseAnomalyActive)
+        {
+            const std::uint64_t duration = now - tracked.poseAnomalyStartedAt;
+            tracked.poseAnomalyActive = false;
+            if (ReservePoseAnomalyLogRecords(1))
+            {
+                Diagnostics::Log(
+                    "[POSE-ANOMALY] recovered entity=%016llX event=%llu sample=%llu durationMs=%llu "
+                    "valid=%02X span=%.3f headRelZ=%.3f headHips=%.3f boundsHeight=%.3f",
+                    static_cast<unsigned long long>(tracked.entityId),
+                    static_cast<unsigned long long>(tracked.poseAnomalyEvents),
+                    static_cast<unsigned long long>(visual.poseSampleSequence),
+                    static_cast<unsigned long long>(duration), current.validMask, current.verticalSpan,
+                    current.headRelativeZ, current.headToHips, boundsHeight);
+            }
+        }
+
+        tracked.poseMetrics = current;
+        memcpy(tracked.poseEntityPosition, entityPosition, sizeof(tracked.poseEntityPosition));
+    }
+
+    bool ReadTransform(const EntityLayout* entity, float position[3], float orientation[4]);
+
+    struct PoseWork
+    {
+        Game::Rtti::Handle entityHandle;
+        EntityLayout* entity = nullptr;
+        std::uint64_t entityId = 0;
+        std::uint64_t sequence = 0;
+        std::size_t slot = 0;
+        bool isDead = false;
+        bool ready = false;
+        float position[3]{};
+        Game::AnimationData::VisualData visual;
+        PoseReadTelemetry telemetry;
+    };
+
+    void ProcessPoseWorkOnMainTick(PoseWork& work)
+    {
+        __try
+        {
+            auto* entity = static_cast<EntityLayout*>(work.entityHandle.instance);
+            if (!entity || entity != work.entity || entity->entityId != work.entityId ||
+                ClassifyPuppet(entity->nativeType) != PuppetKind::Npc)
+            {
+                return;
+            }
+
+            float orientation[4]{};
+            if (!ReadTransform(entity, work.position, orientation))
+                return;
+            Game::AnimationData::ReadVisualData(work.entityId, work.position, work.visual);
+            work.telemetry = ReadCurrentPoseSlots(entity, work.visual);
+            work.ready = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            work.ready = false;
+        }
+    }
+
+    void ProcessPoseOnMainTick()
+    {
+        constexpr std::size_t kPosePerTick = 24;
+        constexpr ULONGLONG kPoseIntervalMilliseconds = 33;
+        constexpr ULONGLONG kPoseRequestLifetimeMilliseconds = 250;
+        std::array<PoseWork, kPosePerTick> workItems{};
+        std::size_t workCount = 0;
+        const ULONGLONG now = GetTickCount64();
+        const std::size_t start = static_cast<std::size_t>(g_poseRoundRobin % kMaxTrackedPuppets);
+        std::size_t scanned = 0;
+
+        // Stabilize storage only long enough to copy exact strong owners. No RTTI lookup, Script VM entry, or
+        // other game call is allowed while this lock is held.
+        AcquireSRWLockShared(&g_puppetListLock);
+        for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
+        {
+            const std::size_t slot = (start + scanned) % kMaxTrackedPuppets;
+            if (!IsPuppetOccupied(slot))
+                continue;
+            const TrackedPuppet& tracked = g_puppetList[slot];
+            if (!tracked.entity || tracked.entityId == 0 || tracked.poseRequestedAt == 0 ||
+                now - tracked.poseRequestedAt > kPoseRequestLifetimeMilliseconds ||
+                (tracked.visualUpdatedAt != 0 && now - tracked.visualUpdatedAt < kPoseIntervalMilliseconds))
+            {
+                continue;
+            }
+
+            PoseWork& work = workItems[workCount];
+            if (!Game::Rtti::CopyHandle(&tracked.entityHandle, &work.entityHandle))
+                continue;
+            work.entity = tracked.entity;
+            work.entityId = tracked.entityId;
+            work.sequence = tracked.sequence;
+            work.slot = slot;
+            work.isDead = tracked.isDead;
+            ++workCount;
+        }
+        ReleaseSRWLockShared(&g_puppetListLock);
+        g_poseRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
+
+        for (std::size_t i = 0; i < workCount; ++i)
+            ProcessPoseWorkOnMainTick(workItems[i]);
+
+        // Publish complete pose samples as one cache transaction. Present can now only observe the previous or the
+        // new sample, never the six-slot capture in progress.
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (std::size_t i = 0; i < workCount; ++i)
+        {
+            PoseWork& work = workItems[i];
+            if (!work.ready)
+                continue;
+            TrackedPuppet& tracked = g_puppetList[work.slot];
+            if (tracked.entity != work.entity || tracked.entityHandle.instance != work.entity ||
+                tracked.entityId != work.entityId || tracked.sequence != work.sequence)
+            {
+                continue;
+            }
+            DiagnosePoseSample(tracked, work.visual, work.telemetry, work.position, work.isDead, now);
+            tracked.visual = work.visual;
+            tracked.visualUpdatedAt = now;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+
+        for (std::size_t i = 0; i < workCount; ++i)
+            ReleaseOwnedHandle(workItems[i].entityHandle, "pose-work");
+    }
+
+    void ClearPoseStateOnMainTick()
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+            tracked.visual = {};
+            tracked.visualUpdatedAt = 0;
+            tracked.poseRequestedAt = 0;
+            tracked.poseMetrics = {};
+            memset(tracked.poseEntityPosition, 0, sizeof(tracked.poseEntityPosition));
+            tracked.poseAnomalyStartedAt = 0;
+            tracked.poseAnomalyActive = false;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
     }
 
     bool IsCorpseDead(const EntityLayout* entity)
@@ -1253,15 +1582,6 @@ namespace
             snapshot.healthCurrent = tracked.healthCurrent;
             snapshot.healthMax = tracked.healthMax;
             snapshot.healthRatio = tracked.healthRatio;
-            const ULONGLONG now = GetTickCount64();
-            if (tracked.visualUpdatedAt == 0 || now - tracked.visualUpdatedAt >= 33)
-            {
-                Game::AnimationData::VisualData refreshed;
-                Game::AnimationData::ReadVisualData(snapshot.entityId, snapshot.position, refreshed);
-                ReadCurrentPoseSlots(entity, refreshed);
-                tracked.visual = refreshed;
-                tracked.visualUpdatedAt = now;
-            }
             snapshot.visual = tracked.visual;
             return SnapshotResult::Ready;
         }
@@ -2740,6 +3060,7 @@ namespace Game::EntityTracker
         g_featureRequirements.store(0, std::memory_order_release);
         g_healthRequirementActive = false;
         g_attitudeRequirementActive = false;
+        g_poseRequirementActive = false;
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
@@ -2855,6 +3176,7 @@ namespace Game::EntityTracker
         std::uint64_t hostile = 0;
         std::array<Game::Rtti::Handle, kMaxTrackedPuppets> staleHandles{};
         std::size_t staleHandleCount = 0;
+        const ULONGLONG poseRequestNow = GetTickCount64();
         const std::int64_t lockWaitStart = Diagnostics::Profile::Now();
         AcquireSRWLockExclusive(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::SnapshotLockWait,
@@ -2888,7 +3210,10 @@ namespace Game::EntityTracker
             police += snapshot.category == NpcCategory::Police ? 1u : 0u;
             hostile += snapshot.hostility == Hostility::Hostile ? 1u : 0u;
             if (count < capacity)
+            {
+                tracked.poseRequestedAt = poseRequestNow;
                 output[count++] = snapshot;
+            }
         }
         g_trackedPuppets.store(trackedCount, std::memory_order_release);
         g_trackedCivilians.store(civilians, std::memory_order_release);
@@ -2914,6 +3239,24 @@ namespace Game::EntityTracker
         // Present publishes requirements but never enters these RTTI/engine paths. A requirement that turns off is
         // cleared once here before the path becomes dormant, so a later re-enable starts with no stale cache.
         const std::uint32_t requirements = g_featureRequirements.load(std::memory_order_acquire);
+        const bool poseRequired = (requirements & kFeaturePoseRequirementBit) != 0;
+        if (poseRequired)
+        {
+            if (!g_poseRequirementActive)
+            {
+                Diagnostics::Log("pose capture activated: path=main-tick maxPerTick=24 intervalMs=33 "
+                                 "requestLifetimeMs=250");
+            }
+            g_poseRequirementActive = true;
+            Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickPose);
+            ProcessPoseOnMainTick();
+        }
+        else if (g_poseRequirementActive)
+        {
+            ClearPoseStateOnMainTick();
+            g_poseRequirementActive = false;
+        }
+
         const bool healthRequired = (requirements & kFeatureHealthRequirementBit) != 0;
         if (healthRequired)
         {
@@ -3021,16 +3364,17 @@ namespace Game::EntityTracker
         }
     }
 
-    void UpdateFeatureRequirements(bool health, bool attitude)
+    void UpdateFeatureRequirements(bool health, bool attitude, bool pose)
     {
         std::uint32_t requirements = 0;
         requirements |= health ? kFeatureHealthRequirementBit : 0u;
         requirements |= attitude ? kFeatureAttitudeRequirementBit : 0u;
+        requirements |= pose ? kFeaturePoseRequirementBit : 0u;
         const std::uint32_t previous = g_featureRequirements.exchange(requirements, std::memory_order_acq_rel);
         if (previous != requirements)
         {
-            Diagnostics::Log("tracker requirements published: health=%d attitude=%d",
-                             health ? 1 : 0, attitude ? 1 : 0);
+            Diagnostics::Log("tracker requirements published: health=%d attitude=%d pose=%d",
+                             health ? 1 : 0, attitude ? 1 : 0, pose ? 1 : 0);
         }
     }
 }

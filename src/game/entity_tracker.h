@@ -125,9 +125,9 @@ namespace Game::EntityTracker
     // this is false; a repopulated tracker is held false for a bounded settle window after loading.
     bool IsWorldReadyForMainTickConsumers();
 
-    // Publishes which snapshot consumers still need reflected health/attitude refreshes. The values are consumed
+    // Publishes which snapshot consumers still need reflected health/attitude/pose refreshes. The values are consumed
     // only by OnGameMainTick; disabling a requirement clears its cached state once on that same main-tick path.
-    void UpdateFeatureRequirements(bool health, bool attitude);
+    void UpdateFeatureRequirements(bool health, bool attitude, bool pose);
 
     // Requests a main-tick clear and waits for a clear event plus a following tick before unload. The request itself
     // is atomic, so this function never calls into the engine from the unload worker.
