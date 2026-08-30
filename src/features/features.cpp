@@ -56,7 +56,7 @@ namespace Features
         return g_settings;
     }
 
-    void DrawOverlay()
+    void DrawOverlay(bool menuVisible)
     {
         Config::Update();
         const bool graphEnabled = g_settings.debug.showGraph;
@@ -81,7 +81,7 @@ namespace Features
 
         if (graphEnabled)
             Diagnostics::Profile::EndPresentFrame();
-        FpsCounter::Draw(g_settings.debug.showFps, graphEnabled);
+        FpsCounter::Draw(g_settings.debug, menuVisible);
     }
 
     void UpdateHeadless(float displayWidth, float displayHeight)

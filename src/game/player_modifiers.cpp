@@ -19,10 +19,12 @@ namespace
     constexpr std::size_t kModifierDataSize = 0x50;
     constexpr std::uint32_t kMultiplierModifierType = 2;
     constexpr std::size_t kRecoilModifierCount = 11;
-    constexpr std::size_t kSpreadModifierCount = 14;
+    constexpr std::size_t kSpreadModifierCount = 16;
     constexpr std::size_t kModifierCount = kRecoilModifierCount + kSpreadModifierCount;
     constexpr std::uint32_t kNoRecoilMask = 1u << 0;
     constexpr std::uint32_t kNoSpreadMask = 1u << 1;
+    constexpr ULONGLONG kWorldGateFallbackMilliseconds = 1000;
+    constexpr ULONGLONG kWeaponLookupGraceMilliseconds = 250;
 
     struct TweakDbId
     {
@@ -122,6 +124,9 @@ namespace
     std::atomic_uintptr_t g_ownerStatsSystem{0};
     std::atomic_uintptr_t g_ownerPlayerInstance{0};
     ULONGLONG g_lastPathLogTick = 0;
+    ULONGLONG g_worldGateBlockedSince = 0;
+    ULONGLONG g_weaponLookupMissSince = 0;
+    bool g_worldGateFallbackActive = false;
 
     void SetMainTickStage(MainTickStage stage)
     {
@@ -148,6 +153,7 @@ namespace
     // the REDmodding base-stat reference (wiki.redmodding.org): default/min/max/change-per-shot for both hip-fire and ADS. Runtime class and
     // function validation still gates all writes; in-game 2.31 validation remains required.
     constexpr std::array<std::int32_t, kSpreadModifierCount> kSpreadStats = {
+        1432, // Spread
         1435, // SpreadAdsDefaultX
         1436, // SpreadAdsDefaultY
         1442, // SpreadAdsMaxX
@@ -162,12 +168,13 @@ namespace
         1463, // SpreadMinX
         1464, // SpreadMinY
         1447, // SpreadChangePerShot
+        1465, // SpreadPenalty
     };
 
     constexpr const char* kSpreadStatNames[kSpreadModifierCount] = {
-        "SpreadAdsDefaultX", "SpreadAdsDefaultY", "SpreadAdsMaxX", "SpreadAdsMaxY", "SpreadAdsMinX",
-        "SpreadAdsMinY", "SpreadAdsChangePerShot", "SpreadDefaultX", "SpreadDefaultY", "SpreadMaxX",
-        "SpreadMaxY", "SpreadMinX", "SpreadMinY", "SpreadChangePerShot",
+        "Spread", "SpreadAdsDefaultX", "SpreadAdsDefaultY", "SpreadAdsMaxX", "SpreadAdsMaxY",
+        "SpreadAdsMinX", "SpreadAdsMinY", "SpreadAdsChangePerShot", "SpreadDefaultX", "SpreadDefaultY",
+        "SpreadMaxX", "SpreadMaxY", "SpreadMinX", "SpreadMinY", "SpreadChangePerShot", "SpreadPenalty",
     };
 
     std::int32_t ModifierStatType(std::size_t index)
@@ -836,11 +843,11 @@ namespace
         g_lastPathLogTick = now;
         const char* path = usingWeapon ? "equipped-weapon" : "player-fallback";
         if (weaponResult == EquippedWeaponResult::NoItem)
-            path = "waiting-for-equipped-weapon";
+            path = "player-fallback-no-item";
         else if (weaponResult == EquippedWeaponResult::InvalidItem)
-            path = "waiting-for-valid-equipped-weapon";
+            path = "player-fallback-invalid-item";
         else if (weaponResult == EquippedWeaponResult::CallFailed)
-            path = "waiting-for-weapon-call";
+            path = "player-fallback-weapon-call-failed";
         else if (weaponResult == EquippedWeaponResult::ApiUnavailable)
             path = "player-fallback-api-unavailable";
         Diagnostics::Log("no-recoil target: path=%s playerId=0x%llX weaponId=0x%llX targetId=0x%llX "
@@ -895,12 +902,19 @@ namespace
         const bool usingWeapon = weaponResult == EquippedWeaponResult::Found;
         if (weaponResult != EquippedWeaponResult::Found && weaponResult != EquippedWeaponResult::ApiUnavailable)
         {
-            // A resolved TransactionSystem path is authoritative. Empty or failed weapon lookup waits instead of
-            // applying a modifier to the player entity while the weapon handle is in transition.
-            LogTargetDecision(playerId, weaponId, false, weaponResult);
-            if (currentlyActive)
-                RemoveModifiers(systems);
-            return false;
+            // GetItemInSlot can return an empty handle indefinitely after a late injection even while the player
+            // has a weapon equipped. Waiting forever made both modifier features silently unavailable. Preserve a
+            // short transition grace, then use the verified player entity as the stat target; the next successful
+            // weapon lookup migrates the modifiers back to the weapon target through the normal remove/apply path.
+            const ULONGLONG now = GetTickCount64();
+            if (g_weaponLookupMissSince == 0)
+                g_weaponLookupMissSince = now;
+            if (now - g_weaponLookupMissSince < kWeaponLookupGraceMilliseconds)
+                return currentlyActive;
+        }
+        else
+        {
+            g_weaponLookupMissSince = 0;
         }
 
         const std::uint64_t targetId = usingWeapon ? weaponId : playerId;
@@ -961,12 +975,33 @@ namespace Game::PlayerModifiers
         }
 
         // EntityTracker runs first in the same detour and publishes this bit without entering an engine system.
-        // During world drain/settle, make zero RTTI/system/refcount calls. Active old-world state is retired locally;
-        // its exact handles remain owned until a later stable tick.
-        if (!Game::EntityTracker::IsWorldReadyForMainTickConsumers())
+        // A late injection cannot see NPCs that were registered before the hook existed, however, so tracked=0 is
+        // ambiguous: it can mean either a draining world or a perfectly live already-loaded save. Keep the bounded
+        // transition guard, then fall back to the player/system validation below instead of latching both features
+        // off forever. Active old-world state is retired before the fallback timer starts.
+        const bool sharedWorldReady = Game::EntityTracker::IsWorldReadyForMainTickConsumers();
+        if (sharedWorldReady)
+        {
+            g_worldGateBlockedSince = 0;
+            g_worldGateFallbackActive = false;
+        }
+        else if (!g_worldGateFallbackActive)
         {
             if (modifierActive)
                 RetireModifiersForWorldTransition();
+            const ULONGLONG now = GetTickCount64();
+            if (g_worldGateBlockedSince == 0)
+                g_worldGateBlockedSince = now;
+            if (now - g_worldGateBlockedSince >= kWorldGateFallbackMilliseconds)
+            {
+                g_worldGateFallbackActive = true;
+                Diagnostics::Log("player modifier world gate fallback: tracked world unavailable for %llums; "
+                                 "using current player/system validation",
+                                 static_cast<unsigned long long>(kWorldGateFallbackMilliseconds));
+            }
+        }
+        if (!sharedWorldReady && !g_worldGateFallbackActive)
+        {
             if (cleanupRequested)
                 g_cleanupAcknowledged.store(false, std::memory_order_release);
             SetMainTickStage(MainTickStage::Idle);
@@ -1064,6 +1099,9 @@ namespace Game::PlayerModifiers
         g_ownerGameInstance.store(0, std::memory_order_release);
         g_ownerStatsSystem.store(0, std::memory_order_release);
         g_ownerPlayerInstance.store(0, std::memory_order_release);
+        g_worldGateBlockedSince = 0;
+        g_weaponLookupMissSince = 0;
+        g_worldGateFallbackActive = false;
         g_runtimeAvailable.store(false, std::memory_order_release);
     }
 

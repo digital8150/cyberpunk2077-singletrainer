@@ -96,6 +96,7 @@ namespace Loc
         // 디버그
         ShowFps,
         ShowGraph,
+        GraphOpacity,
         ShowInternalStats,
         ShowInternalStatsHelp,
         DiagnosticLogging,
@@ -117,6 +118,7 @@ namespace Loc
         DegreesFormat,
         HealthFormat,
         DecimalFormat,
+        PercentFormat,
 
         // 시작 안내
         TrainerReady,

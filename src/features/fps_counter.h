@@ -1,6 +1,11 @@
 #pragma once
 
+namespace Features
+{
+    struct DebugSettings;
+}
+
 namespace FpsCounter
 {
-    void Draw(bool fpsEnabled, bool graphEnabled);
+    void Draw(Features::DebugSettings& settings, bool menuVisible);
 }

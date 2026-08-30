@@ -2619,3 +2619,39 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
 - 빌드: `cmake --build build-next --config Release` 전체 통과, 경고 0. 게임(PID 27680)이 여전히
   `build/bin/Release/cp2077_trainer.dll`을 잡고 있어 정식 `build` 트리는 링크할 수 없었다(LNK1104).
   게임을 닫은 뒤 `cmake --build build --config Release`를 다시 돌려야 정식 산출물이 갱신된다.
+
+## 2026-08-30 — recoil/spread late-injection 회귀 수정과 FPS 그래프 상호작용
+
+- no-recoil/no-spread 설정은 정상적으로 `mask=0x3`까지 게시됐지만, `0e83a1a`에서 추가한 공통 world
+  readiness 게이트가 이미 로드된 세이브에 중간 주입할 때 영구 닫혔다. EntityTracker 훅은 주입 전에
+  등록된 NPC를 소급해서 받지 못하므로 실제 월드가 살아 있어도 `tracked=0`일 수 있다. PID 27680의
+  20:54 세션에서 설정 게시 뒤 resolver/apply가 한 번도 실행되지 않은 것이 직접 증거다.
+- PlayerModifiers는 공통 게이트의 1초 전환 보호를 유지하되, 그 뒤에도 tracker가 비어 있으면 현재
+  PlayerSystem/StatsSystem/GetLocalPlayer 검증 경로로 폴백한다. 기존 modifier가 있으면 폴백 타이머 전에
+  먼저 old-world 상태로 퇴역시킨다. 이로써 late injection을 살리면서 로딩 직후 즉시 엔진 호출하는
+  경로는 만들지 않았다.
+- `GetItemInSlot(AttachmentSlots.WeaponRight)`가 유효한 플레이어를 두고도 `NoItem`을 계속 반환한 실제
+  로그가 있었다. 250 ms 장비 전환 grace 뒤에도 회복되지 않으면 플레이어 entity ID를 stat target으로
+  쓰고, 무기 조회가 다시 성공하면 기존 remove/apply 경로로 weapon target에 복귀한다. 과거의 무한
+  `waiting-for-equipped-weapon` 래치를 제거했다.
+- no-spread에는 설치된 게임의 공식 REDmod 2.31 `tools/redmod/metadata.json`으로 ID를 재검증하고 최종
+  집계 stat `Spread(1432)`와 동적 패널티 `SpreadPenalty(1465)`도 0배 modifier 목록에 포함했다. 총 적용
+  수는 recoil 11 + spread 16 = 27이다.
+- FPS 그래프를 고정 foreground 사각형에서 독립 ImGui window로 바꿨다. 메뉴가 열린 동안 헤더를
+  드래그할 수 있고, 닫히면 `NoInputs`로 게임 입력을 전혀 받지 않는다. 위치는 `[debug]
+  graph_position_x/y`에 저장하고 해상도 변경 시 화면 안으로 clamp한다.
+- 그래프는 현행 UiTheme/UiKit의 surface, border, typography, semantic accent/warning/success 색을 쓴다.
+  원시 Present 샘플을 매 프레임 240개씩 흘리던 방식 대신 time-correct EMA(0.28 s) + 10 Hz 샘플링,
+  120개 히스토리(약 12초)로 바꿔 움직임을 읽을 수 있게 했다.
+- 후속 요청으로 Debug > Overlay에 `그래프 투명도 / Graph opacity` 슬라이더를 추가했다. 범위는
+  35~100%, 기본 88%이며 `[debug] graph_opacity`로 저장된다. 실제 backdrop blur는 추가하지 않고
+  반투명 surface만 사용하므로 GPU 패스 비용은 늘지 않는다.
+- Misc 페이지는 공통 열 시스템의 가운데 정렬을 이 페이지에서만 끄고 최대 470 px 첫 번째 열을 왼쪽에
+  고정했다. 나중에 항목이 늘면 `ColumnsBegin(2, ...)`로 같은 컴포넌트 시스템 안에서 오른쪽 열을 열 수
+  있다.
+- 검증: `git diff --check` 통과, 정식 `cmake --build build --config Release` 전체 통과(경고 0).
+  UI preview에서 Misc 왼쪽 1열과 Debug의 투명도 행/비활성 상태를 확인했다. PID 27680 late injection에서
+  `player modifier world gate fallback` → resolver `resolved=1` → `player-fallback-no-item` →
+  `player modifiers applied: targetId=0x1 count=27 mask=0x3`를 두 번의 새 빌드 모두 재현했고 프로세스는
+  계속 `Responding=True`다. 인게임 캡처로 라이트 테마의 반투명 그래프와 스무딩된 세 곡선을 확인했다.
+  최종 DLL은 현재 PID 27680에 주입된 채라 사용자가 recoil/spread 체감을 바로 확인할 수 있다.

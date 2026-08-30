@@ -655,7 +655,7 @@ namespace Overlay
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        Features::DrawOverlay();
+        Features::DrawOverlay(g_visible);
         Widgets::DrawStartupHint();
         if (g_visible)
             Widgets::DrawMainMenu();

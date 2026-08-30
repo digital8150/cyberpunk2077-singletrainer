@@ -71,7 +71,7 @@ namespace UiKit
     void SetContentWidth(float width);
     // 사용 가능한 폭에 맞춰 실제 열 개수를 정한다 (요청한 것보다 줄어들 수 있다).
     int ResolveColumnCount(int desired, float availableWidth);
-    void ColumnsBegin(int count, float totalWidth);
+    void ColumnsBegin(int count, float totalWidth, bool center = true);
     void Column();
     void ColumnsEnd();
 

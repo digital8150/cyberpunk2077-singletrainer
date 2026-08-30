@@ -97,6 +97,12 @@ namespace Features
         bool showFps = true;
         // FPS/프레임타임/트레이너 CPU 시간 그래프.
         bool showGraph = false;
+        // 35~100%. 완전 투명에 가까우면 그래프 자체가 기능을 잃으므로 UI와 config 양쪽에서 하한을 둔다.
+        float graphOpacityPercent = 88.0f;
+        // 음수는 아직 사용자가 배치하지 않은 상태다. 첫 표시 때 좌하단 기본 위치를 계산하고, 이후에는
+        // 실제 화면 좌표를 저장한다. 해상도가 바뀌면 렌더러가 현재 디스플레이 안으로 다시 clamp한다.
+        float graphPositionX = -1.0f;
+        float graphPositionY = -1.0f;
         // 오버레이에 엔티티 피드/에임봇 후보/시야 캐시 등 내부 카운터를 표시한다.
         bool showInternalStats = false;
         // 진단용: 오버레이 GPU 제출을 멈추고 타겟 선택만 CPU에서 돌린다. 메뉴가 닫혀 있고 오버레이가
@@ -122,6 +128,6 @@ namespace Features
     Settings& GetSettings();
 
     // ImGui::NewFrame 이후 호출. 메뉴 표시 여부와 무관하게 활성 기능의 HUD 요소를 그린다.
-    void DrawOverlay();
+    void DrawOverlay(bool menuVisible);
     void UpdateHeadless(float displayWidth, float displayHeight);
 }

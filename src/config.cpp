@@ -52,6 +52,9 @@ namespace
                lhs.misc.noSpread == rhs.misc.noSpread &&
                lhs.debug.showFps == rhs.debug.showFps &&
                lhs.debug.showGraph == rhs.debug.showGraph &&
+               lhs.debug.graphOpacityPercent == rhs.debug.graphOpacityPercent &&
+               lhs.debug.graphPositionX == rhs.debug.graphPositionX &&
+               lhs.debug.graphPositionY == rhs.debug.graphPositionY &&
                lhs.debug.showInternalStats == rhs.debug.showInternalStats &&
                lhs.debug.headlessAimbot == rhs.debug.headlessAimbot &&
                lhs.debug.diagnosticLogging == rhs.debug.diagnosticLogging &&
@@ -175,6 +178,9 @@ namespace
 
         ok &= WriteBool(L"debug", L"show_fps", settings.debug.showFps);
         ok &= WriteBool(L"debug", L"show_graph", settings.debug.showGraph);
+        ok &= WriteFloat(L"debug", L"graph_opacity", settings.debug.graphOpacityPercent);
+        ok &= WriteFloat(L"debug", L"graph_position_x", settings.debug.graphPositionX);
+        ok &= WriteFloat(L"debug", L"graph_position_y", settings.debug.graphPositionY);
         ok &= WriteBool(L"debug", L"show_internal_stats", settings.debug.showInternalStats);
         ok &= WriteBool(L"debug", L"headless_aimbot", settings.debug.headlessAimbot);
 
@@ -277,6 +283,12 @@ namespace Config
         settings.debug.showFps =
             ReadBoolMigrated(L"debug", L"show_fps", L"trainer", L"show_fps", settings.debug.showFps);
         settings.debug.showGraph = ReadBool(L"debug", L"show_graph", settings.debug.showGraph);
+        settings.debug.graphOpacityPercent =
+            ReadFloat(L"debug", L"graph_opacity", settings.debug.graphOpacityPercent, 35.0f, 100.0f);
+        settings.debug.graphPositionX =
+            ReadFloat(L"debug", L"graph_position_x", settings.debug.graphPositionX, -1.0f, 16384.0f);
+        settings.debug.graphPositionY =
+            ReadFloat(L"debug", L"graph_position_y", settings.debug.graphPositionY, -1.0f, 16384.0f);
         settings.debug.showInternalStats =
             ReadBool(L"debug", L"show_internal_stats", settings.debug.showInternalStats);
         settings.debug.headlessAimbot = ReadBoolMigrated(L"debug", L"headless_aimbot", L"aimbot",

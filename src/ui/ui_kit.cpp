@@ -478,7 +478,7 @@ namespace UiKit
         return count;
     }
 
-    void ColumnsBegin(int count, float totalWidth)
+    void ColumnsBegin(int count, float totalWidth, bool center)
     {
         g_columns.count = (std::max)(1, count);
         g_columns.current = -1;
@@ -488,7 +488,7 @@ namespace UiKit
                                          static_cast<float>(g_columns.count));
         const float used = g_columns.width * g_columns.count +
                            Metrics::kColumnGap * (g_columns.count - 1);
-        g_columns.indent = (std::max)(0.0f, (totalWidth - used) * 0.5f);
+        g_columns.indent = center ? (std::max)(0.0f, (totalWidth - used) * 0.5f) : 0.0f;
     }
 
     // 열은 자식 창이 아니라 그룹으로 만든다. 자식 창으로 나누면 열마다 스크롤바가 따로 생겨서

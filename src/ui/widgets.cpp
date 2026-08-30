@@ -334,7 +334,7 @@ namespace Widgets
         void DrawMiscPage(Features::Settings& settings)
         {
             // 설정이 둘뿐이라 2열로 나눌 것이 없다. 열 하나는 UiKit이 최대 폭으로 잘라 준다.
-            UiKit::ColumnsBegin(1, UiKit::ContentWidth());
+            UiKit::ColumnsBegin(1, UiKit::ContentWidth(), false);
             UiKit::Column();
             UiKit::SectionBegin(Loc::Text(Loc::Str::SectionWeapon));
             UiKit::ToggleRow("no_recoil", Loc::Text(Loc::Str::NoRecoil), &settings.misc.noRecoil);
@@ -458,6 +458,10 @@ namespace Widgets
             UiKit::SectionBegin(Loc::Text(Loc::Str::SectionOverlay));
             UiKit::ToggleRow("show_fps", Loc::Text(Loc::Str::ShowFps), &debug.showFps);
             UiKit::ToggleRow("show_graph", Loc::Text(Loc::Str::ShowGraph), &debug.showGraph);
+            UiKit::BeginDisabled(!debug.showGraph);
+            UiKit::SliderRow("graph_opacity", Loc::Text(Loc::Str::GraphOpacity), &debug.graphOpacityPercent,
+                             35.0f, 100.0f, Loc::Text(Loc::Str::PercentFormat));
+            UiKit::EndDisabled();
             UiKit::ToggleRow("show_stats", Loc::Text(Loc::Str::ShowInternalStats), &debug.showInternalStats,
                              Loc::Text(Loc::Str::ShowInternalStatsHelp));
             UiKit::SectionEnd();
