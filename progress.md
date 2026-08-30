@@ -2178,3 +2178,15 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   lifetime-safe attitude 처리가 더 중요한 완료 증거라고 판정했다. 종료 원인이 별도 Issue #2로 완전히
   분리됐고 다른 작업 중에도 추가 추적할 수 있으므로, 이 승인에 따라 GitHub Issue #1을 완료 처리한다.
 
+## 2026-08-30 - 재사용 가능한 무음 라이브 watchdog
+
+- 라이브 검증에서 사용한 정책을 `tools/scripts/watchdog.ps1`로 승격했다. `-TargetPid` 또는 `-Name`으로
+  대상을 선택하며, 기본 로그 위치는 `CBPK_LOG_DIR`이 있으면 이를 우선하고 아니면
+  `%LOCALAPPDATA%\cp2077_trainer\`를 사용한다.
+- 정상 상태와 유한 smoke-test 완료 시에는 아무 출력도 하지 않는다. 새 `[FATAL][unhandled]`, process exit,
+  연속 `Responding=False`, trainer log heartbeat 정지만 한 줄로 알리고 각 원인별 exit code로 종료한다.
+- heartbeat/fatal 감시는 각각 끌 수 있고 poll 주기, 연속 응답 없음 횟수, heartbeat timeout/연속 stale
+  횟수를 CLI에서 조정할 수 있다. 의도적인 trainer unload 전에는 watchdog을 먼저 중단해야 한다.
+- 검증: healthy `explorer.exe` 1-poll 실행은 output 0/exit 0, synthetic appended unhandled fatal은 CRASH 한 줄,
+  정지된 synthetic heartbeat는 FREEZE 한 줄, 없는 PID는 PROCESS_EXIT 한 줄을 각각 확인했다.
+
