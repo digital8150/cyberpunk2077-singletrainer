@@ -105,6 +105,17 @@ namespace Game::Rtti
     // callers that hardcode a signature can verify it against the running build first.
     std::size_t ParameterCount(const Function* function);
 
+    // 파라미터 하나의 리플렉션 정보. 이름 해시는 ResolveName으로 실제 이름이 되므로, 하드코딩한 시그니처가
+    // 이 빌드와 어긋났을 때 "몇 번째가 무엇인지"를 로그로 확인할 수 있다. 이름 추측 대신 관측을 남기라는
+    // 이 저장소의 규칙을 파라미터 수준까지 확장한 것이다.
+    struct ParameterInfo
+    {
+        std::uint64_t nameHash = 0;
+        std::uint64_t flags = 0;
+    };
+
+    bool ParameterAt(const Function* function, std::size_t index, ParameterInfo& output);
+
     // Invokes a reflected REDengine function using its own parameter type descriptors.
     // The caller owns argument/result storage and must keep it alive for the duration of the call.
     bool Invoke(Function* function, void* context, const Argument* arguments, std::size_t argumentCount,

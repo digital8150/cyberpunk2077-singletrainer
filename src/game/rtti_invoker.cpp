@@ -576,6 +576,31 @@ namespace Game::Rtti
         }
     }
 
+    bool ParameterAt(const Function* opaqueFunction, std::size_t index, ParameterInfo& output)
+    {
+        output = {};
+        if (!IsValidUserPointer(opaqueFunction))
+            return false;
+        __try
+        {
+            const auto* function = reinterpret_cast<const FunctionLayout*>(opaqueFunction);
+            if (function->params.size > function->params.capacity || function->params.size > 24 ||
+                index >= function->params.size || !IsValidUserPointer(function->params.entries))
+                return false;
+            const auto* parameter = static_cast<const PropertyLayout*>(function->params.entries[index]);
+            if (!IsValidUserPointer(parameter))
+                return false;
+            output.nameHash = parameter->nameHash;
+            output.flags = parameter->flags;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            output = {};
+            return false;
+        }
+    }
+
     std::size_t ParameterCount(const Function* opaqueFunction)
     {
         if (!IsValidUserPointer(opaqueFunction))

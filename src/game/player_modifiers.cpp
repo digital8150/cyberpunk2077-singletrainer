@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 
@@ -101,6 +102,9 @@ namespace
         ULONGLONG lastResolveAttempt = 0;
         Game::Rtti::Function* addGodMode = nullptr;
         Game::Rtti::Function* removeGodMode = nullptr;
+        // 이 빌드의 AddGodMode/RemoveGodMode는 반환값이 있다. 관측한 값을 그대로 들고 있다가 호출 시
+        // 결과 저장소를 넘길지 결정한다 — 다른 빌드에서 Void가 되어도 코드를 고칠 필요가 없다.
+        bool godModeReturnsValue = false;
     };
 
     struct StaminaRuntime
@@ -845,6 +849,50 @@ namespace
         return true;
     }
 
+    // 이름 추측이 빗나갔을 때 조용히 기능만 죽지 않도록, 그 타입이 실제로 노출하는 리플렉션 표면을 한 번
+    // 찍는다. AGENTS.md가 정한 원칙 — 틀린 추측은 보고되어야지 무증상으로 사라지면 안 된다.
+    void LogReflectedSurfaceOnce(const char* label, void* systemInstance, bool& alreadyLogged)
+    {
+        if (alreadyLogged || !systemInstance)
+            return;
+        alreadyLogged = true;
+
+        const Game::Rtti::Class* type = Game::Rtti::NativeType(systemInstance);
+        for (unsigned depth = 0; type && depth < 6; ++depth)
+        {
+            const std::size_t count = Game::Rtti::FunctionCount(type);
+            Diagnostics::Log("%s reflected surface: depth=%u class=%s functions=%zu", label, depth,
+                             Game::Rtti::ResolveName(Game::Rtti::ClassNameHash(type)), count);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                Game::Rtti::Function* function = Game::Rtti::FunctionAt(type, i);
+                Game::Rtti::FunctionInfo info;
+                if (!function || !Game::Rtti::InspectFunction(function, info))
+                    continue;
+                char parameters[256]{};
+                int offset = 0;
+                for (std::size_t p = 0; p < info.parameterCount && offset >= 0 &&
+                                        offset < static_cast<int>(sizeof(parameters)) - 1; ++p)
+                {
+                    Game::Rtti::ParameterInfo parameter;
+                    if (!Game::Rtti::ParameterAt(function, p, parameter))
+                        break;
+                    const int written = snprintf(parameters + offset, sizeof(parameters) - offset, "%s%s(0x%llX)",
+                                                 p == 0 ? "" : ", ",
+                                                 Game::Rtti::ResolveName(parameter.nameHash),
+                                                 static_cast<unsigned long long>(parameter.flags));
+                    if (written < 0)
+                        break;
+                    offset += written;
+                }
+                Diagnostics::Log("%s   [%zu] %s params=%zu return=%d (%s)", label, i,
+                                 Game::Rtti::ResolveName(info.shortNameHash), info.parameterCount,
+                                 info.hasReturnValue ? 1 : 0, parameters);
+            }
+            type = Game::Rtti::ParentClass(type);
+        }
+    }
+
     bool ResolveHealthRuntimeOnMainTick()
     {
         if (g_healthRuntime.addGodMode && g_healthRuntime.removeGodMode)
@@ -872,8 +920,12 @@ namespace
                 addHasReturn = Game::Rtti::HasReturnValue(addGodMode);
             if (removeGodMode)
                 removeHasReturn = Game::Rtti::HasReturnValue(removeGodMode);
+            // 관측된 2.31 표면: AddGodMode/RemoveGodMode(entID, gmType, sourceInfo)이고 둘 다 반환값이 있다.
+            // 예전에는 Void라고 가정하고 반환값이 있으면 거절해서, 이름과 인자 수가 다 맞는데도 기능이
+            // 통째로 죽어 있었다. 반환 여부는 여기서 기록해 두고 호출 시 결과 버퍼를 넘긴다.
             resolved = addGodMode && removeGodMode && Game::Rtti::ParameterCount(addGodMode) == 3 &&
-                       Game::Rtti::ParameterCount(removeGodMode) == 3 && !addHasReturn && !removeHasReturn;
+                       Game::Rtti::ParameterCount(removeGodMode) == 3;
+            g_healthRuntime.godModeReturnsValue = addHasReturn || removeHasReturn;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -885,9 +937,14 @@ namespace
             g_healthRuntime.addGodMode = addGodMode;
             g_healthRuntime.removeGodMode = removeGodMode;
         }
-        Diagnostics::Log("health GodMode resolver: system=%p add=%p remove=%p resolved=%d",
+        Diagnostics::Log("health GodMode resolver: system=%p add=%p remove=%p found=(%p,%p) resolved=%d",
                          systems.godModeSystem, g_healthRuntime.addGodMode, g_healthRuntime.removeGodMode,
-                         resolved ? 1 : 0);
+                         addGodMode, removeGodMode, resolved ? 1 : 0);
+        if (!resolved)
+        {
+            static bool loggedGodModeSurface = false;
+            LogReflectedSurfaceOnce("GodMode", systems.godModeSystem, loggedGodModeSurface);
+        }
         return g_healthRuntime.addGodMode && g_healthRuntime.removeGodMode;
     }
 
@@ -900,11 +957,13 @@ namespace
         std::uint64_t source = kGodModeSource;
         Game::Rtti::Argument arguments[] = {{&playerId}, {&mode}, {&source}};
         bool invoked = false;
+        // 관측된 시그니처는 (entID, gmType, sourceInfo)에 반환값이 있다. 반환 저장소를 넘기지 않으면
+        // Invoke가 결과를 쓸 곳이 없다.
+        bool result = false;
         __try
         {
-            // AddGodMode/RemoveGodMode are Void in the reflected 2.31 surface. The resolver rejects a return
-            // value, so Invoke receives no guessed result buffer.
-            invoked = Game::Rtti::Invoke(function, systems.godModeSystem, arguments, 3);
+            invoked = Game::Rtti::Invoke(function, systems.godModeSystem, arguments, 3,
+                                         g_healthRuntime.godModeReturnsValue ? &result : nullptr);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1030,7 +1089,7 @@ namespace
                 setterHasReturn = Game::Rtti::HasReturnValue(setValue);
             resolved = getValue && getMaxValue && setValue && Game::Rtti::ParameterCount(getValue) == 3 &&
                        Game::Rtti::ParameterCount(getMaxValue) == 2 &&
-                       Game::Rtti::ParameterCount(setValue) == 4 && !setterHasReturn;
+                       Game::Rtti::ParameterCount(setValue) == 6 && !setterHasReturn;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1043,9 +1102,14 @@ namespace
             g_staminaRuntime.getMaxValue = getMaxValue;
             g_staminaRuntime.setValue = setValue;
         }
-        Diagnostics::Log("stamina stat-pool resolver: system=%p value=%p max=%p set=%p resolved=%d",
+        Diagnostics::Log("stamina stat-pool resolver: system=%p value=%p max=%p set=%p found=(%p,%p,%p) resolved=%d",
                          systems.statPoolsSystem, g_staminaRuntime.getValue, g_staminaRuntime.getMaxValue,
-                         g_staminaRuntime.setValue, resolved ? 1 : 0);
+                         g_staminaRuntime.setValue, getValue, getMaxValue, setValue, resolved ? 1 : 0);
+        if (!resolved)
+        {
+            static bool loggedStatPoolSurface = false;
+            LogReflectedSurfaceOnce("StatPools", systems.statPoolsSystem, loggedStatPoolSurface);
+        }
         return g_staminaRuntime.getValue && g_staminaRuntime.getMaxValue && g_staminaRuntime.setValue;
     }
 
@@ -1081,14 +1145,20 @@ namespace
         if (!systems.statPoolsSystem || !g_staminaRuntime.setValue || !playerId || !player.instance)
             return false;
         std::int32_t pool = kStaminaPool;
+        // 관측된 2.31 시그니처는 여섯 개다:
+        //   RequestSettingStatPoolValue(objID, statPoolType, newValue, instigator, perc, ignoreCustomLimit)
+        // 뒤 두 개는 optional 플래그(0x400)가 붙어 있지만 Invoke는 정확한 개수를 요구하므로 반드시 넘긴다
+        // (이미 동작 중인 GetStatPoolValue의 perc도 같은 optional이고 같은 방식으로 넘기고 있다).
+        // perc=false는 newValue를 퍼센트가 아니라 절대값으로 해석하라는 뜻이다.
+        bool percentage = false;
+        bool ignoreCustomLimit = false;
         Game::Rtti::Argument arguments[] = {{&playerId}, {&pool}, {&value},
-                                             {const_cast<Game::Rtti::Handle*>(&player)}};
+                                             {const_cast<Game::Rtti::Handle*>(&player)},
+                                             {&percentage}, {&ignoreCustomLimit}};
         bool invoked = false;
         __try
         {
-            // The resolver rejects a reflected return value: RequestSettingStatPoolValue is a Void API in the
-            // 2.31 script surface, so a null result pointer is safe and avoids guessing a return ABI.
-            invoked = Game::Rtti::Invoke(g_staminaRuntime.setValue, systems.statPoolsSystem, arguments, 4);
+            invoked = Game::Rtti::Invoke(g_staminaRuntime.setValue, systems.statPoolsSystem, arguments, 6);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
