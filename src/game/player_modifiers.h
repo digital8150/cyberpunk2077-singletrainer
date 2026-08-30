@@ -2,11 +2,17 @@
 
 #include <cstdint>
 
+namespace Features
+{
+    struct MiscSettings;
+}
+
 namespace Game::PlayerModifiers
 {
-    // Present/UI code only publishes this atomic request. StatsSystem and TransactionSystem calls run from the
-    // existing game-main-tick detour in visibility.cpp.
-    void PublishDesired(bool enabled);
+    // Present/UI code only publishes this request. StatsSystem and TransactionSystem calls run from the
+    // existing game-main-tick detour in visibility.cpp. The whole Misc group is published in one call so the
+    // Present-side call site does not have to grow a line per feature.
+    void PublishDesired(const Features::MiscSettings& misc);
     void OnGameMainTick();
 
     // Requests removal on the main tick and waits for its acknowledgement. Returns false when the game stopped

@@ -36,7 +36,7 @@ namespace Features
     {
         Config::Update();
         // Present may publish the desired value, but all StatsSystem calls are drained by the game main tick.
-        Game::PlayerModifiers::PublishDesired(g_settings.misc.noRecoil);
+        Game::PlayerModifiers::PublishDesired(g_settings.misc);
         // ESP와 에임봇이 같은 시야 캐시를 공유하므로 프레임 예산은 여기서 한 번만 초기화한다.
         Game::Visibility::BeginFrame();
         // 트래킹 리스트 순회도 프레임당 한 번이면 충분하다. ESP와 에임봇이 같은 배열을 읽는다.
@@ -49,7 +49,7 @@ namespace Features
     void UpdateHeadless(float displayWidth, float displayHeight)
     {
         Config::Update();
-        Game::PlayerModifiers::PublishDesired(g_settings.misc.noRecoil);
+        Game::PlayerModifiers::PublishDesired(g_settings.misc);
         Game::Visibility::BeginFrame();
         const FrameSnapshots frame = CaptureFrameSnapshots();
         Aimbot::UpdateHeadless(g_settings.aimbot, frame, displayWidth, displayHeight);

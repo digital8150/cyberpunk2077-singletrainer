@@ -2,6 +2,7 @@
 
 #include "rtti_invoker.h"
 #include "../diagnostics.h"
+#include "../features/features.h"
 #include "../framework.h"
 
 #include <algorithm>
@@ -723,8 +724,9 @@ namespace
 
 namespace Game::PlayerModifiers
 {
-    void PublishDesired(bool enabled)
+    void PublishDesired(const Features::MiscSettings& misc)
     {
+        const bool enabled = misc.noRecoil;
         // Once unload cleanup starts it owns the desired state. Present/headless publication must not continually
         // flip the atomic back to true while the unload worker is waiting for its main-tick acknowledgement.
         if (enabled && g_cleanupRequested.load(std::memory_order_acquire))
