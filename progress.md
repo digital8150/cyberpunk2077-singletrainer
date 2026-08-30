@@ -2377,3 +2377,37 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   `A129F5BE7DCA2882C699B01C286EAC7C319CB88D67C832DC820E35A35D19DF43`이다. 현재 PID 4392는 구 DLL의 unload
   루프 안이므로 강제 해제하지 않았다. 다음 clean process에서 no-recoil ON save-load 후 owner reset/재적용/End
   unload 완료를 검증한다. 상세 근거는 `reports/2026-08-30_issue2_validation_pid4392.md`에 기록했다.
+
+## 2026-08-30 - M2 Release Stability 착수: 공유 스키마 선행 커밋과 3-lane 병렬 분업
+
+- 사용자가 "튕김도 없고 성능도 괜찮다"고 판단해 M2(Release Stability)로 넘어갔다. M2 범위는 다섯 가지다:
+  (1) 오버레이 폴리싱(사이드바 + 한/영 다국어 + 다크/라이트 테마 + ini 전용이던 진단 토글의 Debug 탭
+  노출), (2) misc 신규 기능 4종(no spread / auto pistol / infinite health / infinite stamina),
+  (3) Debug 탭의 FPS + FPS·프레임타임·트레이너 CPU 시간 그래프, (4) 꺼진 시각화/디버깅 기능이 아예 그
+  경로를 타지 않게 하는 게이팅, (5) 에임봇 FOV를 픽셀에서 각도로.
+- 작업을 git worktree 3개(`m2/ui`, `m2/misc`, `m2/perf`)로 갈라 Codex 워커(gpt-5.6-luna, effort=xhigh)
+  세 명에게 병렬로 맡겼다. 세 lane이 같은 파일을 건드리면 통합 비용이 병렬화 이득을 넘기므로, **공유
+  표면은 전부 master에 먼저 커밋해 두고 lane별 파일 소유권을 명시적으로 나눴다**:
+  - ui lane: `src/ui/*` + CMakeLists
+  - misc lane: `src/game/player_modifiers.*`, 새 `src/game/*`, `visibility.cpp`의 메인 틱 디스패치 배선
+  - perf lane: `src/features/*`, `src/profiling.*`, `src/game/entity_tracker.*`
+  `src/features/features.h`(설정 스키마)와 `src/config.cpp`는 어느 lane도 수정하지 못하게 했다.
+- 선행 커밋 1 (`c5d5618`): `Features::Settings`를 오버레이 탭 단위(ui/esp/aimbot/misc/debug)로 재구성하고
+  M2에서 추가될 필드를 전부 미리 선언했다. `config.cpp`에 `[ui]`/`[misc]`/`[debug]` 섹션을 추가하고,
+  진단 토글은 계속 `[diagnostics]` 섹션을 정본으로 쓰되 UI에서 바꾼 값도 같은 키로 되돌려 쓰게 했다.
+  - `Diagnostics::{Get,Apply}RuntimeToggles`를 추가했다. 로깅/계측/디버거 출력은 원자 하나로 즉시
+    반영된다. **크래시 기록(VEH + 마지막 기회 필터)은 끌 때 등록을 해제하지 않는다** — 예외가 이미
+    디스패치 중일 때 핸들러를 빼는 것이야말로 이 프로젝트가 없애려는 사고 유형이라, 대신 핸들러 첫
+    줄에서 원자를 읽고 곧바로 `EXCEPTION_CONTINUE_SEARCH`로 빠진다. 반대로 초기화 시점에 꺼져 있어
+    아예 등록되지 않았던 세션에서 켜면 그때 지연 등록한다(등록 자체는 안전한 연산이다).
+  - 에임봇 FOV를 `fovRadiusPixels`에서 `fovRadiusDegrees`로 바꿨다. 픽셀 반경은 ADS/줌으로 초점거리가
+    바뀌면 같은 원이 전혀 다른 월드 각도를 덮는다(줌을 당길수록 실제 포착 각도가 좁아졌다).
+    `Game::Projection::GetPixelsPerTangent`가 월드→클립 변환이 아핀이라는 성질을 이용해 기준점 하나와
+    세 축 프로브(ProjectPoint 4회)로 clip.x와 clip.w의 행벡터를 복원한다. 표준 원근 행렬에서 그 두
+    행은 `cot(fovX/2)·right`와 `forward`이고 둘 다 단위벡터에 걸려 있어, 길이 비가 곧 현재 초점거리다.
+    카메라를 못 읽는 프레임은 수직 70도 가정으로 폴백하고, 결과가 수평 화각 5~150도를 벗어나면 우리가
+    읽은 행이 기대한 행렬이 아니라는 뜻이므로 폴백을 쓴다.
+- 선행 커밋 2 (`7bba47c`): `PlayerModifiers::PublishDesired`가 bool 하나 대신 `MiscSettings` 전체를
+  받게 했다. 이렇게 해야 misc lane이 신규 기능을 붙일 때 perf lane 소유인 `features.cpp`를 건드리지
+  않는다.
+- 두 선행 커밋 모두 `cmake --build build --config Release` 통과를 확인하고 커밋했다.
