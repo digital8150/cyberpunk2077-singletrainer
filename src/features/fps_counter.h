@@ -2,5 +2,5 @@
 
 namespace FpsCounter
 {
-    void Draw(bool enabled);
+    void Draw(bool fpsEnabled, bool graphEnabled);
 }

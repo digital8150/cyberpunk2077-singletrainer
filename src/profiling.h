@@ -3,8 +3,8 @@
 #include <atomic>
 #include <cstdint>
 
-// QPC 기반 구간 계측. 최적화 전/후를 로그로 대조하기 위한 것이며, 슬롯 하나당 비용은 QPC 2회 +
-// relaxed 원자 연산 3회다. 누적값은 메인 틱에서 5초마다 한 번 로그로 비우므로 오버플로 걱정이 없다.
+// QPC 기반 구간 계측. 최적화 전/후를 로그로 대조하기 위한 것이며, 슬롯 하나당 비용은 QPC 2회와
+// 소수의 relaxed 원자 연산이다. 누적값은 메인 틱에서 5초마다 한 번 로그로 비우므로 오버플로 걱정이 없다.
 namespace Diagnostics::Profile
 {
     enum class Slot : unsigned
@@ -49,6 +49,16 @@ namespace Diagnostics::Profile
     // 게임 메인 틱에서 매 틱 호출한다. 5초가 지났을 때만 로그를 찍고 누적값을 리셋한다.
     void LogCadence();
     void Reset();
+
+    // Present 스레드에서 한 프레임의 트레이너 구간을 묶는다. Scope 자체는 기존처럼 슬롯별 누적 로그에도
+    // 기록되지만, 이 경계 사이의 Present 슬롯 합계는 그래프용으로 별도 보존된다.
+    void BeginPresentFrame();
+    void EndPresentFrame();
+    // 마지막으로 완료된 Present 경로의 SnapshotPass + EspFrame + AimbotFrame 합계(us). profiling이 꺼져
+    // 있으면 0을 반환한다. SnapshotPass는 호출자가 실제로 스냅샷을 요청한 프레임에만 포함된다.
+    std::uint64_t LastPresentMicroseconds();
+    // 마지막으로 완료된 게임 메인 틱의 TickTotal(us). profiling이 꺼져 있으면 0을 반환한다.
+    std::uint64_t LastTickTotalMicroseconds();
 
     class Scope
     {

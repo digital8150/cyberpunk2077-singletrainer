@@ -501,6 +501,16 @@ namespace
     using GetPropertyFn = PropertyLayout* (*)(ClassLayout*, std::uint64_t);
     GetPropertyFn g_getProperty = nullptr;
     bool g_getPropertyAttempted = false;
+    constexpr std::uint32_t kFeatureHealthRequirementBit = 1u << 0;
+    constexpr std::uint32_t kFeatureAttitudeRequirementBit = 1u << 1;
+    std::atomic_uint32_t g_featureRequirements{0};
+    bool g_healthRequirementActive = false;
+    bool g_attitudeRequirementActive = false;
+    // 하이라이트 경로를 완전히 잠재우기 전에 남은 per-entity desired 상태를 반드시 비워야 한다.
+    // 게이트가 request/mode만 보면, desired는 남았는데 mode가 아직 안 켜진 좁은 창에서 경로가 잠들어
+    // 엔티티가 하이라이트된 채로 영영 남는다. enabled가 내려가는 순간 이 래치를 세우고, 실제로 비울 게
+    // 없다는 것을 확인한 뒤에만 내린다.
+    std::atomic_bool g_nativeHighlightDrainPending{false};
     std::atomic_uint32_t g_nativeHighlightRequest{0};
     std::atomic_uint64_t g_nativeHighlightGeneration{0};
     std::atomic_bool g_nativeHighlightModeActive{false};
@@ -1708,16 +1718,17 @@ namespace
         // an eager mode=0 call and lets the next main tick retry the same transition.
         const bool cachedDesired = HasDesiredHighlightState();
         const bool modeDesired = anyDesired || cachedDesired;
-        if (!worldEmpty && !worldSettling &&
-            (workCount > 0 || g_nativeHighlightModeActive.load(std::memory_order_acquire) != modeDesired))
+        const bool modeActive = g_nativeHighlightModeActive.load(std::memory_order_acquire);
+        const bool clearRetryNeeded = !enabled && cachedDesired;
+        if (!worldEmpty && !worldSettling && (workCount > 0 || modeActive != modeDesired || clearRetryNeeded))
         {
             if (ResolveNativeHighlightOnMainTick())
             {
                 // RedHotTools enables braindance mode before placing the first render event. Clear events are sent
                 // before returning to mode 0 so the engine sees a consistent transition.
                 bool modeReady = true;
-                const bool modeActive = g_nativeHighlightModeActive.load(std::memory_order_acquire);
-                if (modeDesired && (workCount > 0 || !modeActive))
+                const bool currentModeActive = g_nativeHighlightModeActive.load(std::memory_order_acquire);
+                if (modeDesired && (workCount > 0 || !currentModeActive))
                     modeReady = SetBraindanceModeOnMainTick(true, workCount > 0);
 
                 // If the mode transition failed, do not enqueue events into a half-initialized render path. The
@@ -1739,6 +1750,12 @@ namespace
         // calls are complete and after PublishHighlightResult has dropped the tracker lock.
         for (std::size_t i = 0; i < workCount; ++i)
             ReleaseOwnedHandle(workItems[i].entityHandle, "native-highlight-work");
+
+        if (g_nativeHighlightDrainPending.load(std::memory_order_acquire) && !enabled &&
+            !HasDesiredHighlightState() && !g_nativeHighlightModeActive.load(std::memory_order_acquire))
+        {
+            g_nativeHighlightDrainPending.store(false, std::memory_order_release);
+        }
 
         if (g_cleanupRequested.load(std::memory_order_acquire))
         {
@@ -1933,6 +1950,23 @@ namespace
         PublishHealthBatch(workItems.data(), workCount);
     }
 
+    void ClearHealthStateOnMainTick()
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+            tracked.healthValid = false;
+            tracked.healthCurrent = 0.0f;
+            tracked.healthMax = 0.0f;
+            tracked.healthRatio = 0.0f;
+            tracked.healthReachedMin = false;
+            tracked.isDead = false;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+    }
+
     void ApplyAttitudeFailClosed()
     {
         const std::uint64_t blocked = g_attitudeFailClosedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1957,6 +1991,20 @@ namespace
 
         if ((blocked & 0xFFu) == 0)
             MaybeLogPhase1Summary();
+    }
+
+    void ClearAttitudeStateOnMainTick()
+    {
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (TrackedPuppet& tracked : g_puppetList)
+        {
+            if (!tracked.entity)
+                continue;
+            tracked.hostility = Game::EntityTracker::Hostility::Unknown;
+            tracked.hostilityUpdatedAt = 0;
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        g_attitudeFailClosedStateCleared.store(false, std::memory_order_release);
     }
 
     struct AttitudeWork
@@ -2679,6 +2727,10 @@ namespace Game::EntityTracker
             ReleaseOwnedHandle(retainedEntities[i], "tracker-shutdown");
 
         g_nativeHighlightModeActive.store(false, std::memory_order_release);
+        g_nativeHighlightDrainPending.store(false, std::memory_order_release);
+        g_featureRequirements.store(0, std::memory_order_release);
+        g_healthRequirementActive = false;
+        g_attitudeRequirementActive = false;
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupClearQueued.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);
@@ -2840,15 +2892,44 @@ namespace Game::EntityTracker
             MaybeLogPhase1Summary();
 
         // Both operations below are intentionally called only from visibility's single game-main-tick detour.
-        // Present publishes requests but never enters these RTTI/engine paths.
+        // Present publishes requirements but never enters these RTTI/engine paths. A requirement that turns off is
+        // cleared once here before the path becomes dormant, so a later re-enable starts with no stale cache.
+        const std::uint32_t requirements = g_featureRequirements.load(std::memory_order_acquire);
+        const bool healthRequired = (requirements & kFeatureHealthRequirementBit) != 0;
+        if (healthRequired)
         {
+            g_healthRequirementActive = true;
             Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickHealth);
             ProcessHealthOnMainTick();
         }
+        else if (g_healthRequirementActive)
         {
+            ClearHealthStateOnMainTick();
+            g_healthRequirementActive = false;
+        }
+
+        const bool attitudeRequired = (requirements & kFeatureAttitudeRequirementBit) != 0;
+        if (attitudeRequired)
+        {
+            g_attitudeRequirementActive = true;
             Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickAttitude);
             ProcessAttitudeOnMainTick();
         }
+        else if (g_attitudeRequirementActive)
+        {
+            ClearAttitudeStateOnMainTick();
+            g_attitudeRequirementActive = false;
+        }
+
+        // Native highlight has its own request atom. Keep processing while a request, active mode, or shutdown
+        // cleanup remains; once the last clear is acknowledged, an entirely disabled highlight path does no list
+        // scan and no RTTI work.
+        const std::uint32_t highlightRequest = g_nativeHighlightRequest.load(std::memory_order_acquire);
+        const bool highlightRequired = (highlightRequest & kHighlightEnabledBit) != 0 ||
+                                       g_nativeHighlightModeActive.load(std::memory_order_acquire) ||
+                                       g_nativeHighlightDrainPending.load(std::memory_order_acquire) ||
+                                       g_cleanupRequested.load(std::memory_order_acquire);
+        if (highlightRequired)
         {
             Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::TickHighlight);
             ProcessNativeHighlightsOnMainTick();
@@ -2857,6 +2938,7 @@ namespace Game::EntityTracker
 
     bool PrepareForShutdown(std::uint32_t timeoutMilliseconds)
     {
+        g_featureRequirements.store(0, std::memory_order_release);
         g_nativeHighlightRequest.store(0, std::memory_order_release);
         // A Present-side request may have been published before the first main tick, but that is not engine state yet.
         // Only wait when a mode transition or an actual per-entity enable event has been acknowledged.
@@ -2909,11 +2991,27 @@ namespace Game::EntityTracker
         }
         if (previous != settings)
         {
+            // 켜져 있다가 꺼진 전환에서만 세운다. 처음부터 꺼져 있던 경로는 비울 것이 없다.
+            if ((previous & kHighlightEnabledBit) != 0 && (settings & kHighlightEnabledBit) == 0)
+                g_nativeHighlightDrainPending.store(true, std::memory_order_release);
             g_nativeHighlightGeneration.fetch_add(1, std::memory_order_acq_rel);
             Diagnostics::Log("native highlight desired settings published: enabled=%d civilians=%d enemies=%d "
                              "police=%d other=%d hideDead=%d",
                              enabled ? 1 : 0, showCivilians ? 1 : 0, showEnemies ? 1 : 0,
                              showPolice ? 1 : 0, showUnclassified ? 1 : 0, hideDead ? 1 : 0);
+        }
+    }
+
+    void UpdateFeatureRequirements(bool health, bool attitude)
+    {
+        std::uint32_t requirements = 0;
+        requirements |= health ? kFeatureHealthRequirementBit : 0u;
+        requirements |= attitude ? kFeatureAttitudeRequirementBit : 0u;
+        const std::uint32_t previous = g_featureRequirements.exchange(requirements, std::memory_order_acq_rel);
+        if (previous != requirements)
+        {
+            Diagnostics::Log("tracker requirements published: health=%d attitude=%d",
+                             health ? 1 : 0, attitude ? 1 : 0);
         }
     }
 }

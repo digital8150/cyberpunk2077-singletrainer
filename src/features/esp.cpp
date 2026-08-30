@@ -199,10 +199,6 @@ namespace Esp
     {
         Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::EspFrame);
 
-        Game::EntityTracker::UpdateNativeHighlights(
-            settings.enabled && settings.nativeHighlight, settings.showCivilians, settings.showEnemies,
-            settings.showPolice, settings.showUnclassified, settings.hideDead);
-
         // 스냅샷 패스는 호출자가 프레임당 한 번 돌린 뒤라, EspFrame 슬롯에는 더 이상 그 비용이 안 들어간다.
         const Game::EntityTracker::Stats entityStats = Game::EntityTracker::GetStats();
         const std::size_t count = frame.count;
@@ -272,6 +268,10 @@ namespace Esp
             categoryEnabledCount += style.enabled ? 1u : 0u;
             if (settings.hideDead && puppet.isDead)
                 continue;
+            // Category-disabled entries still contribute to the inexpensive counters above, but do not need pose
+            // bounds, camera-facing projection, visibility queries, or any draw work.
+            if (!style.enabled)
+                continue;
 
             ImVec2 minimum;
             ImVec2 maximum;
@@ -294,7 +294,7 @@ namespace Esp
                 continue;
             }
             ++withinDistanceCount;
-            if (!settings.enabled || !style.enabled)
+            if (!settings.enabled)
                 continue;
 
             if (maximum.x < 0.0f || minimum.x > io.DisplaySize.x || maximum.y < 0.0f ||

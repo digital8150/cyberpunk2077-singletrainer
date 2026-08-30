@@ -20,8 +20,12 @@ namespace
     };
 
     std::array<Accumulator, kSlotCount> g_slots{};
+    std::array<std::atomic_uint64_t, kSlotCount> g_lastSlotTicks{};
     std::atomic<std::int64_t> g_frequency{0};
+    std::atomic_uint64_t g_lastPresentTicks{0};
     ULONGLONG g_lastCadenceTick = 0;
+    std::uint64_t g_presentFrameTicks = 0;
+    std::atomic_bool g_presentFrameActive{false};
 
     struct SlotInfo
     {
@@ -131,6 +135,22 @@ namespace
         Diagnostics::Log("profile %s (%llums):%s", label, static_cast<unsigned long long>(elapsedMilliseconds),
                          buffer);
     }
+
+    bool IsPresentDurationSlot(Diagnostics::Profile::Slot slot)
+    {
+        return slot == Diagnostics::Profile::Slot::SnapshotPass ||
+               slot == Diagnostics::Profile::Slot::EspFrame ||
+               slot == Diagnostics::Profile::Slot::AimbotFrame;
+    }
+
+    std::uint64_t TicksToMicroseconds(std::uint64_t ticks)
+    {
+        if (ticks == 0)
+            return 0;
+        const double microseconds = static_cast<double>(ticks) * 1000000.0 /
+                                    static_cast<double>(Frequency());
+        return microseconds > 0.0 ? static_cast<std::uint64_t>(microseconds) : 0;
+    }
 }
 
 namespace Diagnostics::Profile
@@ -157,6 +177,9 @@ namespace Diagnostics::Profile
 
         Accumulator& accumulator = g_slots[static_cast<std::size_t>(slot)];
         const auto value = static_cast<std::uint64_t>(ticks);
+        g_lastSlotTicks[static_cast<std::size_t>(slot)].store(value, std::memory_order_release);
+        if (g_presentFrameActive.load(std::memory_order_acquire) && IsPresentDurationSlot(slot))
+            g_presentFrameTicks += value;
         accumulator.count.fetch_add(1, std::memory_order_relaxed);
         accumulator.total.fetch_add(value, std::memory_order_relaxed);
         std::uint64_t previous = accumulator.maximum.load(std::memory_order_relaxed);
@@ -201,6 +224,40 @@ namespace Diagnostics::Profile
             slot.total.store(0, std::memory_order_relaxed);
             slot.maximum.store(0, std::memory_order_relaxed);
         }
+        for (std::atomic_uint64_t& slot : g_lastSlotTicks)
+            slot.store(0, std::memory_order_release);
+        g_lastPresentTicks.store(0, std::memory_order_release);
+        g_presentFrameTicks = 0;
+        g_presentFrameActive.store(false, std::memory_order_release);
         g_lastCadenceTick = 0;
+    }
+
+    void BeginPresentFrame()
+    {
+        g_presentFrameTicks = 0;
+        g_presentFrameActive.store(Enabled(), std::memory_order_release);
+    }
+
+    void EndPresentFrame()
+    {
+        if (!g_presentFrameActive.load(std::memory_order_acquire))
+            return;
+        g_lastPresentTicks.store(g_presentFrameTicks, std::memory_order_release);
+        g_presentFrameActive.store(false, std::memory_order_release);
+    }
+
+    std::uint64_t LastPresentMicroseconds()
+    {
+        if (!Enabled())
+            return 0;
+        return TicksToMicroseconds(g_lastPresentTicks.load(std::memory_order_acquire));
+    }
+
+    std::uint64_t LastTickTotalMicroseconds()
+    {
+        if (!Enabled())
+            return 0;
+        return TicksToMicroseconds(
+            g_lastSlotTicks[static_cast<std::size_t>(Slot::TickTotal)].load(std::memory_order_acquire));
     }
 }
