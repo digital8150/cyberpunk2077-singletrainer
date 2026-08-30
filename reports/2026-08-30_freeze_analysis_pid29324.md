@@ -108,17 +108,3 @@
 
 2. **컴포넌트 순회 시 안전성 강화**:
    - `ForEachComponent` 및 `FindAttitudeAgent`에서 컴포넌트 포인터의 유효성을 사전에 검증하여 1st-chance 예외 발생 자체를 원천 차단합니다.
-
----
-
-## 💡 후속 세션 참고용 디버깅 힌트 (Debugging Hints & Insights)
-
-1. **MO2 가상화 환경(VFS) 로그 및 크래시 파일 위치**:
-   - 게임 엔진 크래시 리포트(`Cyberpunk2077.exe-*.txt`)는 `C:\CYBERPUNK_ARK_PACK_MO2\overwrite\bin\x64\`에 위치합니다.
-   - 파일이 프로세스에 의해 잠겨있을 경우 파이썬 ctypes `CreateFileW` + `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`로 읽을 수 있습니다.
-
-2. **SEH(`__try/__except`)와 엔진 VEH의 동작 순서**:
-   - SEH로 감싸져 있어도 메모리 예외 발생 시 엔진의 VEH가 1st-chance로 먼저 개입해 크래시 리포팅을 시작하므로, **예외를 발생시키지 않는 사전 포인터 검증이 필수적**입니다.
-
-3. **라이브 덤프 및 스택 심볼화**:
-   - 프로세스가 살아있는 동안 `dbghelp.MiniDumpWriteDump`로 미니덤프(`.dmp`)를 확보하고, `SymFromAddrW`/`SymGetLineFromAddrW64`로 PDB를 매핑하여 정확한 충돌 소스 라인을 즉시 확보할 수 있습니다.

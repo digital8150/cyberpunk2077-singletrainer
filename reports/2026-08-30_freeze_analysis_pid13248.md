@@ -132,14 +132,3 @@
 2. **엔티티 생명주기 및 메모리 접근 안전성 확보**:
    - 엔티티의 `isDisposed` 또는 활성 플래그를 사전에 확인하여 스트리밍 아웃 중인 엔티티의 내부 컴포넌트 접근을 원천 차단합니다.
    - Attitude 조회가 실패하더라도 `Unknown` 상태로 안전하게 유지하고, 위험한 원시 포인터 역참조를 최소화합니다.
-
----
-
-## 💡 후속 세션 참고용 디버깅 힌트 (Debugging Hints & Insights)
-
-1. **유저모드 포인터 범위 검사(`IsValidUserPointer`)와 Use-After-Free**:
-   - `0x10000 ~ 0x7FFFFFFEFFFF` 검사는 커널 주소 및 non-canonical 주소(#GP)만 걸러낼 뿐, 이미 해제된 힙 메모리(Use-After-Free)를 방어할 수 없습니다.
-   - 엔진 VEH가 1st-chance로 크래시를 낚아채는 환경에서는 SEH(`__try/__except`)에 의존하는 메모리 프로빙을 절대 수행해서는 안 되며, 객체 생명주기 검증이 선행되어야 합니다.
-
-2. **아티팩트 및 PDB 심볼 역추적 관리**:
-   - 모든 프리징 및 크래시 조사 시 생성된 미니덤프(`.dmp`)와 엔진/트레이너 로그는 [`reports/artifacts/`](file:///E:/repos/cyberpunk2077-singletrainer/reports/artifacts/) 하위 폴더에 PID별로 격리 보관하여 버전 관리 및 후속 검증이 용이하도록 합니다.

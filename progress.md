@@ -2218,3 +2218,138 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   main-tick 경로는 함수 metadata만 캐시하고 bounded batch 직전에 system을 fresh-acquire하는 별도 Phase
   2B로, Present 경로는 엔진 호출을 메인 틱 snapshot으로 옮기는 더 큰 Phase 2C로 분리한다.
 
+
+## 2026-08-30 - 14:29 GPU 크래시(DLSS 프리셋 변경): 신규 경로, DRED 등록 경로가 죽어 있었다
+
+- **사고**: 14:29:06 게임 하드 크래시. 사용자가 그래픽 메뉴에서 DLSS 품질 프리셋을 바꾼 직후였다.
+  게임 텔레메트리는 `crashPatch=2.31`, `isOom=false`, `sessionLength=1981s`.
+- **실패 종류 확정**: 게임 자체 Aftermath 싱크(`%TEMP%\gpucrash-2026-08-30_14.29.06.774.log`)가
+  `Device Removed Reason: 0x887a0001`(`DXGI_ERROR_INVALID_CALL`), `PageFaultVA=0`을 남겼다. GPU 행(TDR)이나
+  메모리 폴트가 아니라 **잘못된 D3D12 호출로 런타임이 디바이스를 제거한 CPU측 removal**이다. Windows
+  이벤트 로그 14:00~14:45 구간에 `nvlddmkm` TDR도 `Application Error`도 없다. 우리 `[FATAL][unhandled]`
+  0x80000003(`rsi=0x887A0005`)은 엔진 자체 크래시 핸들러의 int3이며 원인이 아니라 반응이다.
+- **기존 경로가 아니다**: 8/27~28의 GPU 사망 8건은 전부 `0x887A0006`(DEVICE_HUNG) + 메뉴 오픈 직후였고
+  ImGui 프레임 링 깊이 수정으로 닫혔다. 그 뒤 이틀간 GPU 크래시 0건이었다. 이번 건은 코드
+  (`0x887A0001`), 트리거(스왑체인 리사이즈), 오버레이 상태(마지막 토글이 14:20:22 `visible=0`)가 모두
+  다르다. 8/28 10:12 크래시(USB SSD I/O 행)와도 무관하다.
+- **트리거 확인**: 14:29:06.219 `ResizeBuffers intercepted` -> .461 오버레이 재초기화 -> .475 첫 제출 ->
+  .774 device removal. 스왑체인 포인터·커맨드 큐·크기(2560x1440)가 리사이즈 전후 동일하므로 창/출력
+  해상도 변경이 아니라 업스케일러 재구성이다. 설정은 `DLSSFrameGen=true` + MFG x2 + `DLSS_D=true`(Ray
+  Reconstruction) + Transformer + RT on이고, 프로세스에 Streamline·FSR3·XeSS 런타임이 동시에 로드돼 있다.
+- **범인은 아직 특정 못 한다. 이유가 계측 쪽에 있었다**: `GetAutoBreadcrumbsOutput1`이 `0x887A0004`
+  (UNSUPPORTED)로 실패했다. `d3dconfig dred`는 여전히 전부 `force-on`인데 `d3dconfig apps`에 등록된 경로가
+  `g:\steamlibrary\...\cyberpunk2077.exe` 하나뿐이었고 **게임은 더 이상 거기 없다**. `libraryfolders.vdf`
+  기준 app 1091500은 `C:\Program Files (x86)\Steam` 라이브러리에 있고 G:\SteamLibrary에는 폴더도
+  `appmanifest_1091500.acf`도 없다. 8/28 USB SSD I/O 행 이후 게임을 C:로 옮기면서 DRED 적용 범위가
+  끊겼고, 그 뒤로 계속 무효였다.
+  - **수정**: `d3dconfig apps --clear` 후 실제 경로로 재등록했다. 현재 등록값은
+    `c:\program files (x86)\steam\steamapps\common\cyberpunk 2077\bin\x64\cyberpunk2077.exe`이고 dred는
+    `auto-breadcrumbs`/`breadcrumb-contexts`/`page-faults`/`watson-dumps` 모두 `force-on`이다.
+    설정은 디바이스 생성 시점에 읽히므로 **게임 재시작 후부터 유효**하다 (사용자가 나중에 직접 재시작).
+  - **규칙으로 남길 것**: 게임 설치 경로가 바뀌면 `d3dconfig apps`를 반드시 다시 등록한다. DRED가 꺼져
+    있어도 아무 경고가 없고, 크래시가 나야 빈 덤프로 드러난다.
+- **증거 저울** (다음 세션에서 다시 판단할 것):
+  - 트레이너에 불리하지 않음: 재초기화 후 약 48프레임(299 ms, 실측 ~160 fps) 정상 제출 뒤 사망했다.
+    잘못된 재초기화라면 첫 `ExecuteCommandLists`에서 즉사한다. 같은 제출 경로가 직전 27분간 멀쩡했고,
+    이 로그의 이전 `ResizeBuffers` 인터셉트들도 device removal 없이 지나갔다. 얼로케이터 풀은 4에서
+    안정(`allocatorMisses=0`), `shutdown fence wait skipped`는 전체 로그에 0건이다.
+  - 트레이너에 불리함: 오버레이가 **리사이즈 직후 첫 Present에서 즉시** 재초기화한다 — Streamline이
+    DLSS-SR/RR/G 컨텍스트를 재생성하는 창과 정확히 겹친다. 또 `hkResizeBuffers`
+    (`src/hooks/d3d12_hook.cpp:67`)가 원본 `ResizeBuffers`의 HRESULT를 버려서 실패를 관측하지 못한다.
+- **별개 결함 발견 — 안전 언로드 livelock**: 크래시 11분 전인 14:17:56에 언로드가 요청됐는데 완료되지
+  않았다. `PlayerModifiers::PrepareForShutdown`(`src/game/player_modifiers.cpp:518`)이 기다리는 ack는 메인
+  틱의 `RemoveModifiers()` 성공에만 달려 있는데 `targetId=0x9AFDC9`에서 계속 실패했다. abort 경로가
+  `g_cleanupRequested`를 지우지 않아 그 시점 이후 No-Recoil은 조용히 죽은 상태로 남고, 메인 틱은 11분간
+  매 틱 `RemoveModifiers()`를 호출했다. `Features`가 매 사이클 `PublishDesired(g_settings.noRecoil)`를 다시
+  올리는 것도 겹친다(`src/features/features.cpp:39`). `dllmain.cpp:46` 재시도 루프에는 상한이 없어 End를
+  눌러도 사용자에게 아무 실패 신호 없이 무한히 주입 상태로 남는다. abort가 `MH_DisableHook` **전에**
+  일어나므로 훅을 껐다 켰다 하지는 않았고, 그래서 리사이즈는 정상 인터셉트됐다.
+- **다음 단계** (우선순위 순): (1) DRED 재등록 — 완료, 게임 재시작 대기. (2) A/B: 트레이너 미주입 상태로
+  DLSS 프리셋을 10회 왕복, 이어서 주입하되 메뉴는 열지 않은 상태로 반복. 사람이 재현 가능한 단일
+  동작이라 이전에 보류한 headless A/B보다 정보량이 크다. (3) 리사이즈 경로 하드닝: 원본 `ResizeBuffers`
+  HRESULT 로깅, 재초기화를 첫 Present가 아니라 몇 프레임 뒤로 지연. (4) 언로드 livelock 수정.
+- 상세 보고서는 `reports/2026-08-30_gpucrash_analysis_pid29084.md`, 원본 아티팩트 4종은
+  `reports/artifacts/2026-08-30_gpucrash_pid29084/`에 보존했다 (`%TEMP%`의 gpucrash 로그는 정리될 수 있음).
+
+## 2026-08-30 - 14:57 PID 26484 하드 프리즈: Phase 2A fresh-acquire로도 못 막은 하이라이트 결함
+
+- **pid30148(12:59)과 완전히 같은 폴트가 2A 빌드에서 재발했다.** `[FATAL][veh] 14:57:35.328 tid=32932`,
+  `at=Cyberpunk2077.exe+0xA037C8`, `access=WRITE target=0x49`, 트레이너 프레임은 PDB 심볼화 결과
+  `SetBraindanceModeOnMainTick+0x132`(`entity_tracker.cpp:1514`) +
+  `ProcessNativeHighlightsOnMainTick+0x3ED`(`entity_tracker.cpp:1615`)로, 두 사고의 모듈 오프셋·대상 주소·
+  프레임 구성이 전부 일치한다.
+- **주입 빌드 확정**: `build/bin/Release/cp2077_trainer.dll`(14:42:19 빌드, 14:42:31 주입). `5a1825a`(14:17)의
+  fresh-acquire 수정은 들어 있고(`native highlight system unavailable` 문자열 present), 후속 world-gate
+  (`native highlight world gate`)는 사고 시점 기준 `build/`·`build-next/` **양쪽 DLL 모두 absent**였다
+  (사후: `215fb70`(15:17) 커밋 + `build-next` 15:15 빌드에 포함됨. 프리즈를 일으킨 `build/` 14:42 빌드에는 없음).
+  DLL 문자열을 `grep -a`로 직접 확인했다 — 소스 추측 없이 "그 수정이 이 빌드에 있는가"를 판정하는 방법으로 유용하다.
+- **2A가 부족했던 이유**: 호출 직전에 `GetSystemOnMainTick`으로 막 얻은 non-null 시스템
+  (`rcx=0x000001DB856FCCE0`)으로 호출했는데도 폴트가 났다. 대상이 `0x49`인 near-null write이므로 시스템 객체는
+  살아 있고 그 **내부 멤버가 드레인 중 이미 널**이었다는 뜻이다. **포인터의 신선도는 사용 가능성을 보장하지 않는다** —
+  월드 전환 중 시스템은 non-null이면서 바인딩이 풀린 상태로 존재할 수 있다.
+- **트리거**: 14:57:35.302 `ESP diagnostics: snapshots=0 tracked=0 ... unregistered=2223`(트래커 40 -> 0) 직후
+  26 ms. 2A 소스는 `if (!anyDesired && !HasDesiredHighlightState()) SetBraindanceModeOnMainTick(false);`라
+  드레인 틱에서 퇴역 중인 vision system에 mode=0을 호출한다.
+- **가장 중요한 실측: `__except`가 잡았는데도 하드 프리즈했다.** 폴트 시 `rsp=0x81D97FC440`, 프리즈 관측 시
+  `RSP=0x81D97FF1E0`으로 현재 RSP가 더 높다 = 언와인드 성공. 그런데도 메인 틱은 `HookOnTick` 아래
+  `Cyberpunk2077.exe+0x14AC7B`/`+0x14AF14`(이미 식별된 게임 자체 스핀 대기 프리미티브)에 6분간 갇혀 있었다.
+  폴트가 엔진 동기화 상태를 끊었고 SEH 언와인드는 엔진이 잡은 것을 되돌려주지 못한다.
+  **엔진 호출은 사전 조건 검사로 회피해야 하며 SEH는 안전 근거가 아니다** — 규칙으로 승격할 것.
+- **프리즈 정량 증명**: `threadstacks.py` 스냅샷 2개(15:04, 15:10) 전체 diff가 2줄(tid 32932의 RIP)뿐이고
+  RSP와 24프레임 전부 불변, 나머지 102스레드 완전 동일. `TotalProcessorTime` 델타는 3초/3초로 코어 하나를
+  태우는 스피너가 정확히 하나. RIP가 움직인 ntdll 영역의 바이트를 직접 읽어 `rdtscp` +
+  `KUSER_SHARED_DATA(0x7FFE03B8)` + 역방향 `jne` 재시도 루프 = `RtlQueryPerformanceCounter`로 식별했다.
+  ntdll이 범인이 아니라 한 프레임 위 엔진 스핀이 QPC를 매 반복 읽는 것이다.
+- **권고**: (1) `trackedCount == 0`이면 엔진 호출 없이 로컬 latch만 내린다(퇴역 월드는 꺼줄 필요가 없다).
+  (2) 재populate 후 바운드된 settle window. 이 둘은 `215fb70`(15:17)로 구현·커밋되었고 `build-next`(15:15
+  빌드)에 들어 있으나 **이 결함에 대한 인게임 검증은 아직 없다** — 이 보고서가 그 방향의 실측 근거다.
+  (3) Phase 2B/2C 대상
+  (`statPoolsSystem`/`playerSystem`/`spatialQueriesSystem`/no-recoil)에도 fresh-acquire만이 아니라 전환 게이트를
+  같이 건다. (4) 회귀 시그니처는 `at=Cyberpunk2077.exe+0xA037C8` + `target=0x49`.
+- 새 일회성 도구 2개를 `tools/scripts/temp/`에 만들었다 (저장소에 미니덤프 작성 도구가 없었다):
+  `writedump.py`(`MiniDumpWriteDump` 래퍼), `symbolize.py`(RVA -> 심볼+소스라인). 후자는 dbghelp의
+  **ANSI 계열 + 실제 프로세스 핸들 + 명시적 모듈 크기** 조합이라야 동작한다(유니코드 `…W` + 가짜 핸들은 조용히 실패).
+  계속 쓸 값이 있으면 `tools/scripts/` 본체로 승격할 것.
+- 상세 보고서는 `reports/2026-08-30_freeze_analysis_pid26484.md`, 아티팩트(미니덤프 2개, 스택 스냅샷 2개,
+  fatal/트레이너 로그)는 `reports/artifacts/2026-08-30_freeze_pid26484/`에 보존했다.
+
+## 2026-08-30 - PID 26484 후속: Issue #2 Phase 2A.1 world-drain gate와 Phase 2B system lifetime hardening 완료
+
+- PID 26484 watchdog은 `[WATCHDOG][FREEZE] pid=26484 Responding=False for 3 polls`로 종료했다. 프로세스는
+  살아 있었지만 main-tick TID 32932가 한 코어를 계속 사용했고 trainer heartbeat는 14:57:35에서 멈췄다.
+  live PDB 심볼화 결과 first-chance AV의 trainer 호출 체인은
+  `SetBraindanceModeOnMainTick+0x132 -> ProcessNativeHighlightsOnMainTick+0x3ED -> HookOnTick`이었다. `rdx=0`과
+  `tracked=0` 직후라는 정황까지 합쳐, save/world drain 중 mode-off 호출이 직접 트리거였음을 확정했다.
+- Phase 2A.1은 `src/game/entity_tracker.cpp`에 구현했다. 유효 tracked entity가 0이면 vision system resolver,
+  mode on/off, `QueueEvent`를 모두 호출하지 않고 이전 world의 내부 mode latch만 false로 폐기한다. zero-to-nonzero
+  repopulation 뒤에는 1000 ms settle gate를 두며, 그 동안 copied work Handle은 공통 drain에서 해제되고 transition
+  cache는 성공 처리하지 않아 안정화 뒤 재시도된다. empty world에서도 기존 cleanup 2-tick acknowledgement는
+  unsafe engine call 없이 유지된다.
+- Phase 2B는 main-tick system raw pointer의 장기 보관을 제거했다. health의 stat-pool system, attitude의 player
+  system, visibility의 spatial-query system, no-recoil의 game/player/stats/transaction system은 nonempty bounded
+  batch 직전에 fresh-acquire하고 해당 tick-local context 밖으로 내보내지 않는다. runtime에는 검증된 RTTI
+  Function/Class metadata만 남긴다. visibility acquisition 실패는 request를 pop하지 않아 큐를 보존한다.
+- no-recoil 호출에는 transition AV가 main tick 밖으로 새지 않도록 좁은 SEH 경계를 추가했다. `ConstructHandle`
+  성공 직후 `cleanupTracked`로 표시하므로 `AddModifier` 실패/예외 뒤에도 exact `RemoveModifier` 성공 전에는
+  Handle을 버리거나 cleanup을 거짓 승인하지 않는다. 제거 실패 시 safe unload를 거부하는 기존 원칙은 유지했다.
+  다만 이전 world target에 대한 `RemoveModifier`가 계속 실패하는 별도 이슈와, `ConstructHandle` 자체 실패 시 raw
+  instance를 해제할 검증된 ABI가 없는 문제는 다음 세션 추적 대상으로 남긴다.
+- 교차 리뷰에서 이번 diff의 blocker는 발견되지 않았다. 남은 High 우선순위는 Present의
+  `GetPuppetSnapshots`가 tracker lock을 잡은 채 animation/pose RTTI 게임 호출을 수행하는 경로이며 Phase 2C에서
+  main-tick immutable snapshot 게시 방식으로 분리해야 한다. health/attitude 결과 publication의 `sequence` 비교
+  보강도 함께 추적한다.
+- 검증은 `git diff --check` 통과, `cmake --build build-next --config Release` 통과. hang 상태 PID 26484에는
+  unload/reinject를 시도하지 않았다. 컨텍스트 오염 보고에 따라 이번 세션은 코드와 기록까지만 닫고, 다음 클린
+  세션에서 게임 재시작 후 fixed Release build 주입, 새 watchdog 부착, save-load 재현 검증부터 재개한다.
+
+## 2026-08-30 - 보고서 인사이트를 `reports/INSIGHTS.md`로 분리
+
+- 개별 보고서마다 반복되던 "후속 세션 참고용 디버깅 힌트" 절을 없애고 `reports/INSIGHTS.md` 한 곳으로 모았다.
+  같은 힌트(SEH/VEH 순서, 라이브 미니덤프, MO2 VFS 로그 위치)가 보고서 3개에 중복돼 있었고, 보고서를 열어야만
+  보이는 구조라 재사용이 안 됐다.
+- 주제별로 4개 절(엔진 호출 안전성 / 프리즈 실측 기법 / 덤프·심볼화 / 로그·아티팩트 위치)로 정리하고 중복을
+  병합했으며, 각 항목에 `— 출처: <보고서 파일명>`을 남겨 근거를 추적할 수 있게 했다.
+- `TEMPLATE.md`의 힌트 절은 규칙 한 문단으로 대체했다: 보고서에는 사건 분석만 쓰고, 재사용 가능한 힌트는
+  `INSIGHTS.md`에 추가하되 같은 주제가 있으면 새 항목 대신 기존 항목을 보강한다.
+- 인사이트 절을 제거한 보고서: `..._pid13248.md`, `..._pid29324.md`, `..._pid26484.md`
+  (`..._pid30148.md`와 `..._gpucrash_pid29084.md`에는 원래 없었다).

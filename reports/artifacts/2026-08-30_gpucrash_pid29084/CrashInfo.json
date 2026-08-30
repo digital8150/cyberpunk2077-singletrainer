@@ -1,0 +1,29 @@
+{
+	"RootType": "gameTelemetryPostMortemContainer",
+	"Data": {
+		"postMortem": {
+			"crashVisitId": "859729c3-2050-4147-8568-28de0c254826",
+			"playthroughId": "6a8fd1c347e9a568",
+			"crashVersion": "5294808",
+			"crashPatch": "2.31",
+			"timeCrash": "2026-08-30T05:29:06Z",
+			"trackedQuest": {
+				"name": "sq004_riders_on_the_storm",
+				"objectiveName": "morning_after",
+				"type": "SQ",
+				"distance": 9.000000,
+				"questName": "",
+				"questType": ""
+			},
+			"location": {
+				"X": 1816.283691,
+				"Y": -1071.515137,
+				"Z": 60.481796
+			},
+			"district": "Badlands_RedPeaks",
+			"zoneType": "None",
+			"sessionLength": 1981.347046,
+			"isOom": false
+		}
+	}
+}

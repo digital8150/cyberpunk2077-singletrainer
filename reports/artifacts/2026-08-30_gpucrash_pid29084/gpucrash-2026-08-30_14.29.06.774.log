@@ -1,0 +1,358 @@
+Device Removed Reason: 0x887a0001 : 
+GPU Crash Reason: Unknown
+
+Dumping SubmitOrder Reuse
+SubmitOrder: [  396320:  52] del
+SubmitOrder: [  396386:  52] del
+SubmitOrder: [  396466:   8] del
+SubmitOrder: [  396482:  52] del
+SubmitOrder: [  396512:  61] del
+SubmitOrder: [  396550:  52] del
+SubmitOrder: [  396578:   8] del
+SubmitOrder: [  396580:  61] del
+SubmitOrder: [  396655:  49] del
+SubmitOrder: [  396655:  51] del
+SubmitOrder: [  396656:  47] del
+SubmitOrder: [  396657:  52] del
+SubmitOrder: [  396661:  54] del
+SubmitOrder: [  396661:  60] del
+SubmitOrder: [  396662:  55] del
+SubmitOrder: [  396662:  56] del
+SubmitOrder: [  396662:  58] del
+SubmitOrder: [  396662:  57] del
+SubmitOrder: [  396662:  59] del
+SubmitOrder: [  396694:  50] del
+SubmitOrder: [  396696:   1] del
+SubmitOrder: [  396700:   7] del
+SubmitOrder: [  396704:  52] del
+SubmitOrder: [  396710:  56] del
+SubmitOrder: [  396724:  61] del
+SubmitOrder: [  396735:  60] del
+SubmitOrder: [  396754:   8] del
+SubmitOrder: [  396845:  39] del
+SubmitOrder: [  396845:  40] del
+SubmitOrder: [  396845:  35] del
+SubmitOrder: [  396846:  41] del
+SubmitOrder: [  396846:  45] del
+SubmitOrder: [  396846:  42] del
+SubmitOrder: [  396846:  43] del
+SubmitOrder: [  396848:  34] del
+SubmitOrder: [  396849:  52] del
+SubmitOrder: [  396850:  52] del
+SubmitOrder: [  396851:  47] del
+SubmitOrder: [  396852:  49] del
+SubmitOrder: [  396855:   8] del
+SubmitOrder: [  396876:  51] del
+SubmitOrder: [  396880:  61] del
+SubmitOrder: [  396881:  50] del
+SubmitOrder: [  396881:  52] del
+SubmitOrder: [  396911:  60] del
+SubmitOrder: [  396960:  56] del
+SubmitOrder: [  397090:  49] del
+SubmitOrder: [  397091:  50] del
+SubmitOrder: [  397091:  51] del
+SubmitOrder: [  397095:  52] del
+SubmitOrder: [  397116:  54] del
+SubmitOrder: [  397116:  58] del
+SubmitOrder: [  397118:  47] del
+SubmitOrder: [  397128:   4] del
+SubmitOrder: [  397130:  58] del
+SubmitOrder: [  397146:  63] del
+SubmitOrder: [  397152:  10] del
+SubmitOrder: [  397158:   6] del
+SubmitOrder: [  397163:  60] del
+SubmitOrder: [  397184:   8] del
+SubmitOrder: [  397188:   6] del
+SubmitOrder: [  397226:   6] del
+SubmitOrder: [  397282:  25] del
+SubmitOrder: [  397284:  59] del
+SubmitOrder: [  397312:  60] del
+SubmitOrder: [  397362:  60] del
+SubmitOrder: [  397369:  25] del
+SubmitOrder: [  397387:  59] del
+SubmitOrder: [  397389:  57] del
+SubmitOrder: [  397389:  56] del
+SubmitOrder: [  397389:  55] del
+SubmitOrder: [  397389:  53] del
+SubmitOrder: [  397390:  54] del
+SubmitOrder: [  397400:  52] del
+SubmitOrder: [  397451:  51] del
+SubmitOrder: [  397451:  59] del
+SubmitOrder: [  397503:   4] del
+SubmitOrder: [  397503:   8] del
+SubmitOrder: [  397503:   9] del
+SubmitOrder: [  397504:   2] del
+SubmitOrder: [  397504:  40] del
+SubmitOrder: [  397504:  38] del
+SubmitOrder: [  397504:  34] del
+SubmitOrder: [  397504:  33] del
+SubmitOrder: [  397504:  41] del
+SubmitOrder: [  397504:  42] del
+SubmitOrder: [  397505:   5] del
+SubmitOrder: [  397505:   3] del
+SubmitOrder: [  397506:   5] del
+SubmitOrder: [  397506:  44] del
+SubmitOrder: [  397512:  13] del
+SubmitOrder: [  397513:  13] del
+SubmitOrder: [  397514:  48] del
+SubmitOrder: [  397515:  57] del
+SubmitOrder: [  397533:  56] del
+SubmitOrder: [  397533:  39] del
+SubmitOrder: [  397534:  54] del
+SubmitOrder: [  397536:   1] del
+SubmitOrder: [  397536:  58] del
+SubmitOrder: [  397536:  55] del
+SubmitOrder: [  397536:  50] del
+SubmitOrder: [  397566:  60] del
+SubmitOrder: [  397566:  59] del
+SubmitOrder: [  397567:  49] del
+SubmitOrder: [  397569:  46] del
+SubmitOrder: [  397593:   7] del
+SubmitOrder: [  397630:   8] del
+SubmitOrder: [  397631:  61] del
+SubmitOrder: [  397640:  60] del
+SubmitOrder: [  397661:   8] del
+SubmitOrder: [  397701:  61] del
+SubmitOrder: [  397737:  60] del
+SubmitOrder: [  397746:  56] del
+SubmitOrder: [  397798:   1] del
+SubmitOrder: [  397799:  10] del
+SubmitOrder: [  397801:  68] del
+SubmitOrder: [  397834:  54] del
+SubmitOrder: [  397834:  68] del
+SubmitOrder: [  397834:  69] del
+SubmitOrder: [  397836:   4] del
+SubmitOrder: [  397836:   7] del
+SubmitOrder: [  397836:   6] del
+SubmitOrder: [  397838:  57] del
+SubmitOrder: [  397866:   6] del
+SubmitOrder: [  397866:  60] del
+SubmitOrder: [  397895:   5] del
+SubmitOrder: [  397895:  11] del
+SubmitOrder: [  397896:   5] del
+SubmitOrder: [  397897:   1] del
+SubmitOrder: [  397897:   4] del
+SubmitOrder: [  397899:   3] del
+SubmitOrder: [  397902:  44] del
+SubmitOrder: [  397902:   3] del
+SubmitOrder: [  397903:  51] del
+SubmitOrder: [  397903:  22] del
+SubmitOrder: [  397903:  43] del
+SubmitOrder: [  397903:  50] del
+SubmitOrder: [  397903:  48] del
+SubmitOrder: [  397903:  46] del
+SubmitOrder: [  397903:  49] del
+SubmitOrder: [  397903:  56] del
+SubmitOrder: [  397903:  52] del
+SubmitOrder: [  397903:  45] del
+SubmitOrder: [  397903:  53] del
+SubmitOrder: [  397903:  54] del
+SubmitOrder: [  397903:  55] del
+SubmitOrder: [  397903:  47] del
+SubmitOrder: [  397904:  25] del
+SubmitOrder: [  397904:  26] del
+SubmitOrder: [  397904:  52] del
+SubmitOrder: [  397904:  49] del
+SubmitOrder: [  397904:  45] del
+SubmitOrder: [  397904:  23] del
+SubmitOrder: [  397904:  50] del
+SubmitOrder: [  397904:  19] del
+SubmitOrder: [  397904:  18] del
+SubmitOrder: [  397904:  17] del
+SubmitOrder: [  397904:  16] del
+SubmitOrder: [  397904:  15] del
+SubmitOrder: [  397904:  14] del
+SubmitOrder: [  397904:  13] del
+SubmitOrder: [  397904:  12] del
+SubmitOrder: [  397904:  11] del
+SubmitOrder: [  397904:   8] del
+SubmitOrder: [  397904:   7] del
+SubmitOrder: [  397904:  53] del
+SubmitOrder: [  397904:   5] del
+SubmitOrder: [  397904:  24] del
+SubmitOrder: [  397904:  30] del
+SubmitOrder: [  397904:  27] del
+SubmitOrder: [  397904:   9] del
+SubmitOrder: [  397904:  46] del
+SubmitOrder: [  397904:  31] del
+SubmitOrder: [  397904:  32] del
+SubmitOrder: [  397904:  20] del
+SubmitOrder: [  397904:  33] del
+SubmitOrder: [  397904:  56] del
+SubmitOrder: [  397904:  10] del
+SubmitOrder: [  397904:  28] del
+SubmitOrder: [  397904:  34] del
+SubmitOrder: [  397904:  35] del
+SubmitOrder: [  397904:  36] del
+SubmitOrder: [  397904:  51] del
+SubmitOrder: [  397904:  43] del
+SubmitOrder: [  397904:  55] del
+SubmitOrder: [  397904:  54] del
+SubmitOrder: [  397904:  37] del
+SubmitOrder: [  397904:  47] del
+SubmitOrder: [  397904:  41] del
+SubmitOrder: [  397904:  40] del
+SubmitOrder: [  397904:  39] del
+SubmitOrder: [  397904:  38] del
+SubmitOrder: [  397904:  21] del
+SubmitOrder: [  397925:   4] del
+SubmitOrder: [  397927:   4] del
+SubmitOrder: [  397933:   7] del
+SubmitOrder: [  397933:   4] del
+SubmitOrder: [  397934:   4] del
+SubmitOrder: [  397936:   3] del
+SubmitOrder: [  397964:   4] del
+SubmitOrder: [  398303:   1] del
+SubmitOrder: [  398897:   4] -prev-> [  398896:   6]
+SubmitOrder: [  398898:   1] -prev-> [  398880:   3]
+SubmitOrder: [  398898:   3] -prev-> [  398897:   1]
+SubmitOrder: [  398899:   2] -prev-> [  398896:   2]
+SubmitOrder: [  398899:   3] -prev-> [       0:   0]
+SubmitOrder: [  398899:   4] -prev-> [       0:   0]
+SubmitOrder: [  398899:   5] -prev-> [       0:   0]
+SubmitOrder: [  398899:   6] -prev-> [       0:   0]
+SubmitOrder: [  398899:   7] -prev-> [       0:   0]
+SubmitOrder: [  398899:   8] -prev-> [       0:   0]
+SubmitOrder: [  398899:   9] -prev-> [       0:   0]
+SubmitOrder: [  398899:  10] -prev-> [       0:   0]
+SubmitOrder: [  398899:  11] -prev-> [       0:   0]
+SubmitOrder: [  398899:  12] -prev-> [  398896:   3]
+SubmitOrder: [  398899:  13] -prev-> [  398898:   2]
+SubmitOrder: [  398899:  15] -prev-> [       0:   0]
+SubmitOrder: [  398899:  16] -prev-> [  398897:   3]
+SubmitOrder: [  398899:  17] -prev-> [       0:   0]
+SubmitOrder: [  398899:  18] -prev-> [       0:   0]
+SubmitOrder: [  398899:  19] -prev-> [       0:   0]
+SubmitOrder: [  398899:  21] -prev-> [       0:   0]
+SubmitOrder: [  398899:  22] -prev-> [       0:   0]
+SubmitOrder: [  398899:  23] -prev-> [       0:   0]
+SubmitOrder: [  398899:  24] -prev-> [       0:   0]
+SubmitOrder: [  398899:  25] -prev-> [       0:   0]
+SubmitOrder: [  398899:  26] -prev-> [       0:   0]
+SubmitOrder: [  398899:  27] -prev-> [       0:   0]
+SubmitOrder: [  398899:  28] -prev-> [       0:   0]
+SubmitOrder: [  398899:  29] -prev-> [       0:   0]
+SubmitOrder: [  398899:  30] -prev-> [       0:   0]
+SubmitOrder: [  398899:  31] -prev-> [       0:   0]
+SubmitOrder: [  398899:  33] -prev-> [       0:   0]
+SubmitOrder: [  398899:  34] -prev-> [       0:   0]
+SubmitOrder: [  398899:  35] -prev-> [       0:   0]
+SubmitOrder: [  398899:  36] -prev-> [       0:   0]
+SubmitOrder: [  398899:  37] -prev-> [       0:   0]
+SubmitOrder: [  398899:  38] -prev-> [       0:   0]
+SubmitOrder: [  398899:  40] -prev-> [       0:   0]
+SubmitOrder: [  398899:  41] -prev-> [       0:   0]
+SubmitOrder: [  398899:  42] -prev-> [       0:   0]
+SubmitOrder: [  398899:  43] -prev-> [       0:   0]
+SubmitOrder: [  398899:  44] -prev-> [       0:   0]
+SubmitOrder: [  398899:  45] -prev-> [       0:   0]
+SubmitOrder: [  398899:  46] -prev-> [       0:   0]
+SubmitOrder: [  398899:  47] -prev-> [       0:   0]
+SubmitOrder: [  398899:  48] -prev-> [       0:   0]
+SubmitOrder: [  398899:  49] -prev-> [       0:   0]
+SubmitOrder: [  398899:  50] -prev-> [       0:   0]
+SubmitOrder: [  398899:  51] -prev-> [       0:   0]
+SubmitOrder: [  398899:  52] -prev-> [  398899:  39]
+SubmitOrder: [  398899:  53] -prev-> [       0:   0]
+SubmitOrder: [  398899:  55] -prev-> [       0:   0]
+SubmitOrder: [  398899:  56] -prev-> [       0:   0]
+SubmitOrder: [  398899:  57] -prev-> [       0:   0]
+SubmitOrder: [  398899:  58] -prev-> [  398899:  54]
+SubmitOrder: [  398899:  59] -prev-> [       0:   0]
+SubmitOrder: [  398899:  60] -prev-> [       0:   0]
+SubmitOrder: [  398899:  61] -prev-> [       0:   0]
+SubmitOrder: [  398899:  62] -prev-> [       0:   0]
+SubmitOrder: [  398899:  63] -prev-> [       0:   0]
+SubmitOrder: [  398899:  64] -prev-> [       0:   0]
+SubmitOrder: [  398899:  65] -prev-> [       0:   0]
+SubmitOrder: [  398899:  66] -prev-> [       0:   0]
+SubmitOrder: [  398899:  67] -prev-> [  398897:   5]
+Dumping SubmitOrder Reuse Complete
+
+Dumping Breadcrumbs
+Breadcrumbs: Command list '[  398897:   4] [0000013BCD9A0570 Default] RenderGraph_Blank': Finished [2]
+Breadcrumbs: Command list '[  398898:   1] [0000013BDFB964F0 CopyAsync] CopyQueueUpload': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398898:   3] [0000013BE4B85760 Default] FrameTick': Finished [3]
+Breadcrumbs: Command list '[  398899:   2] [0000013BBA43EE80 Default] UpdateGlyphCacheTexture': Finished [2]
+Breadcrumbs: Command list '[  398899:   3] [0000013BD522F1B0 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   4] [0000013BD13F4B20 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   5] [0000013BC9985F10 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   6] [0000013BDB3A1F50 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   7] [0000013BC8D85D60 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   8] [0000013BBD851BD0 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:   9] [0000013BB99FB7D0 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:  10] [0000013BBAAF6E30 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:  11] [0000013BC63E1550 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:  12] [0000013BDCFB9BD0 Default] ProcessDrawBuffer': Finished [2]
+Breadcrumbs: Command list '[  398899:  13] [0000013BBD8554B0 CopyAsync] CopyQueueUpload': Finished [2]
+Breadcrumbs: Command list '[  398899:  15] [0000013BC39FC620 Default] StorageData': Finished [3]
+Breadcrumbs: Command list '[  398899:  16] [0000013BC0205640 Default] StartRender': Finished [2]
+Breadcrumbs: Command list '[  398899:  17] [0000013BCA7AE5D0 Default] WindUpdateAndRainMap': Finished [2]
+Breadcrumbs: Command list '[  398899:  18] [0000013BD553B890 Default] RenderPrep': Finished [3]
+Breadcrumbs: Command list '[  398899:  19] [0000013BD4655B00 Default] PrepareGloballyAccessibleSystems': Finished [5]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  21] [0000013BCA83F6F0 Default] DepthPrepass': Finished [2]
+Breadcrumbs: Command list '[  398899:  22] [0000013BD674B2E0 Default] GBufferEarly_Velocity_Weapon': Finished [2]
+Breadcrumbs: Command list '[  398899:  23] [0000013BBAE495B0 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  24] [0000013BD56BE4A0 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  25] [0000013BC7B10300 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  26] [0000013BC4E885B0 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  27] [0000013BCEE1CB30 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  28] [0000013BC958E2E0 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  29] [0000013BD0E56860 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  30] [0000013BC4F42560 Default] GBuffer_Solid': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  31] [0000013BCEA9F640 Compute] AsyncWater': Finished [2]
+Breadcrumbs: Command list '[  398899:  33] [0000013BE3C1A270 Default] GBuffer_Discard': Finished [2]
+Breadcrumbs: Command list '[  398899:  34] [0000013BD608F570 Default] GBufferVelocity_Solid': Finished [2]
+Breadcrumbs: Command list '[  398899:  35] [0000013BE0189A00 Default] GBufferVelocity_Discard': Finished [2]
+Breadcrumbs: Command list '[  398899:  36] [0000013BB8E52340 Default] DeferredDecals': Finished [2]
+Breadcrumbs: Command list '[  398899:  37] [0000013BD72D0C50 Default] Hair_Opaque': Finished [2]
+Breadcrumbs: Command list '[  398899:  38] [0000013BDF62E980 Default] PostGBufferOverrides': Finished [3]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  40] [0000013BCA3B1200 Default] RenderDistantShadows': Finished [2]
+Breadcrumbs: Command list '[  398899:  41] [0000013BD5C47110 Default] ClearShadowCascades': Finished [2]
+Breadcrumbs: Command list '[  398899:  42] [0000013BDDE50EB0 Default] RenderCascade0': Finished [2]
+Breadcrumbs: Command list '[  398899:  43] [0000013BCE43E770 Default] RenderCascade1': Finished [2]
+Breadcrumbs: Command list '[  398899:  44] [0000013BE3FB4C30 Default] RenderCascade2': Finished [2]
+Breadcrumbs: Command list '[  398899:  45] [0000013BCB722CB0 Default] RenderLocalShadows0': Finished [2]
+Breadcrumbs: Command list '[  398899:  46] [0000013BD9F24CA0 Default] RenderLocalShadows1': Finished [2]
+Breadcrumbs: Command list '[  398899:  47] [0000013BD78E1150 Default] RenderLocalShadows2': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  48] [0000013BB61D7D10 Compute] AccelerationStructureUpdateStatic': Finished [2]
+Breadcrumbs: Command list '[  398899:  49] [0000013BCB077980 Compute] AccelerationStructuresUpdateDynamic': Finished [2]
+Breadcrumbs: Command list '[  398899:  50] [0000013BCCC42590 Compute] AccelerationStructuresUpdateEpilogue': Finished [2]
+Breadcrumbs: Command list '[  398899:  51] [0000013BD336EDA0 Compute] AsyncComputeDuringShadowmaps': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  52] [0000013BB9D41BF0 Default] <<-merge [0000013BBC6EE1B0 Default] Lighting': Finished [2]
+Breadcrumbs: Command list '[  398899:  53] [0000013BBC6EE1B0 Default] Lighting': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  55] [0000013BD351B390 Default] Skin_Post_and_Forward_Opaque': Finished [2]
+Breadcrumbs: Command list '[  398899:  56] [0000013BE4021DA0 Default] HologramDepth_and_Distortion': Finished [2]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  57] [0000013BD5AAF860 Compute] DecoupledParticleLighting': Finished [8]
+Breadcrumbs:   ----
+Breadcrumbs: Command list '[  398899:  58] [0000013BC60B3820 Default] <<-merge [0000013BC299E3D0 Default] Transparents': Not started [2]
+Breadcrumbs: Command list '[  398899:  59] [0000013BC299E3D0 Default] Transparents': Not started [2]
+Breadcrumbs: Command list '[  398899:  60] [0000013BD885FB60 Default] Transparents_Weapon': Not started [2]
+Breadcrumbs: Command list '[  398899:  61] [0000013BD3B9C6A0 Default] TXAA_Blurs': Not started [2]
+Breadcrumbs: Command list '[  398899:  62] [0000013BD5EC0930 Default] Transparents_Screen': Not started [2]
+Breadcrumbs: Command list '[  398899:  63] [0000013BCA3E3D30 Default] DoF_MotionBlur': Not started [2]
+Breadcrumbs: Command list '[  398899:  64] [0000013BD1075AC0 Default] Forward_NoTXAA': Not started [2]
+Breadcrumbs: Command list '[  398899:  65] [0000013BBEA50DF0 Default] PostFX': Not started [2]
+Breadcrumbs: Command list '[  398899:  66] [0000013BD6B66430 Default] RenderFinal2D': Not started [2]
+Breadcrumbs: Command list '[  398899:  67] [0000013BC97096A0 Default] EndRender': Not started [2]
+Dumping Breadcrumbs Complete
+
+Dumping DRED
+DRED: Checking DRED 1.2 output
+DRED:   Failed to get D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1. HR=0x887a0004 
+DRED:   Failed to get D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT. HR=0x887a0004 
+DRED:   Page Fault Allocation Output1:
+DRED:     PageFaultVA: 0000000000000000
+DRED:     Existing Allocations:
+DRED:     Freed Allocations:
+DRED: Finished DRED output
+Dumping DRED Complete
+
