@@ -17,6 +17,9 @@ namespace Game::Rtti
         std::uint32_t registrationIndex = 0;
         std::size_t parameterCount = 0;
         bool hasReturnValue = false;
+        // CProperty::Flags::isHandle (bit 0x1B) on the reflected return property. This is the
+        // ownership-bearing return contract used by the Phase 2 attitude getter validation.
+        bool returnIsHandle = false;
         void* nativeHandler = nullptr;
     };
 
@@ -79,6 +82,10 @@ namespace Game::Rtti
     std::size_t ClassSize(const Class* type);
     void* CreateInstance(Class* type);
     bool ConstructHandle(Handle* handle, void* instance);
+    // Verifies the 2.31 Handle constructor plus the exact strong/weak final-release helpers are
+    // available. Callers must complete their own source-storage/lifetime validation before using
+    // this as an ownership gate.
+    bool HasExactHandleOwnership();
     // Copies a handle whose two-word source storage is owned by the caller for the whole operation. This is the
     // SDK Handle copy-constructor operation (strong increment followed by the two-word copy); it is deliberately
     // not a component-array accessor because an unretained DynArray entry can change between those operations.

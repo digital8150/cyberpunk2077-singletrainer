@@ -37,15 +37,15 @@ namespace
     constexpr std::size_t kComponentDetailLogLimit = 8;
     constexpr ULONGLONG kPhase1SummaryIntervalMilliseconds = 3000;
 
-    // Phase 2 deliberately leaves attitude disabled until both sides of the ownership contract are live-proved:
-    // a source component Handle must be acquired without a DynArray-entry TOCTOU, and every resulting Handle must
-    // use the exact final-owner release path. The runtime gate is also closed so stale configuration cannot reopen
-    // a path that the source-storage contract has not earned.
-    constexpr bool kPhase2AttitudeLifetimeCompileGate = false;
-    constexpr bool kPhase2AttitudeSourceContractCompileGate = false;
+    // Phase 2 owns the Entity through a strong Handle acquired in the RegisterEntity caller scope. Attitude no
+    // longer reads a component DynArray entry: the retained Entity is the source for the reflected GetAttitudeAgent
+    // getter, which returns its own strong Handle. The runtime gate still requires the exact 2.31 Handle ABI and
+    // all reflected signatures to validate on the running image before any attitude call is made.
+    constexpr bool kPhase2AttitudeLifetimeCompileGate = true;
+    constexpr bool kPhase2AttitudeSourceContractCompileGate = true;
     constexpr bool kPhase2AttitudeRttiCompileGate = kPhase2AttitudeLifetimeCompileGate &&
                                                      kPhase2AttitudeSourceContractCompileGate;
-    static_assert(!kPhase2AttitudeRttiCompileGate, "Phase 2 attitude must remain fail-closed until proven");
+    static_assert(kPhase2AttitudeRttiCompileGate, "Phase 2 retained-Entity attitude path must be compiled");
 
     // Cyberpunk 2077 2.31 / internal 3.0.80.51928에서 검증. 상대 call 대상만 wildcard 처리했으며
     // tools/scripts/memtool.py aobscan으로 Cyberpunk2077.exe 내 정확히 1개 매치를 확인했다.
@@ -210,6 +210,9 @@ namespace
     struct TrackedPuppet
     {
         EntityLayout* entity = nullptr;
+        // This is the owner of the raw Entity pointer above. Handle is intentionally opaque and must only be
+        // moved under g_puppetListLock or copied with Game::Rtti::CopyHandle while that lock stabilizes storage.
+        Game::Rtti::Handle entityHandle;
         std::uint64_t entityId = 0;
         std::uint64_t sequence = 0;
         Game::AnimationData::VisualData visual;
@@ -346,6 +349,35 @@ namespace
         return kPhase2AttitudeRttiCompileGate && g_attitudeRttiRuntimeGate.load(std::memory_order_acquire);
     }
 
+    bool HasHandleValue(const Game::Rtti::Handle& handle) noexcept
+    {
+        return handle.instance != nullptr || handle.refCount != nullptr;
+    }
+
+    bool IsHandleShapeValid(const Game::Rtti::Handle& handle) noexcept
+    {
+        return Game::Rtti::IsValidUserPointer(handle.instance) &&
+               Game::Rtti::IsValidUserPointer(handle.refCount);
+    }
+
+    // Exact Handle destruction is deliberately the only release operation used by Phase 2. If an engine result is
+    // malformed or the verified resolver disappears, clear the local storage and fail closed; never route a live
+    // attitude/reference-counting path through the conservative/leaking ReleaseHandle fallback.
+    bool ReleaseOwnedHandle(Game::Rtti::Handle& handle, const char* reason) noexcept
+    {
+        if (!HasHandleValue(handle))
+            return true;
+        if (!IsHandleShapeValid(handle) || !Game::Rtti::ReleaseHandleExact(&handle))
+        {
+            g_attitudeRttiRuntimeGate.store(false, std::memory_order_release);
+            Diagnostics::Log("phase2 exact Handle release rejected: reason=%s instance=%p refCount=%p", reason,
+                             handle.instance, handle.refCount);
+            handle = {};
+            return false;
+        }
+        return true;
+    }
+
     std::uint64_t ObserveThread(ThreadObservation& observation, const char* path)
     {
         const std::uint64_t current = static_cast<std::uint64_t>(GetCurrentThreadId());
@@ -424,7 +456,7 @@ namespace
             "componentEntities=%llu componentSkipped=%llu componentSamples=%llu layoutRejects=%llu "
             "nullInstance=%llu nullRefCount=%llu truncated=%llu "
             "attitudeAttempts=%llu attitudeSourceBlocked=%llu attitudeAcquire=%llu attitudeExpiredInvalid=%llu "
-            "attitudeAgent=%llu attitudeUnknown=%llu attitudeFailClosed=1",
+            "attitudeAgent=%llu attitudeUnknown=%llu attitudeFailClosed=%d",
             static_cast<unsigned long long>(g_registerCallbacks.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_registered.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_registerThread.lastThreadId.load(std::memory_order_relaxed)),
@@ -460,7 +492,8 @@ namespace
             static_cast<unsigned long long>(g_attitudeLifetimeAcquisitionSuccess.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_attitudeExpiredOrInvalidReference.load(std::memory_order_relaxed)),
             static_cast<unsigned long long>(g_attitudeAgentLookupSuccess.load(std::memory_order_relaxed)),
-            static_cast<unsigned long long>(g_attitudeAgentLookupUnknown.load(std::memory_order_relaxed)));
+            static_cast<unsigned long long>(g_attitudeAgentLookupUnknown.load(std::memory_order_relaxed)),
+            IsPhase2AttitudeEnabled() ? 0 : 1);
     }
 
     std::uint64_t g_puppetSequence = 0;
@@ -1040,15 +1073,19 @@ namespace
                orientationLength > 0.01f && orientationLength < 4.0f;
     }
 
-    void TrackPuppet(EntityLayout* entity)
+    bool TrackPuppet(EntityLayout* entity, std::uint64_t entityId, Game::EntityTracker::NpcCategory category,
+                     Game::Rtti::Handle& retainedEntity, Game::Rtti::Handle& accessEntity,
+                     Game::Rtti::Handle& displacedEntity)
     {
+        accessEntity = {};
+        displacedEntity = {};
         AcquireSRWLockExclusive(&g_puppetListLock);
 
         TrackedPuppet* target = nullptr;
         TrackedPuppet* oldest = &g_puppetList[0];
         for (TrackedPuppet& tracked : g_puppetList)
         {
-            if (tracked.entityId == entity->entityId)
+            if (tracked.entityId == entityId)
             {
                 target = &tracked;
                 break;
@@ -1061,15 +1098,55 @@ namespace
 
         if (!target)
             target = oldest;
+        const bool hasIncomingOwner = HasHandleValue(retainedEntity);
         // A streamed-out object can be replaced at the same slot/ID. Do not carry health/highlight state from the
-        // old pointer into the replacement; it must earn a fresh snapshot and highlight transition.
-        if (target->entity != entity || target->entityId != entity->entityId)
+        // old pointer into the replacement; it must earn a fresh snapshot and highlight transition. Move the old
+        // owner out before clearing the slot so its exact final release happens after this lock is dropped.
+        const bool sameEntity = target->entity == entity && target->entityId == entityId;
+        const bool hasStoredOwner = sameEntity && HasHandleValue(target->entityHandle);
+        if (!hasIncomingOwner && !hasStoredOwner)
+        {
+            ReleaseSRWLockExclusive(&g_puppetListLock);
+            return false;
+        }
+        // Make the caller's post-original access owner before changing the slot. If this atomic strong increment
+        // fails, leave the slot and incoming owner untouched; the caller will release the incoming owner safely.
+        if (hasIncomingOwner)
+        {
+            if (!Game::Rtti::CopyHandle(&retainedEntity, &accessEntity))
+            {
+                ReleaseSRWLockExclusive(&g_puppetListLock);
+                return false;
+            }
+        }
+        else if (!Game::Rtti::CopyHandle(&target->entityHandle, &accessEntity))
+        {
+            ReleaseSRWLockExclusive(&g_puppetListLock);
+            return false;
+        }
+
+        if (!sameEntity)
+        {
+            displacedEntity = target->entityHandle;
             *target = {};
+        }
+        else if (hasIncomingOwner)
+        {
+            // Duplicate registration of the same object supplies a fresh strong owner. Replace the stored owner so
+            // the incoming handle is never copied without an increment; release the previous owner after unlock.
+            displacedEntity = target->entityHandle;
+            target->entityHandle = {};
+        }
         target->entity = entity;
-        target->entityId = entity->entityId;
+        target->entityId = entityId;
         target->sequence = ++g_puppetSequence;
-        target->category = ClassifyNpc(entity);
+        target->category = category;
         target->isDead = false;
+        if (hasIncomingOwner)
+        {
+            target->entityHandle = retainedEntity;
+            retainedEntity = {};
+        }
         SetPuppetOccupied(static_cast<std::size_t>(target - g_puppetList.data()), true);
 
         std::uint64_t count = 0;
@@ -1077,6 +1154,7 @@ namespace
             count += tracked.entity != nullptr ? 1u : 0u;
         g_trackedPuppets.store(count, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
+        return HasHandleValue(accessEntity);
     }
 
     enum class SnapshotResult : std::uint8_t
@@ -1143,11 +1221,14 @@ namespace
         }
     }
 
-    void CaptureEntity(EntityLayout* entity)
+    void CaptureEntity(EntityLayout* entity, Game::Rtti::Handle& retainedEntity)
     {
         if (!entity)
             return;
 
+        Game::Rtti::Handle displacedEntity;
+        Game::Rtti::Handle accessEntity;
+        Game::EntityTracker::NpcCategory npcCategory = Game::EntityTracker::NpcCategory::Other;
         __try
         {
             const std::uint64_t total = g_registered.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1156,61 +1237,82 @@ namespace
             const PuppetKind puppetKind = ClassifyPuppet(nativeType);
             const bool puppet = puppetKind == PuppetKind::Npc;
             if (puppet)
+            {
+                npcCategory = ClassifyNpc(entity);
                 g_puppets.fetch_add(1, std::memory_order_relaxed);
-
-            float position[3]{};
-            float orientation[4]{};
-            bool hasPosition = false;
-            if (ReadTransform(entity, position, orientation))
-            {
-                hasPosition = true;
-                g_positioned.fetch_add(1, std::memory_order_relaxed);
-            }
-            else if (puppet)
-            {
-                g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
             }
 
-            if (puppet)
-                TrackPuppet(entity);
-
-            // Read the id before taking the lock. An access violation between acquire and release would leak
-            // g_lastEntityLock permanently now that this body is inside __except, and GetStats would then block
-            // forever on it. Nothing under the lock touches game memory.
+            // Publish the owner before any subsequent entity reads. The duplicate copy made under the tracker lock
+            // is the reference used by this function while concurrent UnregisterEntity callbacks invalidate slots.
             const std::uint64_t entityId = entity->entityId;
-            g_lastRegisteredEntityAddress.store(reinterpret_cast<std::uint64_t>(entity), std::memory_order_relaxed);
-            g_lastRegisteredEntityId.store(entityId, std::memory_order_relaxed);
-            SampleComponentHandles(entity, entityId);
-
-            AcquireSRWLockExclusive(&g_lastEntityLock);
-            g_lastEntityId = entityId;
-            g_lastPosition[0] = position[0];
-            g_lastPosition[1] = position[1];
-            g_lastPosition[2] = position[2];
+            bool trackingAccess = true;
             if (puppet)
             {
-                g_hasLastPuppet = true;
-                g_lastPuppetId = entityId;
-                g_lastPuppetPosition[0] = position[0];
-                g_lastPuppetPosition[1] = position[1];
-                g_lastPuppetPosition[2] = position[2];
+                trackingAccess = TrackPuppet(entity, entityId, npcCategory, retainedEntity, accessEntity,
+                                             displacedEntity);
             }
-            ReleaseSRWLockExclusive(&g_lastEntityLock);
-
-            if (total <= 5 || (total & (total - 1)) == 0)
+            // If no retained owner could be copied, do not continue reading this entity after publishing the slot:
+            // the original caller scope is the only remaining lifetime proof and UnregisterEntity may run on a
+            // different thread. Other non-attitude registration counters remain valid.
+            if (!puppet || trackingAccess)
             {
-                Diagnostics::Log("entity registered: total=%llu ptr=%p id=0x%llX typeHash=0x%llX puppet=%d "
-                                 "positioned=%d pos=(%.2f, %.2f, %.2f)",
-                                 static_cast<unsigned long long>(total), entity,
-                                 static_cast<unsigned long long>(entityId),
-                                 static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
-                                 hasPosition ? 1 : 0, position[0], position[1], position[2]);
+                EntityLayout* stableEntity = HasHandleValue(accessEntity)
+                                                 ? static_cast<EntityLayout*>(accessEntity.instance)
+                                                 : entity;
+
+                float position[3]{};
+                float orientation[4]{};
+                bool hasPosition = false;
+                if (ReadTransform(stableEntity, position, orientation))
+                {
+                    hasPosition = true;
+                    g_positioned.fetch_add(1, std::memory_order_relaxed);
+                }
+                else if (puppet)
+                {
+                    g_pendingPosition.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                // The id was read before TrackPuppet. An access violation between acquire and release would leak
+                // g_lastEntityLock permanently now that this body is inside __except, so the lock below touches no
+                // game memory.
+                g_lastRegisteredEntityAddress.store(reinterpret_cast<std::uint64_t>(stableEntity),
+                                                     std::memory_order_relaxed);
+                g_lastRegisteredEntityId.store(entityId, std::memory_order_relaxed);
+                AcquireSRWLockExclusive(&g_lastEntityLock);
+                g_lastEntityId = entityId;
+                g_lastPosition[0] = position[0];
+                g_lastPosition[1] = position[1];
+                g_lastPosition[2] = position[2];
+                if (puppet)
+                {
+                    g_hasLastPuppet = true;
+                    g_lastPuppetId = entityId;
+                    g_lastPuppetPosition[0] = position[0];
+                    g_lastPuppetPosition[1] = position[1];
+                    g_lastPuppetPosition[2] = position[2];
+                }
+                ReleaseSRWLockExclusive(&g_lastEntityLock);
+
+                if (total <= 5 || (total & (total - 1)) == 0)
+                {
+                    Diagnostics::Log("entity registered: total=%llu ptr=%p id=0x%llX typeHash=0x%llX puppet=%d "
+                                     "positioned=%d pos=(%.2f, %.2f, %.2f)",
+                                     static_cast<unsigned long long>(total), stableEntity,
+                                     static_cast<unsigned long long>(entityId),
+                                     static_cast<unsigned long long>(typeHash), puppet ? 1 : 0,
+                                     hasPosition ? 1 : 0, position[0], position[1], position[2]);
+                }
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             // Ignore stale/unmapped entity registrations safely
         }
+        // Exact release can enter the engine's final-owner destruction path. Keep it outside the SEH containment
+        // above so an engine exception is never swallowed with a half-completed destructor/refcount transition.
+        ReleaseOwnedHandle(displacedEntity, "tracked-slot-replacement");
+        ReleaseOwnedHandle(accessEntity, "register-capture");
     }
 
     constexpr std::uint32_t kHighlightEnabledBit = 1u << 0;
@@ -1675,8 +1777,8 @@ namespace
         const std::uint64_t blocked = g_attitudeFailClosedTicks.fetch_add(1, std::memory_order_relaxed) + 1;
         if (!g_attitudeFailClosedLogged.exchange(true, std::memory_order_acq_rel))
         {
-            Diagnostics::Log("PHASE2 FAIL-CLOSED: attitude disabled; no component Handle source acquisition or "
-                             "GetAttitudeTowards Invoke; hostility remains Unknown");
+            Diagnostics::Log("PHASE2 FAIL-CLOSED: attitude disabled; retained Entity/GetAttitudeAgent contract or "
+                             "GetAttitudeTowards signature is unavailable; hostility remains Unknown");
         }
 
         if (!g_attitudeFailClosedStateCleared.exchange(true, std::memory_order_acq_rel))
@@ -1696,43 +1798,288 @@ namespace
             MaybeLogPhase1Summary();
     }
 
-    // This is the only Phase 2 attitude boundary. It owns no raw component pointer and performs no engine/VM call
-    // until a source-entry acquisition contract is proven. In the current build the contract is intentionally
-    // closed: the live Phase 1 observer measured concurrent off-main UnregisterEntity callbacks, and no engine API
-    // has yet been proved to make a component DynArray entry stable while its strong count is copied. A generation
-    // check or same-thread assumption would leave that TOCTOU open, so those fallbacks are not attempted.
-    Game::EntityTracker::Hostility TryResolveAttitudeAgentSafely(const EntityLayout* entity,
+    struct AttitudeWork
+    {
+        EntityLayout* entity = nullptr;
+        Game::Rtti::Handle entityHandle;
+        std::uint64_t entityId = 0;
+        std::size_t slot = 0;
+        Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
+    };
+
+    struct AttitudeRuntime
+    {
+        bool attempted = false;
+        ULONGLONG lastResolveAttempt = 0;
+        void* playerSystem = nullptr;
+        Game::Rtti::Function* getLocalPlayer = nullptr;
+        Game::Rtti::Function* getAttitudeAgent = nullptr;
+        Game::Rtti::Function* getAttitudeTowards = nullptr;
+        const Game::Rtti::Class* attitudeAgentClass = nullptr;
+        std::uint64_t attitudeGetterOwnerHash = 0;
+        bool agentLogged = false;
+        bool logged = false;
+    };
+    AttitudeRuntime g_attitudeRuntime;
+
+    constexpr std::uint64_t kGetAttitudeAgentName = Fnv1a64("GetAttitudeAgent");
+    constexpr std::uint64_t kGetAttitudeTowardsName = Fnv1a64("GetAttitudeTowards");
+    constexpr std::uint64_t kGameAttitudeAgentName = Fnv1a64("gameAttitudeAgent");
+
+    bool ValidateHandleGetter(Game::Rtti::Function* function, Game::Rtti::FunctionInfo& info)
+    {
+        if (!function || !Game::Rtti::InspectFunction(function, info))
+            return false;
+        return info.parameterCount == 0 && info.hasReturnValue && info.returnIsHandle;
+    }
+
+    bool ValidateAttitudeTowards(Game::Rtti::Function* function, Game::Rtti::FunctionInfo& info)
+    {
+        if (!function || !Game::Rtti::InspectFunction(function, info))
+            return false;
+        // The local 2.31 metadata identifies GetAttitudeTowards as a native one-parameter integer-returning
+        // method. Requiring the native handler prevents an unrelated scripted overload from entering this path.
+        return info.parameterCount == 1 && info.hasReturnValue && !info.returnIsHandle &&
+               (info.flags & 1u) != 0 && info.nativeHandler != nullptr;
+    }
+
+    void ReleaseAttitudeWorkHandles(AttitudeWork* workItems, std::size_t count)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (!ReleaseOwnedHandle(workItems[i].entityHandle, "attitude-entity-work"))
+                g_attitudeExpiredOrInvalidReference.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    bool InvokeHandleGetter(Game::Rtti::Function* function, void* context, Game::Rtti::Handle& result,
+                            const char* reason)
+    {
+        result = {};
+        Game::Rtti::FunctionInfo info;
+        if (!function || !context || !ValidateHandleGetter(function, info))
+            return false;
+
+        const bool called = Game::Rtti::Invoke(function, context, nullptr, 0, &result);
+        if (!called || !IsHandleShapeValid(result))
+        {
+            ReleaseOwnedHandle(result, reason);
+            return false;
+        }
+        return true;
+    }
+
+    bool TryAcquireLocalPlayerAgent(Game::Rtti::Handle& playerAgent)
+    {
+        playerAgent = {};
+        if (!IsPhase2AttitudeEnabled() || !g_attitudeRuntime.playerSystem ||
+            !g_attitudeRuntime.getLocalPlayer)
+            return false;
+
+        Game::Rtti::Handle playerEntity;
+        if (!InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, playerEntity,
+                                "local-player-result"))
+            return false;
+
+        const Game::Rtti::Class* playerType = Game::Rtti::NativeType(playerEntity.instance);
+        if (!playerType || !g_attitudeRuntime.getAttitudeAgent)
+        {
+            ReleaseOwnedHandle(playerEntity, "local-player-entity");
+            return false;
+        }
+
+        const bool agentCalled = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeAgent, playerEntity.instance,
+                                                    nullptr, 0, &playerAgent);
+        const bool entityReleased = ReleaseOwnedHandle(playerEntity, "local-player-entity");
+        if (!agentCalled || !IsHandleShapeValid(playerAgent) || !entityReleased)
+        {
+            ReleaseOwnedHandle(playerAgent, "local-player-agent-result");
+            return false;
+        }
+
+        const Game::Rtti::Class* agentType = Game::Rtti::NativeType(playerAgent.instance);
+        if (!Game::Rtti::IsClassOrDerived(agentType, kGameAttitudeAgentName))
+        {
+            ReleaseOwnedHandle(playerAgent, "local-player-agent-type");
+            return false;
+        }
+        g_attitudeAgentLookupSuccess.fetch_add(1, std::memory_order_relaxed);
+        if (!g_attitudeRuntime.agentLogged)
+        {
+            Diagnostics::Log("phase2 local attitude agent: entityType=0x%llX getterOwner=0x%llX agent=%p",
+                             static_cast<unsigned long long>(Game::Rtti::ClassNameHash(playerType)),
+                             static_cast<unsigned long long>(g_attitudeRuntime.attitudeGetterOwnerHash),
+                             playerAgent.instance);
+            g_attitudeRuntime.agentLogged = true;
+        }
+        return true;
+    }
+
+    // This is the only Phase 2 attitude boundary. A raw Entity pointer is used only through entityHandle, which
+    // owns the object until this function returns. GetAttitudeAgent supplies a second strong Handle for the agent;
+    // that handle remains live across NativeType/IsClassOrDerived, GetAttitudeTowards, and its exact release.
+    Game::EntityTracker::Hostility TryResolveAttitudeAgentSafely(const Game::Rtti::Handle& entityHandle,
                                                                  const Game::Rtti::Handle* playerAgent)
     {
         using Game::EntityTracker::Hostility;
         g_attitudeLookupAttempts.fetch_add(1, std::memory_order_relaxed);
 
-        if (!IsPhase2AttitudeEnabled())
-        {
-            (void)entity;
-            (void)playerAgent;
-            g_attitudeSourceContractBlocked.fetch_add(1, std::memory_order_relaxed);
+        const auto unknown = [&](bool expired) {
+            if (expired)
+                g_attitudeExpiredOrInvalidReference.fetch_add(1, std::memory_order_relaxed);
             g_attitudeAgentLookupUnknown.fetch_add(1, std::memory_order_relaxed);
             return Hostility::Unknown;
+        };
+
+        if (!IsPhase2AttitudeEnabled())
+        {
+            g_attitudeSourceContractBlocked.fetch_add(1, std::memory_order_relaxed);
+            return unknown(false);
+        }
+        if (!IsHandleShapeValid(entityHandle) || !playerAgent || !IsHandleShapeValid(*playerAgent))
+            return unknown(true);
+
+        const Game::Rtti::Class* entityType = Game::Rtti::NativeType(entityHandle.instance);
+        if (!entityType || !g_attitudeRuntime.getAttitudeAgent)
+            return unknown(false);
+
+        Game::Rtti::Handle agent;
+        const bool agentCalled = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeAgent, entityHandle.instance,
+                                                    nullptr, 0, &agent);
+        if (!agentCalled || !IsHandleShapeValid(agent))
+        {
+            ReleaseOwnedHandle(agent, "npc-agent-result");
+            return unknown(true);
         }
 
-        // kPhase2AttitudeRttiCompileGate is a compile-time conjunction that remains false until both acquisition
-        // and release/source-storage evidence are independently accepted. Keep this branch fail-closed if a future
-        // edit changes only the runtime gate instead of supplying the retained-handle implementation.
-        (void)entity;
-        (void)playerAgent;
-        g_attitudeExpiredOrInvalidReference.fetch_add(1, std::memory_order_relaxed);
-        g_attitudeAgentLookupUnknown.fetch_add(1, std::memory_order_relaxed);
-        return Hostility::Unknown;
+        const Game::Rtti::Class* agentType = Game::Rtti::NativeType(agent.instance);
+        if (!Game::Rtti::IsClassOrDerived(agentType, kGameAttitudeAgentName))
+        {
+            ReleaseOwnedHandle(agent, "npc-agent-type");
+            return unknown(false);
+        }
+        g_attitudeAgentLookupSuccess.fetch_add(1, std::memory_order_relaxed);
+
+        if (!g_attitudeRuntime.getAttitudeTowards)
+        {
+            ReleaseOwnedHandle(agent, "npc-agent-signature");
+            return unknown(false);
+        }
+
+        std::int32_t attitude = -1;
+        Game::Rtti::Argument arguments[] = {{const_cast<Game::Rtti::Handle*>(playerAgent)}};
+        const bool called = Game::Rtti::Invoke(g_attitudeRuntime.getAttitudeTowards, agent.instance, arguments, 1,
+                                               &attitude);
+        const bool released = ReleaseOwnedHandle(agent, "npc-attitude-agent");
+        if (!called || !released)
+            return unknown(!released);
+
+        // EAIAttitude: AIA_Friendly = 0, AIA_Neutral = 1, AIA_Hostile = 2.
+        switch (attitude)
+        {
+        case 0:
+            return Hostility::Friendly;
+        case 1:
+            return Hostility::Neutral;
+        case 2:
+            return Hostility::Hostile;
+        default:
+            return unknown(false);
+        }
     }
 
-    struct AttitudeWork
+    bool ResolveAttitudeOnMainTick()
     {
-        EntityLayout* entity = nullptr;
-        std::uint64_t entityId = 0;
-        std::size_t slot = 0;
-        Game::EntityTracker::Hostility hostility = Game::EntityTracker::Hostility::Unknown;
-    };
+        if (!kPhase2AttitudeRttiCompileGate)
+            return false;
+        if (!Game::Rtti::HasExactHandleOwnership())
+        {
+            g_attitudeRttiRuntimeGate.store(false, std::memory_order_release);
+            return false;
+        }
+        if (g_attitudeRttiRuntimeGate.load(std::memory_order_acquire) && g_attitudeRuntime.playerSystem &&
+            g_attitudeRuntime.getLocalPlayer && g_attitudeRuntime.getAttitudeAgent &&
+            g_attitudeRuntime.getAttitudeTowards &&
+            g_attitudeRuntime.attitudeAgentClass)
+            return true;
+
+        const ULONGLONG now = GetTickCount64();
+        if (g_attitudeRuntime.attempted && now - g_attitudeRuntime.lastResolveAttempt < 2000)
+            return false;
+        g_attitudeRuntime.attempted = true;
+        g_attitudeRuntime.lastResolveAttempt = now;
+
+        g_attitudeRuntime.playerSystem = nullptr;
+        g_attitudeRuntime.getLocalPlayer = nullptr;
+        g_attitudeRuntime.getAttitudeAgent = nullptr;
+        g_attitudeRuntime.getAttitudeTowards = nullptr;
+        g_attitudeRuntime.attitudeAgentClass = nullptr;
+        g_attitudeRuntime.attitudeGetterOwnerHash = 0;
+
+        void* gameInstance = ResolveGameInstanceOnMainTick();
+        g_attitudeRuntime.playerSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIPlayerSystem"));
+        const Game::Rtti::Class* playerSystemType = Game::Rtti::NativeType(g_attitudeRuntime.playerSystem);
+        g_attitudeRuntime.getLocalPlayer = Game::Rtti::FindFunction(
+            playerSystemType, Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
+        Game::Rtti::FunctionInfo localPlayerInfo;
+        const bool localPlayerValid = ValidateHandleGetter(g_attitudeRuntime.getLocalPlayer, localPlayerInfo);
+
+        // Resolve GetAttitudeAgent from a live, ownership-bearing player Entity before opening the runtime gate.
+        // This proves the zero-parameter Handle-return signature on the actual running type without touching the
+        // component DynArray. During loading screens the null player simply leaves the gate closed for a retry.
+        Game::Rtti::FunctionInfo getterInfo;
+        Game::Rtti::Handle resolverPlayer;
+        bool getterValid = false;
+        if (localPlayerValid &&
+            InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, resolverPlayer,
+                               "attitude-resolver-player"))
+        {
+            const Game::Rtti::Class* playerType = Game::Rtti::NativeType(resolverPlayer.instance);
+            Game::Rtti::Function* getter = Game::Rtti::FindFunction(playerType, kGetAttitudeAgentName);
+            getterValid = ValidateHandleGetter(getter, getterInfo);
+            if (getterValid)
+            {
+                g_attitudeRuntime.getAttitudeAgent = getter;
+                g_attitudeRuntime.attitudeGetterOwnerHash = Game::Rtti::ClassNameHash(getterInfo.parent);
+            }
+        }
+        if (!ReleaseOwnedHandle(resolverPlayer, "attitude-resolver-player"))
+            getterValid = false;
+
+        g_attitudeRuntime.attitudeAgentClass = Game::Rtti::GetClass(kGameAttitudeAgentName);
+        g_attitudeRuntime.getAttitudeTowards = Game::Rtti::FindFunction(
+            g_attitudeRuntime.attitudeAgentClass, kGetAttitudeTowardsName);
+        Game::Rtti::FunctionInfo attitudeInfo;
+        const bool attitudeValid = ValidateAttitudeTowards(g_attitudeRuntime.getAttitudeTowards, attitudeInfo);
+
+        const bool resolved = g_attitudeRuntime.playerSystem && localPlayerValid && getterValid &&
+                              g_attitudeRuntime.attitudeAgentClass && attitudeValid;
+        g_attitudeRttiRuntimeGate.store(resolved, std::memory_order_release);
+        if (!g_attitudeRuntime.logged || resolved)
+        {
+            Diagnostics::Log(
+                "phase2 attitude resolver: ownership=1 playerSystem=%p GetLocalPlayer=%p "
+                "local=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X) "
+                "GetAttitudeAgent=%p getter=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X) "
+                "GetAttitudeTowards=%p agent=(owner=0x%llX params=%zu return=%d handle=%d flags=0x%X native=%p) "
+                "resolved=%d",
+                g_attitudeRuntime.playerSystem, g_attitudeRuntime.getLocalPlayer,
+                static_cast<unsigned long long>(Game::Rtti::ClassNameHash(localPlayerInfo.parent)),
+                localPlayerInfo.parameterCount, localPlayerInfo.hasReturnValue ? 1 : 0,
+                localPlayerInfo.returnIsHandle ? 1 : 0, localPlayerInfo.flags,
+                g_attitudeRuntime.getAttitudeAgent,
+                static_cast<unsigned long long>(Game::Rtti::ClassNameHash(getterInfo.parent)),
+                getterInfo.parameterCount, getterInfo.hasReturnValue ? 1 : 0,
+                getterInfo.returnIsHandle ? 1 : 0, getterInfo.flags,
+                g_attitudeRuntime.getAttitudeTowards,
+                static_cast<unsigned long long>(Game::Rtti::ClassNameHash(attitudeInfo.parent)),
+                attitudeInfo.parameterCount, attitudeInfo.hasReturnValue ? 1 : 0,
+                attitudeInfo.returnIsHandle ? 1 : 0, attitudeInfo.flags, attitudeInfo.nativeHandler,
+                resolved ? 1 : 0);
+            g_attitudeRuntime.logged = true;
+        }
+        return resolved;
+    }
 
     // Same shape as PublishHealthBatch: one exclusive lock, one identity comparison at a known slot.
     void PublishHostilityBatch(const AttitudeWork* items, std::size_t count)
@@ -1757,12 +2104,15 @@ namespace
 
     void ProcessAttitudeOnMainTick()
     {
-        if (!IsPhase2AttitudeEnabled())
+        const bool resolved = ResolveAttitudeOnMainTick();
+        if (!resolved || !IsPhase2AttitudeEnabled())
             ApplyAttitudeFailClosed();
+        else
+            g_attitudeFailClosedStateCleared.store(false, std::memory_order_release);
 
-        // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second. While
-        // the Phase 2 ownership gate is closed, the bounded calls below are bookkeeping-only and make no engine/VM
-        // calls.
+        // Attitude only matters at human reaction speed, so each puppet refreshes about four times a second. Entity
+        // work items copy the already-retained slot Handle while the tracker lock is held; all RTTI/VM work below
+        // happens after that lock is released.
         constexpr std::size_t kAttitudePerTick = 4;
         constexpr ULONGLONG kAttitudeIntervalMs = 250;
 
@@ -1787,6 +2137,11 @@ namespace
             work.entity = tracked.entity;
             work.entityId = tracked.entityId;
             work.slot = slot;
+            if (resolved && IsPhase2AttitudeEnabled())
+            {
+                if (Game::Rtti::CopyHandle(&tracked.entityHandle, &work.entityHandle))
+                    g_attitudeLifetimeAcquisitionSuccess.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         ReleaseSRWLockShared(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeCollect,
@@ -1795,13 +2150,17 @@ namespace
 
         const bool shouldLog = now - g_attitudePathLogTick >= 3000;
         const std::int64_t invokeStart = Diagnostics::Profile::Now();
+        Game::Rtti::Handle playerAgent;
+        if (resolved && IsPhase2AttitudeEnabled() && workCount > 0)
+            TryAcquireLocalPlayerAgent(playerAgent);
         for (std::size_t i = 0; i < workCount; ++i)
-            workItems[i].hostility = TryResolveAttitudeAgentSafely(workItems[i].entity, nullptr);
+            workItems[i].hostility = TryResolveAttitudeAgentSafely(workItems[i].entityHandle, &playerAgent);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
                                      Diagnostics::Profile::Now() - invokeStart);
 
         if (workCount == 0)
         {
+            ReleaseOwnedHandle(playerAgent, "attitude-player-agent");
             if (shouldLog)
             {
                 g_attitudePathLogTick = now;
@@ -1818,6 +2177,8 @@ namespace
                              IsPhase2AttitudeEnabled() ? 1 : 0);
         }
         PublishHostilityBatch(workItems.data(), workCount);
+        ReleaseOwnedHandle(playerAgent, "attitude-player-agent");
+        ReleaseAttitudeWorkHandles(workItems.data(), workCount);
     }
 
     bool TryReadEntityIdBeforeRemoval(const EntityLayout* entity, std::uint64_t& entityId) noexcept
@@ -1837,27 +2198,6 @@ namespace
         }
     }
 
-    bool ObserveTrackedBeforeRemoval(EntityLayout* entity, std::uint64_t entityId, bool& tracked) noexcept
-    {
-        tracked = false;
-        if (!TryAcquireSRWLockShared(&g_puppetListLock))
-            return false;
-
-        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
-        {
-            if (!IsPuppetOccupied(slot))
-                continue;
-            const TrackedPuppet& candidate = g_puppetList[slot];
-            if (candidate.entity == entity && (entityId == 0 || candidate.entityId == entityId))
-            {
-                tracked = true;
-                break;
-            }
-        }
-        ReleaseSRWLockShared(&g_puppetListLock);
-        return true;
-    }
-
     bool HookUnregisterEntity(void* registry, EntityLayout* entity)
     {
         HookLifecycle::CallbackGuard callback;
@@ -1868,8 +2208,31 @@ namespace
 
         std::uint64_t entityId = 0;
         const bool identityKnown = TryReadEntityIdBeforeRemoval(entity, entityId);
+        Game::Rtti::Handle retainedEntity;
         bool tracked = false;
-        const bool trackedKnown = ObserveTrackedBeforeRemoval(entity, identityKnown ? entityId : 0, tracked);
+        // Invalidate and move the stored owner out before the original removal call. A concurrent attitude work item
+        // that already copied the Handle remains an independent strong owner. Keep this local owner alive until the
+        // original returns so its call cannot observe an object destroyed by our final release.
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
+        {
+            if (!IsPuppetOccupied(slot))
+                continue;
+            TrackedPuppet& candidate = g_puppetList[slot];
+            if (candidate.entity != entity || (identityKnown && candidate.entityId != entityId))
+                continue;
+            tracked = true;
+            retainedEntity = candidate.entityHandle;
+            candidate = {};
+            SetPuppetOccupied(slot, false);
+            break;
+        }
+        std::uint64_t trackedCount = 0;
+        for (const TrackedPuppet& candidate : g_puppetList)
+            trackedCount += candidate.entity != nullptr ? 1u : 0u;
+        g_trackedPuppets.store(trackedCount, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        constexpr bool trackedKnown = true;
         g_lastUnregisteredEntityAddress.store(entityAddress, std::memory_order_relaxed);
         g_lastUnregisteredEntityId.store(identityKnown ? entityId : 0, std::memory_order_relaxed);
         g_lastUnregisteredTrackingKnown.store(trackedKnown, std::memory_order_relaxed);
@@ -1883,9 +2246,10 @@ namespace
         else
             g_unregisterUntracked.fetch_add(1, std::memory_order_relaxed);
 
-        // Do not hold g_puppetListLock (or any tracker lock) across this game call. The entity is not inspected
-        // after it returns; stale validation remains the authoritative cleanup path for this Phase 1 observer.
+        // Do not hold g_puppetListLock (or any tracker lock) across this game call. The local strong owner remains
+        // alive for the complete original call and is released only after it returns.
         const bool result = g_originalUnregisterEntity(registry, entity);
+        ReleaseOwnedHandle(retainedEntity, "unregister-entity");
         if (callbackCount <= 5 || (callbackCount & (callbackCount - 1)) == 0)
         {
             Diagnostics::Log("entity unregister observed: total=%llu ptr=%p id=0x%llX identity=%d trackedKnown=%d "
@@ -1907,10 +2271,18 @@ namespace
         ObserveThreadAffinity(currentThread, g_registerThreadAffinityMatches, g_registerThreadAffinityMismatches);
         g_lastRegisteredEntityAddress.store(reinterpret_cast<std::uint64_t>(entity), std::memory_order_relaxed);
 
-        // The original is called exactly once and before any tracker work. No tracker lock is held across this game
-        // call. Shutdown disables all hooks and drains CallbackGuard instances before clearing this pointer.
+        // The direct 2.31 caller retains the Entity through this detour's return. Acquire our own strong owner in
+        // that known-live scope before calling the original; the slot takes ownership only after all post-original
+        // reads complete. If the exact Handle ABI is unavailable, leave the attitude source gated and keep no raw
+        // owner that could not be released safely.
+        Game::Rtti::Handle retainedEntity;
+        if (entity && Game::Rtti::HasExactHandleOwnership())
+            Game::Rtti::ConstructHandle(&retainedEntity, entity);
+
+        // The original is called exactly once and before any tracker lock. Shutdown disables all hooks and drains
+        // CallbackGuard instances before clearing this pointer.
         const bool result = g_originalRegisterEntity(registry, entity);
-        if (!HookLifecycle::IsShuttingDown())
+        if (result && !HookLifecycle::IsShuttingDown())
         {
             void* expected = nullptr;
             if (g_registry.compare_exchange_strong(expected, registry, std::memory_order_release,
@@ -1918,8 +2290,9 @@ namespace
             {
                 Diagnostics::Log("runtime entity registry captured: registry=%p", registry);
             }
-            CaptureEntity(entity);
+            CaptureEntity(entity, retainedEntity);
         }
+        ReleaseOwnedHandle(retainedEntity, "register-entity");
         if ((callbackCount & 0x7Fu) == 0)
             MaybeLogPhase1Summary();
         return result;
@@ -2036,7 +2409,7 @@ namespace Game::EntityTracker
             g_unregisterHookCreated.store(false, std::memory_order_release);
             g_hookCreated.store(true, std::memory_order_release);
             Diagnostics::Log("entity tracker hook created: RegisterEntity target=%p unregisterHook=0 "
-                             "attitudeRtti=fail-closed",
+                             "attitudeRtti=runtime-gated",
                              target);
             return true;
         }
@@ -2053,7 +2426,7 @@ namespace Game::EntityTracker
             g_unregisterHookCreated.store(false, std::memory_order_release);
             g_hookCreated.store(true, std::memory_order_release);
             Diagnostics::Log("entity tracker hook created: RegisterEntity target=%p unregisterHook=0 "
-                             "attitudeRtti=fail-closed",
+                             "attitudeRtti=runtime-gated",
                              target);
             return true;
         }
@@ -2069,7 +2442,7 @@ namespace Game::EntityTracker
         g_unregisterHookCreated.store(true, std::memory_order_release);
         g_hookCreated.store(true, std::memory_order_release);
         Diagnostics::Log("entity tracker hooks created: RegisterEntity target=%p UnregisterEntity target=%p "
-                         "attitudeRtti=fail-closed",
+                         "attitudeRtti=runtime-gated",
                          target, removalTarget);
         return true;
     }
@@ -2082,8 +2455,29 @@ namespace Game::EntityTracker
         g_hookCreated.store(false, std::memory_order_release);
         g_unregisterHookCreated.store(false, std::memory_order_release);
         g_registry.store(nullptr, std::memory_order_release);
+        g_attitudeRttiRuntimeGate.store(false, std::memory_order_release);
         g_originalRegisterEntity = nullptr;
         g_originalUnregisterEntity = nullptr;
+
+        // Hooks and callback guards are already drained by the caller. Invalidate slots first, then release their
+        // exact Entity owners without holding the tracker lock so no future snapshot/attitude collection can race
+        // the release. This is the same Handle ABI used by the unregister boundary.
+        std::array<Game::Rtti::Handle, kMaxTrackedPuppets> retainedEntities{};
+        std::size_t retainedCount = 0;
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (std::size_t slot = 0; slot < kMaxTrackedPuppets; ++slot)
+        {
+            TrackedPuppet& tracked = g_puppetList[slot];
+            if (retainedCount < retainedEntities.size())
+                retainedEntities[retainedCount++] = tracked.entityHandle;
+            tracked = {};
+            SetPuppetOccupied(slot, false);
+        }
+        g_trackedPuppets.store(0, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        for (std::size_t i = 0; i < retainedCount; ++i)
+            ReleaseOwnedHandle(retainedEntities[i], "tracker-shutdown");
+
         g_nativeHighlightModeActive.store(false, std::memory_order_release);
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupClearQueued.store(false, std::memory_order_release);
@@ -2184,6 +2578,8 @@ namespace Game::EntityTracker
         std::uint64_t enemies = 0;
         std::uint64_t police = 0;
         std::uint64_t hostile = 0;
+        std::array<Game::Rtti::Handle, kMaxTrackedPuppets> staleHandles{};
+        std::size_t staleHandleCount = 0;
         const std::int64_t lockWaitStart = Diagnostics::Profile::Now();
         AcquireSRWLockExclusive(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::SnapshotLockWait,
@@ -2198,6 +2594,11 @@ namespace Game::EntityTracker
             const SnapshotResult result = TrySnapshot(tracked, snapshot);
             if (result == SnapshotResult::Stale)
             {
+                if (staleHandleCount < staleHandles.size())
+                {
+                    staleHandles[staleHandleCount++] = tracked.entityHandle;
+                    tracked.entityHandle = {};
+                }
                 tracked = {};
                 SetPuppetOccupied(slot, false);
                 g_staleRemoved.fetch_add(1, std::memory_order_relaxed);
@@ -2220,6 +2621,8 @@ namespace Game::EntityTracker
         g_trackedPolice.store(police, std::memory_order_release);
         g_trackedHostile.store(hostile, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_puppetListLock);
+        for (std::size_t i = 0; i < staleHandleCount; ++i)
+            ReleaseOwnedHandle(staleHandles[i], "stale-puppet");
         Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::SnapshotPuppets, count);
         return count;
     }

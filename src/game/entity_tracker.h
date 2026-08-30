@@ -49,8 +49,8 @@ namespace Game::EntityTracker
         std::uint64_t attitudeValid = 0;
         std::uint64_t attitudeInvalid = 0;
         std::uint64_t attitudeFailClosedTicks = 0;
-        // Phase 2 attitude ownership diagnostics. These remain zero for acquisition success while the source
-        // entry contract is gated; unknown counts include candidates deliberately rejected by that gate.
+        // Phase 2 attitude ownership diagnostics. Acquisition success counts a strong retained-Entity copy made
+        // under the tracker lock; unknown counts include candidates rejected by the runtime signature/lifetime gate.
         std::uint64_t attitudeLookupAttempts = 0;
         std::uint64_t attitudeSourceContractBlocked = 0;
         std::uint64_t attitudeLifetimeAcquisitionSuccess = 0;

@@ -324,6 +324,11 @@ namespace Game::Rtti
             output.registrationIndex = function->regIndex;
             output.parameterCount = function->params.size;
             output.hasReturnValue = function->returnType != nullptr;
+            // RED4ext CProperty::Flags::isHandle is bit 0x1B. Keep this as metadata
+            // validation only; the returned storage is still treated as an opaque 16-byte
+            // Handle and must be released through the exact ABI below.
+            output.returnIsHandle = function->returnType != nullptr &&
+                                    (function->returnType->flags & (1ull << 27)) != 0;
 
             const bool isNative = (function->flags & 1u) != 0;
             const bool isStatic = (function->flags & 2u) != 0;
@@ -446,6 +451,19 @@ namespace Game::Rtti
             observed = previous;
         }
         return false;
+    }
+
+    bool HasExactHandleOwnership()
+    {
+        ResolveAddressFn resolve = ResolveAddress();
+        if (!resolve)
+            return false;
+
+        // The constructor is the only accepted strong acquisition from a live Entity pointer. The
+        // three release helpers are the SDK Handle destructor's exact 2.31 path: DecWeakRef, the
+        // ISerializable::CanBeDestructed dispatch, and Memory::Delete.
+        return resolve(kHandleCtorAddressHash) != 0 && resolve(kHandleDecWeakRefAddressHash) != 0 &&
+               resolve(kHandleCanBeDestructedAddressHash) != 0 && resolve(kHandleDestroyAddressHash) != 0;
     }
 
     void ReleaseHandle(Handle* handle)

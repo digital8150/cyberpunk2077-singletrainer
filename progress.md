@@ -2108,3 +2108,32 @@ attitude 경로의 stale 포인터는 별도 항목으로 남긴다. 이번 수�
   산출물은 건드리지 않았다. Phase 2는 release 쪽 계약과 lifetime-aware 경계/계측까지 완료했지만,
   source acquisition proof가 없으므로 기능 활성화 단계로 판정하지 않는다.
 
+## 2026-08-30 - Issue #1 Phase 2B retained Entity + GetAttitudeAgent 경로
+
+- Phase 2 fail-closed 빌드를 PID 30148에 10:32:40경 재주입했다. 기존 Phase 1은 먼저 안전 언로드됐고
+  fatal 로그에 `[SESSION] closed cleanly at 10:32:01.681`이 남았다. Phase 2 세션에서는 source gate 차단과
+  expired/invalid reference가 분리되어 집계됐고, 예를 들어 10:37:39에 `attitudeAttempts=356`,
+  `attitudeSourceBlocked=356`, `attitudeExpiredInvalid=0`이었다.
+- 로컬 2.31 실행 파일에서 `FNV64("GetAttitudeAgent") = 0xC995204DDA42530A` immediate가 RVA
+  `0xD02AC4`에 유일하게 존재함을 확인했다. 해당 wrapper entry RVA `0xD02A20`은 0-parameter reflected
+  getter를 호출해 16-byte Handle을 반환하며, fast path도 반환 qword 두 개를 복사한 뒤 strong refcount를
+  atomic increment한다. Register의 direct caller RVA `0x8B55A0`은 Entity member-call 범위에서
+  `RDX=entity(this)`를 넘기므로 detour 반환 전 known-live 범위에서 self weak Handle을 strong Handle로 lock할
+  수 있다.
+- Register detour는 original 전 Entity strong Handle을 획득하고, successful NPC registration만 tracker slot로
+  ownership을 이동한다. Unregister detour는 original 전 tracker lock 아래 slot을 invalidate하고 owner를
+  local로 이동하지만, original이 반환할 때까지 strong Handle을 유지한 뒤 lock 밖에서 exact release한다.
+  main-tick attitude work는 tracker lock 아래 stored Entity Handle을 strong-copy하고 모든 RTTI/VM 호출과 release를
+  lock 밖에서 수행한다. generation-only fallback과 raw component DynArray attitude walk는 사용하지 않는다.
+- main tick은 retained Entity에 `GetAttitudeAgent`를 호출해 NPC/player agent strong Handle을 얻고,
+  `NativeType`/class validation과 `GetAttitudeTowards`가 끝날 때까지 보유한 뒤 exact release한다. runtime gate는
+  exact Handle ctor/release helper, `GetLocalPlayerControlledGameObject`의 Handle 반환, 실제 live player type에서
+  찾은 `GetAttitudeAgent`의 0-param Handle 반환, `GetAttitudeTowards`의 1-param native non-Handle 반환을 모두
+  검증해야만 열린다.
+- 본 모델 검토에서 owner 없는 신규 tracked slot을 금지하고, `GetAttitudeAgent` signature 검증 전에 gate가
+  열리던 순서, fail-closed source block을 expired reference로 중복 집계하던 부분, local agent 성공 로그가 매
+  pass마다 출력되던 부분, exact release가 registration SEH 범위 안에서 엔진 destructor 예외를 삼킬 수 있던
+  부분을 수정했다. 새 경로에서 더 이상 필요하지 않은 Phase 1 raw component sample 호출도 제거했다.
+- `build-next` Release 빌드와 `git diff --check`가 통과했다. 아직 라이브 주입 전이므로 runtime resolver가
+  실제로 gate를 여는지, hostility valid/unknown 비율과 장시간 streaming 안정성은 다음 세션에서 검증한다.
+
