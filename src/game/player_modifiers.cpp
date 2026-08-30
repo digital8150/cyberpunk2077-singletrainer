@@ -33,6 +33,10 @@ namespace
         std::uint64_t targetId = 0;
         void* instance = nullptr;
         Game::Rtti::Handle handle;
+        // ConstructHandle establishes a strong handle before AddModifier runs. Keep this separate from active:
+        // a failed/exceptional AddModifier still leaves a handle the engine may have retained and must be removed
+        // through the exact reflected call before the local storage can be released.
+        bool cleanupTracked = false;
         bool active = false;
     };
 
@@ -45,21 +49,34 @@ namespace
         Found,
     };
 
-    struct Runtime
+    enum SystemMask : std::uint32_t
     {
-        bool attempted = false;
-        ULONGLONG lastResolveAttempt = 0;
+        kPlayerSystem = 1u << 0,
+        kStatsSystem = 1u << 1,
+        kTransactionSystem = 1u << 2,
+    };
+
+    struct SystemContext
+    {
+        // These pointers are valid only for the current main-tick/bounded operation. Runtime must never retain them.
         void* gameInstance = nullptr;
         void* playerSystem = nullptr;
         void* statsSystem = nullptr;
         void* transactionSystem = nullptr;
+    };
+
+    struct Runtime
+    {
+        bool attempted = false;
+        ULONGLONG lastResolveAttempt = 0;
         Game::Rtti::Function* getLocalPlayer = nullptr;
         Game::Rtti::Function* addModifier = nullptr;
         Game::Rtti::Function* removeModifier = nullptr;
         Game::Rtti::Function* getItemInSlot = nullptr;
         Game::Rtti::Class* modifierDataClass = nullptr;
         std::size_t modifierDataSize = 0;
-        bool logged = false;
+        ULONGLONG lastSystemAcquireFailureLog = 0;
+        std::uint64_t systemAcquireFailures = 0;
     };
 
     Runtime g_runtime;
@@ -132,6 +149,70 @@ namespace
         return getSystem && type ? getSystem(gameInstance, type) : nullptr;
     }
 
+    std::uint32_t AvailableSystems(const SystemContext& context)
+    {
+        std::uint32_t available = 0;
+        if (context.playerSystem)
+            available |= kPlayerSystem;
+        if (context.statsSystem)
+            available |= kStatsSystem;
+        if (context.transactionSystem)
+            available |= kTransactionSystem;
+        return available;
+    }
+
+    bool AcquireSystemContextOnMainTick(std::uint32_t required, SystemContext& context)
+    {
+        context = {};
+        __try
+        {
+            context.gameInstance = ResolveGameInstanceOnMainTick();
+            if (context.gameInstance)
+            {
+                if ((required & kPlayerSystem) != 0)
+                    context.playerSystem = GetSystemOnMainTick(
+                        context.gameInstance, Game::Rtti::Hash("gameIPlayerSystem"));
+                if ((required & kStatsSystem) != 0)
+                {
+                    context.statsSystem = GetSystemOnMainTick(
+                        context.gameInstance, Game::Rtti::Hash("gameStatsSystem"));
+                    if (!context.statsSystem)
+                        context.statsSystem = GetSystemOnMainTick(
+                            context.gameInstance, Game::Rtti::Hash("gameIStatsSystem"));
+                }
+                if ((required & kTransactionSystem) != 0)
+                {
+                    context.transactionSystem = GetSystemOnMainTick(
+                        context.gameInstance, Game::Rtti::Hash("gameTransactionSystem"));
+                    if (!context.transactionSystem)
+                        context.transactionSystem = GetSystemOnMainTick(
+                            context.gameInstance, Game::Rtti::Hash("gameITransactionSystem"));
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            context = {};
+        }
+
+        const std::uint32_t available = AvailableSystems(context);
+        const bool complete = (available & required) == required;
+        if (!complete)
+        {
+            ++g_runtime.systemAcquireFailures;
+            const ULONGLONG now = GetTickCount64();
+            if (g_runtime.lastSystemAcquireFailureLog == 0 ||
+                now - g_runtime.lastSystemAcquireFailureLog >= 1000)
+            {
+                g_runtime.lastSystemAcquireFailureLog = now;
+                Diagnostics::Log("no-recoil systems unavailable: required=0x%X available=0x%X failures=%llu",
+                                 required, available,
+                                 static_cast<unsigned long long>(g_runtime.systemAcquireFailures));
+            }
+        }
+        return complete;
+    }
+
     std::uint32_t Crc32(const char* text)
     {
         std::uint32_t value = 0xFFFFFFFFu;
@@ -147,85 +228,82 @@ namespace
     bool ResolveRuntimeOnMainTick()
     {
         const ULONGLONG now = GetTickCount64();
-        const bool baseResolved = g_runtime.statsSystem && g_runtime.playerSystem && g_runtime.getLocalPlayer &&
-                                  g_runtime.addModifier && g_runtime.removeModifier && g_runtime.modifierDataClass &&
-                                  g_runtime.modifierDataSize == kModifierDataSize;
-        const bool weaponApiResolved = g_runtime.transactionSystem && g_runtime.getItemInSlot;
-        if (g_runtime.attempted && baseResolved && weaponApiResolved)
+        const bool baseResolved = g_runtime.getLocalPlayer && g_runtime.addModifier && g_runtime.removeModifier &&
+                                  g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize;
+        const bool weaponApiResolved = g_runtime.getItemInSlot != nullptr;
+        if (baseResolved && weaponApiResolved)
+        {
+            g_runtimeAvailable.store(true, std::memory_order_release);
             return true;
+        }
         if (g_runtime.attempted && now - g_runtime.lastResolveAttempt < 1000)
+        {
+            g_runtimeAvailable.store(baseResolved, std::memory_order_release);
             return baseResolved;
+        }
 
         g_runtime.attempted = true;
         g_runtime.lastResolveAttempt = now;
-        g_runtime.gameInstance = nullptr;
-        g_runtime.playerSystem = nullptr;
-        g_runtime.statsSystem = nullptr;
-        g_runtime.transactionSystem = nullptr;
-        g_runtime.getLocalPlayer = nullptr;
-        g_runtime.addModifier = nullptr;
-        g_runtime.removeModifier = nullptr;
-        g_runtime.getItemInSlot = nullptr;
-        g_runtime.modifierDataClass = nullptr;
-        g_runtime.modifierDataSize = 0;
         g_runtimeAvailable.store(false, std::memory_order_release);
+
+        SystemContext systems;
+        // The systems below are temporary resolver inputs only. They are discarded when this function returns;
+        // only verified reflected metadata is retained in Runtime.
+        AcquireSystemContextOnMainTick(kPlayerSystem | kStatsSystem | kTransactionSystem, systems);
 
         __try
         {
-            g_runtime.gameInstance = ResolveGameInstanceOnMainTick();
-            g_runtime.playerSystem = GetSystemOnMainTick(
-                g_runtime.gameInstance, Game::Rtti::Hash("gameIPlayerSystem"));
-            g_runtime.statsSystem = GetSystemOnMainTick(
-                g_runtime.gameInstance, Game::Rtti::Hash("gameStatsSystem"));
-            if (!g_runtime.statsSystem)
-                g_runtime.statsSystem = GetSystemOnMainTick(
-                    g_runtime.gameInstance, Game::Rtti::Hash("gameIStatsSystem"));
-            g_runtime.transactionSystem = GetSystemOnMainTick(
-                g_runtime.gameInstance, Game::Rtti::Hash("gameTransactionSystem"));
-            if (!g_runtime.transactionSystem)
-                g_runtime.transactionSystem = GetSystemOnMainTick(
-                    g_runtime.gameInstance, Game::Rtti::Hash("gameITransactionSystem"));
+            if (systems.playerSystem)
+            {
+                Game::Rtti::Function* getLocalPlayer = Game::Rtti::FindFunction(
+                    Game::Rtti::NativeType(systems.playerSystem),
+                    Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
+                if (getLocalPlayer && Game::Rtti::ParameterCount(getLocalPlayer) == 0)
+                    g_runtime.getLocalPlayer = getLocalPlayer;
+            }
 
-            g_runtime.getLocalPlayer = Game::Rtti::FindFunction(
-                Game::Rtti::NativeType(g_runtime.playerSystem),
-                Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
-            const Game::Rtti::Class* statsType = Game::Rtti::NativeType(g_runtime.statsSystem);
-            g_runtime.addModifier = Game::Rtti::FindFunction(statsType, Game::Rtti::Hash("AddModifier"));
-            g_runtime.removeModifier = Game::Rtti::FindFunction(statsType, Game::Rtti::Hash("RemoveModifier"));
-            if (g_runtime.addModifier && Game::Rtti::ParameterCount(g_runtime.addModifier) != 2)
-                g_runtime.addModifier = nullptr;
-            if (g_runtime.removeModifier && Game::Rtti::ParameterCount(g_runtime.removeModifier) != 2)
-                g_runtime.removeModifier = nullptr;
+            if (systems.statsSystem)
+            {
+                const Game::Rtti::Class* statsType = Game::Rtti::NativeType(systems.statsSystem);
+                Game::Rtti::Function* addModifier = Game::Rtti::FindFunction(
+                    statsType, Game::Rtti::Hash("AddModifier"));
+                Game::Rtti::Function* removeModifier = Game::Rtti::FindFunction(
+                    statsType, Game::Rtti::Hash("RemoveModifier"));
+                if (addModifier && Game::Rtti::ParameterCount(addModifier) == 2)
+                    g_runtime.addModifier = addModifier;
+                if (removeModifier && Game::Rtti::ParameterCount(removeModifier) == 2)
+                    g_runtime.removeModifier = removeModifier;
+            }
 
-            const Game::Rtti::Class* transactionType = Game::Rtti::NativeType(g_runtime.transactionSystem);
-            g_runtime.getItemInSlot = Game::Rtti::FindFunction(transactionType, Game::Rtti::Hash("GetItemInSlot"));
-            if (g_runtime.getItemInSlot && Game::Rtti::ParameterCount(g_runtime.getItemInSlot) != 2)
-                g_runtime.getItemInSlot = nullptr;
-            g_runtime.modifierDataClass = Game::Rtti::GetClass(
+            if (systems.transactionSystem)
+            {
+                const Game::Rtti::Class* transactionType = Game::Rtti::NativeType(systems.transactionSystem);
+                Game::Rtti::Function* getItemInSlot = Game::Rtti::FindFunction(
+                    transactionType, Game::Rtti::Hash("GetItemInSlot"));
+                if (getItemInSlot && Game::Rtti::ParameterCount(getItemInSlot) == 2)
+                    g_runtime.getItemInSlot = getItemInSlot;
+            }
+
+            Game::Rtti::Class* modifierDataClass = Game::Rtti::GetClass(
                 Game::Rtti::Hash("gameConstantStatModifierData"));
-            g_runtime.modifierDataSize = Game::Rtti::ClassSize(g_runtime.modifierDataClass);
+            const std::size_t modifierDataSize = Game::Rtti::ClassSize(modifierDataClass);
+            if (modifierDataClass && modifierDataSize == kModifierDataSize)
+            {
+                g_runtime.modifierDataClass = modifierDataClass;
+                g_runtime.modifierDataSize = modifierDataSize;
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            g_runtime.gameInstance = nullptr;
-            g_runtime.playerSystem = nullptr;
-            g_runtime.statsSystem = nullptr;
-            g_runtime.transactionSystem = nullptr;
-            g_runtime.getLocalPlayer = nullptr;
-            g_runtime.addModifier = nullptr;
-            g_runtime.removeModifier = nullptr;
-            g_runtime.getItemInSlot = nullptr;
-            g_runtime.modifierDataClass = nullptr;
-            g_runtime.modifierDataSize = 0;
+            // Preserve previously verified metadata. A world transition can make this tick's temporary systems
+            // unavailable; dropping exact function/class metadata would turn a transient miss into a latch.
         }
 
-        const bool resolved = g_runtime.statsSystem && g_runtime.playerSystem && g_runtime.getLocalPlayer &&
-                              g_runtime.addModifier && g_runtime.removeModifier &&
+        const bool resolved = g_runtime.getLocalPlayer && g_runtime.addModifier && g_runtime.removeModifier &&
                               g_runtime.modifierDataClass && g_runtime.modifierDataSize == kModifierDataSize;
         g_runtimeAvailable.store(resolved, std::memory_order_release);
-        Diagnostics::Log("no-recoil resolver: player=%p stats=%p transaction=%p getPlayer=%p add=%p remove=%p "
-                         "getItem=%p modifierClass=%p size=0x%zX resolved=%d",
-                         g_runtime.playerSystem, g_runtime.statsSystem, g_runtime.transactionSystem,
+        Diagnostics::Log("no-recoil resolver: getPlayer=%p add=%p remove=%p getItem=%p modifierClass=%p "
+                         "size=0x%zX resolved=%d",
                          g_runtime.getLocalPlayer, g_runtime.addModifier, g_runtime.removeModifier,
                          g_runtime.getItemInSlot, g_runtime.modifierDataClass, g_runtime.modifierDataSize,
                          resolved ? 1 : 0);
@@ -251,87 +329,212 @@ namespace
         return entityId != 0;
     }
 
-    bool GetLocalPlayer(Game::Rtti::Handle& player, std::uint64_t& playerId)
+    void ReleaseLocalHandle(Game::Rtti::Handle& handle)
+    {
+        // Invoke may populate only part of an out Handle before a transition fault. Try the existing conservative
+        // release helper exactly once whenever either word was populated, then clear local storage even when no
+        // proven release path exists for a partial value. Never guess a destructor for the returned object.
+        if (handle.instance || handle.refCount)
+            Game::Rtti::ReleaseHandle(&handle);
+        handle = {};
+    }
+
+    bool GetLocalPlayer(const SystemContext& systems, Game::Rtti::Handle& player, std::uint64_t& playerId)
     {
         player = {};
         playerId = 0;
-        if (!Game::Rtti::Invoke(g_runtime.getLocalPlayer, g_runtime.playerSystem, nullptr, 0, &player) ||
-            !player.instance)
+        if (!g_runtime.getLocalPlayer || !systems.playerSystem)
             return false;
-        const bool valid = ReadEntityId(player.instance, playerId);
+
+        bool invoked = false;
+        __try
+        {
+            invoked = Game::Rtti::Invoke(g_runtime.getLocalPlayer, systems.playerSystem, nullptr, 0, &player);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            invoked = false;
+        }
+
+        bool hasInstance = false;
+        __try
+        {
+            hasInstance = player.instance != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            hasInstance = false;
+        }
+        if (!invoked || !hasInstance)
+        {
+            ReleaseLocalHandle(player);
+            return false;
+        }
+
+        bool valid = false;
+        __try
+        {
+            valid = ReadEntityId(player.instance, playerId);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            playerId = 0;
+            valid = false;
+        }
         if (!valid)
-            Game::Rtti::ReleaseHandle(&player);
+            ReleaseLocalHandle(player);
         return valid;
     }
 
-    EquippedWeaponResult GetEquippedWeaponId(const Game::Rtti::Handle& player, std::uint64_t& weaponId)
+    EquippedWeaponResult GetEquippedWeaponId(const SystemContext& systems, const Game::Rtti::Handle& player,
+                                              std::uint64_t& weaponId)
     {
         weaponId = 0;
-        if (!g_runtime.transactionSystem || !g_runtime.getItemInSlot || !player.instance)
+        bool hasPlayerInstance = false;
+        __try
+        {
+            hasPlayerInstance = player.instance != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            hasPlayerInstance = false;
+        }
+        if (!g_runtime.getItemInSlot || !hasPlayerInstance)
             return EquippedWeaponResult::ApiUnavailable;
+        if (!systems.transactionSystem)
+            return EquippedWeaponResult::CallFailed;
         TweakDbId slot;
         slot.hash = Crc32("AttachmentSlots.WeaponRight");
         slot.length = static_cast<std::uint8_t>(sizeof("AttachmentSlots.WeaponRight") - 1);
-        Game::Rtti::Handle item;
+        Game::Rtti::Handle item{};
         Game::Rtti::Argument arguments[] = {{const_cast<Game::Rtti::Handle*>(&player)}, {&slot}};
-        const bool invoked = Game::Rtti::Invoke(g_runtime.getItemInSlot, g_runtime.transactionSystem,
-                                                arguments, 2, &item);
+        bool invoked = false;
+        __try
+        {
+            invoked = Game::Rtti::Invoke(g_runtime.getItemInSlot, systems.transactionSystem,
+                                         arguments, 2, &item);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            invoked = false;
+        }
         if (!invoked)
         {
-            Game::Rtti::ReleaseHandle(&item);
+            ReleaseLocalHandle(item);
             return EquippedWeaponResult::CallFailed;
         }
-        if (!item.instance)
+
+        bool hasItemInstance = false;
+        __try
         {
-            Game::Rtti::ReleaseHandle(&item);
+            hasItemInstance = item.instance != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            hasItemInstance = false;
+        }
+        if (!hasItemInstance)
+        {
+            ReleaseLocalHandle(item);
             return EquippedWeaponResult::NoItem;
         }
-        if (!ReadEntityId(item.instance, weaponId))
+
+        bool valid = false;
+        __try
         {
-            Game::Rtti::ReleaseHandle(&item);
+            valid = ReadEntityId(item.instance, weaponId);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            weaponId = 0;
+            valid = false;
+        }
+        if (!valid)
+        {
+            ReleaseLocalHandle(item);
             return EquippedWeaponResult::InvalidItem;
         }
-        Game::Rtti::ReleaseHandle(&item);
+        ReleaseLocalHandle(item);
         return EquippedWeaponResult::Found;
     }
 
-    bool ModifierCall(Game::Rtti::Function* function, std::uint64_t targetId, ModifierEntry& modifier)
+    bool ModifierCall(const SystemContext& systems, Game::Rtti::Function* function, std::uint64_t targetId,
+                      ModifierEntry& modifier)
     {
-        if (!function || !g_runtime.statsSystem || !modifier.handle.instance)
+        if (!function || !systems.statsSystem)
             return false;
+
+        bool hasHandleInstance = false;
+        __try
+        {
+            hasHandleInstance = modifier.handle.instance != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            hasHandleInstance = false;
+        }
+        if (!hasHandleInstance)
+            return false;
+
         Game::Rtti::Argument arguments[] = {{&targetId}, {&modifier.handle}};
         bool result = false;
-        const bool invoked = Game::Rtti::Invoke(function, g_runtime.statsSystem, arguments, 2,
-                                                Game::Rtti::HasReturnValue(function) ? &result : nullptr);
-        return invoked && (!Game::Rtti::HasReturnValue(function) || result);
+        bool hasReturnValue = false;
+        __try
+        {
+            hasReturnValue = Game::Rtti::HasReturnValue(function);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+
+        bool invoked = false;
+        __try
+        {
+            invoked = Game::Rtti::Invoke(function, systems.statsSystem, arguments, 2,
+                                         hasReturnValue ? &result : nullptr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            invoked = false;
+        }
+        return invoked && (!hasReturnValue || result);
     }
 
-    bool RemoveModifiers()
+    bool RemoveModifiers(const SystemContext& systems)
     {
+        if (!g_runtime.removeModifier || !systems.statsSystem)
+            return false;
+
         bool allRemoved = true;
         std::size_t activeCount = 0;
+        std::size_t trackedCount = 0;
         std::uint64_t removalTarget = 0;
         for (ModifierEntry& modifier : g_modifiers)
         {
-            if (!modifier.active)
+            if (!modifier.cleanupTracked)
                 continue;
-            ++activeCount;
+            ++trackedCount;
+            if (modifier.active)
+                ++activeCount;
             if (removalTarget == 0)
                 removalTarget = modifier.targetId;
-            const bool removed = ModifierCall(g_runtime.removeModifier, modifier.targetId, modifier);
+            const bool removed = ModifierCall(systems, g_runtime.removeModifier, modifier.targetId, modifier);
             if (!removed)
             {
                 allRemoved = false;
                 g_failures.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
-            Game::Rtti::ReleaseHandle(&modifier.handle);
+            const bool wasActive = modifier.active;
+            ReleaseLocalHandle(modifier.handle);
             modifier = {};
-            g_removed.fetch_add(1, std::memory_order_relaxed);
+            if (wasActive)
+                g_removed.fetch_add(1, std::memory_order_relaxed);
         }
         if (allRemoved)
         {
-            if (activeCount == kModifierCount)
+            if (trackedCount == kModifierCount && activeCount == kModifierCount)
             {
                 Diagnostics::Log("no-recoil modifiers removed: targetId=0x%llX count=%zu",
                                  static_cast<unsigned long long>(removalTarget), activeCount);
@@ -345,9 +548,10 @@ namespace
         return allRemoved;
     }
 
-    bool ApplyModifiers(std::uint64_t targetId)
+    bool ApplyModifiers(const SystemContext& systems, std::uint64_t targetId)
     {
-        if (!targetId || !g_runtime.modifierDataClass || g_runtime.modifierDataSize != kModifierDataSize)
+        if (!targetId || !systems.statsSystem || !g_runtime.addModifier || !g_runtime.modifierDataClass ||
+            g_runtime.modifierDataSize != kModifierDataSize)
             return false;
 
         std::size_t appliedCount = 0;
@@ -373,25 +577,39 @@ namespace
                 break;
             }
 
-            if (!Game::Rtti::ConstructHandle(&modifier.handle, modifier.instance) ||
-                !ModifierCall(g_runtime.addModifier, targetId, modifier))
+            const bool constructed = Game::Rtti::ConstructHandle(&modifier.handle, modifier.instance);
+            if (!constructed)
+            {
+                g_failures.fetch_add(1, std::memory_order_relaxed);
+                // ConstructInstance has no verified destruction ABI in this project. Keep this raw allocation
+                // uncertainty explicit; do not invent a destructor or release a possibly partial Handle.
+                Diagnostics::Log("no-recoil handle construction failed: statType=%d targetId=0x%llX; "
+                                 "raw instance ownership unresolved",
+                                 modifier.statType, static_cast<unsigned long long>(targetId));
+                break;
+            }
+
+            // From this point the exact Handle must remain cleanup-tracked even when AddModifier throws or returns
+            // false: the engine may already have retained it. Safe unload is gated by g_active until removal is
+            // acknowledged, and failed removal leaves this entry intact for the next main tick.
+            modifier.cleanupTracked = true;
+            g_active.store(true, std::memory_order_release);
+            if (!ModifierCall(systems, g_runtime.addModifier, targetId, modifier))
             {
                 g_failures.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
             modifier.active = true;
-            // Mark the feature active as soon as the first exact handle is accepted. If a later stat fails, the
-            // shutdown handshake must still wait for RemoveModifier to retry rather than assuming a clean rollback.
-            g_active.store(true, std::memory_order_release);
             ++appliedCount;
             g_applied.fetch_add(1, std::memory_order_relaxed);
         }
 
         if (appliedCount != g_modifiers.size())
         {
-            // Remove only modifiers whose exact handles were accepted. If an engine call failed, keep its handle
-            // alive and let the next main tick retry; releasing it here could race an internal StatsSystem reference.
-            RemoveModifiers();
+            // Remove every successfully constructed Handle, including a handle whose AddModifier call failed or
+            // threw. If removal fails, keep it alive and let the next main tick retry; releasing it here could race
+            // an internal StatsSystem reference.
+            RemoveModifiers(systems);
             return false;
         }
         g_active.store(true, std::memory_order_release);
@@ -459,23 +677,30 @@ namespace Game::PlayerModifiers
 
         if (!requested)
         {
-            if (RemoveModifiers() && g_cleanupRequested.load(std::memory_order_acquire))
+            SystemContext systems;
+            AcquireSystemContextOnMainTick(kStatsSystem, systems);
+            if (RemoveModifiers(systems) && g_cleanupRequested.load(std::memory_order_acquire))
                 g_cleanupAcknowledged.store(true, std::memory_order_release);
             return;
         }
 
+        SystemContext systems;
+        const std::uint32_t requiredSystems = kPlayerSystem | kStatsSystem |
+                                               (g_runtime.getItemInSlot ? kTransactionSystem : 0u);
+        AcquireSystemContextOnMainTick(requiredSystems, systems);
+
         Game::Rtti::Handle player;
         std::uint64_t playerId = 0;
-        if (!GetLocalPlayer(player, playerId))
+        if (!GetLocalPlayer(systems, player, playerId))
         {
             if (currentlyActive)
-                RemoveModifiers();
+                RemoveModifiers(systems);
             g_failures.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
         std::uint64_t weaponId = 0;
-        const EquippedWeaponResult weaponResult = GetEquippedWeaponId(player, weaponId);
+        const EquippedWeaponResult weaponResult = GetEquippedWeaponId(systems, player, weaponId);
         const bool usingWeapon = weaponResult == EquippedWeaponResult::Found;
         if (weaponResult != EquippedWeaponResult::Found && weaponResult != EquippedWeaponResult::ApiUnavailable)
         {
@@ -483,8 +708,8 @@ namespace Game::PlayerModifiers
             // not evidence that the player is a valid StatsSystem target: remove any old weapon modifiers and wait
             // for a valid right-hand weapon instead of silently applying recoil modifiers to the player entity.
             LogTargetDecision(playerId, weaponId, false, weaponResult);
-            Game::Rtti::ReleaseHandle(&player);
-            if (currentlyActive && !RemoveModifiers())
+            ReleaseLocalHandle(player);
+            if (currentlyActive && !RemoveModifiers(systems))
                 return;
             return;
         }
@@ -493,7 +718,7 @@ namespace Game::PlayerModifiers
         // resolved. Once GetItemInSlot is available, the branch above waits for an equipped weapon.
         const std::uint64_t targetId = usingWeapon ? weaponId : playerId;
         LogTargetDecision(playerId, weaponId, usingWeapon, weaponResult);
-        Game::Rtti::ReleaseHandle(&player);
+        ReleaseLocalHandle(player);
 
         const std::uint64_t currentTarget = g_targetId.load(std::memory_order_acquire);
         const std::uint64_t currentPlayer = g_playerId.load(std::memory_order_acquire);
@@ -501,12 +726,12 @@ namespace Game::PlayerModifiers
         if (currentlyActive && (currentPlayer != playerId || currentTarget != targetId ||
                                 currentPathWeapon != usingWeapon))
         {
-            if (!RemoveModifiers())
+            if (!RemoveModifiers(systems))
                 return;
         }
         if (!g_active.load(std::memory_order_acquire))
         {
-            if (ApplyModifiers(targetId))
+            if (ApplyModifiers(systems, targetId))
             {
                 g_playerId.store(playerId, std::memory_order_release);
                 g_weaponId.store(weaponId, std::memory_order_release);

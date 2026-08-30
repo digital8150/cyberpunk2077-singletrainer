@@ -80,8 +80,6 @@ namespace
     struct State
     {
         std::atomic_bool hookCreated{false};
-        std::atomic_bool spatialResolveAttempted{false};
-        std::atomic<void*> spatialQueriesSystem{nullptr};
         std::atomic<Game::Rtti::Function*> raycast{nullptr};
         std::atomic<std::uint64_t> preset{kSightBlockerPreset};
         std::atomic_uint64_t totalCasts{0};
@@ -102,6 +100,9 @@ namespace
     std::atomic_bool g_loggedFirstMainTick{false};
     DWORD g_mainTickThreadId = 0;
     ULONGLONG g_lastStatsLogTick = 0;
+    ULONGLONG g_lastResolveAttempt = 0;
+    ULONGLONG g_lastSystemAcquireFailureLog = 0;
+    std::uint64_t g_systemAcquireFailures = 0;
 
     void* VirtualFunction(void* object, std::size_t index)
     {
@@ -129,13 +130,77 @@ namespace
         return reinterpret_cast<std::uint8_t*>(address);
     }
 
+    void* ResolveGameInstanceOnMainTick()
+    {
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        const std::uintptr_t enginePointerAddress = resolve ? resolve(kGameEngineAddressHash) : 0;
+        if (!enginePointerAddress)
+            return nullptr;
+        void* engine = *reinterpret_cast<void**>(enginePointerAddress);
+        void* framework = engine ? *reinterpret_cast<void**>(static_cast<std::byte*>(engine) + 0x308) : nullptr;
+        return framework ? *reinterpret_cast<void**>(static_cast<std::byte*>(framework) + 0x10) : nullptr;
+    }
+
+    void* GetSystemOnMainTick(void* gameInstance, std::uint64_t nameHash)
+    {
+        if (!gameInstance)
+            return nullptr;
+        HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
+        const auto resolve = red4ext
+                                 ? reinterpret_cast<ResolveAddressFn>(GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
+                                 : nullptr;
+        const std::uintptr_t rttiAddress = resolve ? resolve(kRttiSystemGetAddressHash) : 0;
+        void* rtti = rttiAddress ? reinterpret_cast<GetRttiSystemFn>(rttiAddress)() : nullptr;
+        const auto getClass = reinterpret_cast<GetClassFn>(VirtualFunction(rtti, 2));
+        const auto getSystem = reinterpret_cast<GetSystemFn>(VirtualFunction(gameInstance, 1));
+        void* type = getClass ? getClass(rtti, nameHash) : nullptr;
+        return getSystem && type ? getSystem(gameInstance, type) : nullptr;
+    }
+
+    bool AcquireSpatialQueriesSystemOnMainTick(void*& spatialQueriesSystem)
+    {
+        spatialQueriesSystem = nullptr;
+        void* gameInstance = nullptr;
+        __try
+        {
+            gameInstance = ResolveGameInstanceOnMainTick();
+            spatialQueriesSystem = GetSystemOnMainTick(
+                gameInstance, Game::Rtti::Hash("gameISpatialQueriesSystem"));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            spatialQueriesSystem = nullptr;
+        }
+
+        if (spatialQueriesSystem)
+            return true;
+
+        ++g_systemAcquireFailures;
+        const ULONGLONG now = GetTickCount64();
+        if (g_lastSystemAcquireFailureLog == 0 ||
+            now - g_lastSystemAcquireFailureLog >= 1000)
+        {
+            g_lastSystemAcquireFailureLog = now;
+            Diagnostics::Log("visibility spatial system unavailable: gameInstance=%p failures=%llu",
+                             gameInstance, static_cast<unsigned long long>(g_systemAcquireFailures));
+        }
+        return false;
+    }
+
     // Resolve the spatial query metadata only from the game-main-tick callback. This keeps all engine RTTI access and
     // the synchronous query in the same context CET uses for onUpdate.
     bool ResolveSpatialQueryOnMainTick()
     {
-        if (g_state.spatialResolveAttempted.exchange(true, std::memory_order_acq_rel))
-            return g_state.spatialQueriesSystem.load(std::memory_order_acquire) != nullptr &&
-                   g_state.raycast.load(std::memory_order_acquire) != nullptr;
+        if (g_state.raycast.load(std::memory_order_acquire))
+            return true;
+
+        const ULONGLONG now = GetTickCount64();
+        if (g_lastResolveAttempt != 0 && now - g_lastResolveAttempt < 1000)
+            return false;
+        g_lastResolveAttempt = now;
 
         void* spatialQueriesSystem = nullptr;
         Game::Rtti::Function* raycast = nullptr;
@@ -145,35 +210,22 @@ namespace
 
         __try
         {
-            HMODULE red4ext = GetModuleHandleW(L"RED4ext.dll");
-            const auto resolve = red4ext ? reinterpret_cast<ResolveAddressFn>(
-                                               GetProcAddress(red4ext, "RED4ext_ResolveAddress"))
-                                         : nullptr;
-            const std::uintptr_t enginePointerAddress = resolve ? resolve(kGameEngineAddressHash) : 0;
-            const std::uintptr_t rttiGetAddress = resolve ? resolve(kRttiSystemGetAddressHash) : 0;
-            void* engine = enginePointerAddress ? *reinterpret_cast<void**>(enginePointerAddress) : nullptr;
-            void* framework = engine ? *reinterpret_cast<void**>(static_cast<std::byte*>(engine) + 0x308) : nullptr;
-            void* gameInstance = framework ? *reinterpret_cast<void**>(static_cast<std::byte*>(framework) + 0x10)
-                                           : nullptr;
-            void* rttiSystem = rttiGetAddress ? reinterpret_cast<GetRttiSystemFn>(rttiGetAddress)() : nullptr;
-            const auto getClass = reinterpret_cast<GetClassFn>(VirtualFunction(rttiSystem, 2));
-            const auto getSystem = reinterpret_cast<GetSystemFn>(VirtualFunction(gameInstance, 1));
-            void* systemType = getClass ? getClass(rttiSystem, Game::Rtti::Hash("gameISpatialQueriesSystem")) : nullptr;
-            spatialQueriesSystem = getSystem && systemType ? getSystem(gameInstance, systemType) : nullptr;
-
-            const Game::Rtti::Class* type = Game::Rtti::NativeType(spatialQueriesSystem);
-            raycast = Game::Rtti::FindFunction(type, Game::Rtti::Hash("SyncRaycastByQueryPreset"));
-            if (raycast)
-                preset = kSightBlockerPreset;
-            else
+            if (AcquireSpatialQueriesSystemOnMainTick(spatialQueriesSystem))
             {
-                raycast = Game::Rtti::FindFunction(type, Game::Rtti::Hash("SyncRaycastByCollisionPreset"));
-                preset = kWorldStaticPreset;
+                const Game::Rtti::Class* type = Game::Rtti::NativeType(spatialQueriesSystem);
+                raycast = Game::Rtti::FindFunction(type, Game::Rtti::Hash("SyncRaycastByQueryPreset"));
+                if (raycast)
+                    preset = kSightBlockerPreset;
+                else
+                {
+                    raycast = Game::Rtti::FindFunction(type, Game::Rtti::Hash("SyncRaycastByCollisionPreset"));
+                    preset = kWorldStaticPreset;
+                }
+                parameterCount = Game::Rtti::ParameterCount(raycast);
+                if (parameterCount != 6)
+                    raycast = nullptr;
+                resolved = raycast != nullptr;
             }
-            parameterCount = Game::Rtti::ParameterCount(raycast);
-            if (parameterCount != 6)
-                raycast = nullptr;
-            resolved = spatialQueriesSystem != nullptr && raycast != nullptr;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -187,20 +239,19 @@ namespace
         {
             g_state.preset.store(preset, std::memory_order_release);
             g_state.raycast.store(raycast, std::memory_order_release);
-            g_state.spatialQueriesSystem.store(spatialQueriesSystem, std::memory_order_release);
         }
 
-        Diagnostics::Log("visibility resolver on main tick: spatialQueriesSystem=%p raycast=%p params=%zu preset=%s",
-                         spatialQueriesSystem, raycast, parameterCount,
-                         preset == kSightBlockerPreset ? "Sight Blocker" : "World Static");
+        Diagnostics::Log("visibility resolver on main tick: raycast=%p params=%zu preset=%s resolved=%d",
+                         raycast, parameterCount,
+                         preset == kSightBlockerPreset ? "Sight Blocker" : "World Static", resolved ? 1 : 0);
         if (!resolved)
             Diagnostics::Log("visibility disabled: spatial query resolver failed or signature was not 6 parameters");
         return resolved;
     }
 
-    // Returns true when the camera-to-target path is clear. Failure is fail-open so the ESP remains usable while the
-    // cache is cold or a particular build's query result is unavailable.
-    bool CastClear(const float camera[3], const float target[3])
+    // Returns true when the camera-to-target path is clear. An invocation/result failure is fail-open so the ESP
+    // remains usable; acquisition failure is handled by ProcessPendingOnMainTick and leaves work queued.
+    bool CastClear(void* spatialQueriesSystem, const float camera[3], const float target[3])
     {
         __try
         {
@@ -214,7 +265,6 @@ namespace
             Vector4 start{camera[0], camera[1], camera[2], 1.0f};
             Vector4 end{camera[0] + direction[0] * scale, camera[1] + direction[1] * scale,
                         camera[2] + direction[2] * scale, 1.0f};
-            void* spatialQueriesSystem = g_state.spatialQueriesSystem.load(std::memory_order_acquire);
             Game::Rtti::Function* raycast = g_state.raycast.load(std::memory_order_acquire);
             std::uint64_t preset = g_state.preset.load(std::memory_order_acquire);
             if (!spatialQueriesSystem || !raycast)
@@ -303,13 +353,22 @@ namespace
 
         std::size_t processed = 0;
         Request request;
-        while (processed < kRequestsPerTick && PopRequest(request))
+        if (QueueCount() > 0)
         {
-            bool clear = CastClear(request.camera, request.primary);
-            if (!clear && request.hasSecondary)
-                clear = CastClear(request.camera, request.secondary);
-            PublishResult(request.entityId, clear);
-            ++processed;
+            // A spatial-query system is owned by the current world/session. Acquire it after the metadata check and
+            // immediately before consuming work; only this local pointer is used for the entire bounded batch below.
+            void* spatialQueriesSystem = nullptr;
+            if (AcquireSpatialQueriesSystemOnMainTick(spatialQueriesSystem))
+            {
+                while (processed < kRequestsPerTick && PopRequest(request))
+                {
+                    bool clear = CastClear(spatialQueriesSystem, request.camera, request.primary);
+                    if (!clear && request.hasSecondary)
+                        clear = CastClear(spatialQueriesSystem, request.camera, request.secondary);
+                    PublishResult(request.entityId, clear);
+                    ++processed;
+                }
+            }
         }
 
         const ULONGLONG now = GetTickCount64();
@@ -394,7 +453,6 @@ namespace Game::Visibility
                 bool priority)
     {
         if (!camera || !primary || entityId == 0 || !g_state.hookCreated.load(std::memory_order_acquire) ||
-            !g_state.spatialQueriesSystem.load(std::memory_order_acquire) ||
             !g_state.raycast.load(std::memory_order_acquire) || HookLifecycle::IsShuttingDown())
         {
             return State::Unknown;
@@ -449,7 +507,6 @@ namespace Game::Visibility
     {
         Stats stats;
         stats.available = g_state.hookCreated.load(std::memory_order_acquire) &&
-                          g_state.spatialQueriesSystem.load(std::memory_order_acquire) != nullptr &&
                           g_state.raycast.load(std::memory_order_acquire) != nullptr;
         stats.casts = g_state.totalCasts.load(std::memory_order_relaxed);
         stats.visible = g_state.totalVisible.load(std::memory_order_relaxed);
@@ -464,9 +521,7 @@ namespace Game::Visibility
         // There is intentionally no thread handle or join: all synchronous engine calls have already returned with
         // the game-main-tick callback.
         g_state.hookCreated.store(false, std::memory_order_release);
-        g_state.spatialQueriesSystem.store(nullptr, std::memory_order_release);
         g_state.raycast.store(nullptr, std::memory_order_release);
-        g_state.spatialResolveAttempted.store(false, std::memory_order_release);
         g_originalOnTick = nullptr;
 
         AcquireSRWLockExclusive(&g_lock);
@@ -478,6 +533,9 @@ namespace Game::Visibility
         g_loggedFirstMainTick.store(false, std::memory_order_release);
         g_mainTickThreadId = 0;
         g_lastStatsLogTick = 0;
+        g_lastResolveAttempt = 0;
+        g_lastSystemAcquireFailureLog = 0;
+        g_systemAcquireFailures = 0;
         Diagnostics::Log("visibility state reset: casts=%llu visible=%llu occluded=%llu dropped=%llu",
                          static_cast<unsigned long long>(g_state.totalCasts.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.totalVisible.load(std::memory_order_relaxed)),

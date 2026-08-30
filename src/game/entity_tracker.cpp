@@ -522,6 +522,9 @@ namespace
         SetBraindanceModeFn setBraindanceMode = nullptr;
         ULONGLONG lastSystemAcquireFailureLog = 0;
         std::uint64_t systemAcquireFailures = 0;
+        bool worldWasEmpty = false;
+        ULONGLONG worldSettleUntil = 0;
+        ULONGLONG lastWorldGateLog = 0;
         std::size_t leakedEvents = 0;
     };
     NativeHighlightRuntime g_highlightRuntime;
@@ -530,10 +533,11 @@ namespace
     {
         bool attempted = false;
         ULONGLONG lastResolveAttempt = 0;
-        void* statPoolsSystem = nullptr;
         Game::Rtti::Function* getValue = nullptr;
         Game::Rtti::Function* getMaxValue = nullptr;
         Game::Rtti::Function* reachedMin = nullptr;
+        ULONGLONG lastSystemAcquireFailureLog = 0;
+        std::uint64_t systemAcquireFailures = 0;
     };
     HealthRuntime g_healthRuntime;
 
@@ -593,6 +597,38 @@ namespace
         void* type = getClass ? getClass(rttiSystem, typeHash) : nullptr;
         const auto getSystem = reinterpret_cast<void* (*)(void*, void*)>(VirtualFunction(gameInstance, 1));
         return getSystem && type ? getSystem(gameInstance, type) : nullptr;
+    }
+
+    void* AcquireHealthStatPoolsSystemOnMainTick()
+    {
+        void* statPoolsSystem = nullptr;
+        __try
+        {
+            void* gameInstance = ResolveGameInstanceOnMainTick();
+            statPoolsSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameStatPoolsSystem"));
+            if (!statPoolsSystem)
+                statPoolsSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIStatPoolsSystem"));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            statPoolsSystem = nullptr;
+        }
+
+        if (!Game::Rtti::IsValidUserPointer(statPoolsSystem))
+            statPoolsSystem = nullptr;
+        if (!statPoolsSystem)
+        {
+            ++g_healthRuntime.systemAcquireFailures;
+            const ULONGLONG now = GetTickCount64();
+            if (g_healthRuntime.lastSystemAcquireFailureLog == 0 ||
+                now - g_healthRuntime.lastSystemAcquireFailureLog >= 1000)
+            {
+                g_healthRuntime.lastSystemAcquireFailureLog = now;
+                Diagnostics::Log("health stat-pool system unavailable: failures=%llu",
+                                 static_cast<unsigned long long>(g_healthRuntime.systemAcquireFailures));
+            }
+        }
+        return statPoolsSystem;
     }
 
     bool FindBoolProperty(const ClassLayout* type, std::uint64_t propertyName, BoolPropertyLocation& result)
@@ -1322,6 +1358,7 @@ namespace
     constexpr std::uint32_t kHighlightPoliceBit = 1u << 3;
     constexpr std::uint32_t kHighlightOtherBit = 1u << 4;
     constexpr std::uint32_t kHighlightHideDeadBit = 1u << 5;
+    constexpr ULONGLONG kNativeHighlightWorldSettleMilliseconds = 1000;
 
     struct HighlightWork
     {
@@ -1563,6 +1600,7 @@ namespace
         const bool enabled = (settings & kHighlightEnabledBit) != 0;
         std::array<HighlightWork, kMaxTrackedPuppets> workItems{};
         std::size_t workCount = 0;
+        std::size_t trackedCount = 0;
         bool anyDesired = false;
 
         const std::int64_t collectStart = Diagnostics::Profile::Now();
@@ -1574,6 +1612,7 @@ namespace
             const TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity)
                 continue;
+            ++trackedCount;
             const bool desired = enabled && IsCategoryEnabled(tracked.category, tracked.hostility, settings) &&
                                  !((settings & kHighlightHideDeadBit) != 0 && tracked.isDead);
             // Queue only a state transition: unknown+desired=true is the first enable, while known entries queue
@@ -1608,11 +1647,69 @@ namespace
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::HighlightCollect,
                                      Diagnostics::Profile::Now() - collectStart);
 
+        // A zero-entry tracker is a world/session drain, not a request to call mode=0 on the retired vision
+        // system. Drop the local mode latch and let the existing cleanup acknowledgement finish without any engine
+        // calls. If entries repopulate, hold all highlight calls for one bounded settle window so their owners and
+        // the new world system have had a chance to stabilize. Work handles copied during that window are released
+        // by the common drain below; no transition cache is updated until QueueEvent succeeds.
+        const ULONGLONG now = GetTickCount64();
+        const bool worldEmpty = trackedCount == 0;
+        bool worldSettling = false;
+        if (worldEmpty)
+        {
+            g_highlightRuntime.worldSettleUntil = 0;
+            g_nativeHighlightModeActive.store(false, std::memory_order_release);
+            if (!g_highlightRuntime.worldWasEmpty)
+            {
+                g_highlightRuntime.worldWasEmpty = true;
+                if (g_highlightRuntime.lastWorldGateLog == 0 ||
+                    now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
+                {
+                    g_highlightRuntime.lastWorldGateLog = now;
+                    Diagnostics::Log("native highlight world gate: empty tracked=0");
+                }
+            }
+        }
+        else
+        {
+            if (g_highlightRuntime.worldWasEmpty)
+            {
+                g_highlightRuntime.worldWasEmpty = false;
+                g_highlightRuntime.worldSettleUntil = now + kNativeHighlightWorldSettleMilliseconds;
+                if (g_highlightRuntime.lastWorldGateLog == 0 ||
+                    now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
+                {
+                    g_highlightRuntime.lastWorldGateLog = now;
+                    Diagnostics::Log("native highlight world gate: repopulated tracked=%zu settleMs=%llu",
+                                     trackedCount,
+                                     static_cast<unsigned long long>(kNativeHighlightWorldSettleMilliseconds));
+                }
+            }
+            if (g_highlightRuntime.worldSettleUntil != 0)
+            {
+                if (now < g_highlightRuntime.worldSettleUntil)
+                {
+                    worldSettling = true;
+                }
+                else
+                {
+                    g_highlightRuntime.worldSettleUntil = 0;
+                    if (g_highlightRuntime.lastWorldGateLog == 0 ||
+                        now - g_highlightRuntime.lastWorldGateLog >= kNativeHighlightWorldSettleMilliseconds)
+                    {
+                        g_highlightRuntime.lastWorldGateLog = now;
+                        Diagnostics::Log("native highlight world gate: settled tracked=%zu", trackedCount);
+                    }
+                }
+            }
+        }
+
         // Keep mode enabled while a clear transition is pending. This prevents a failed clear from being hidden by
         // an eager mode=0 call and lets the next main tick retry the same transition.
         const bool cachedDesired = HasDesiredHighlightState();
         const bool modeDesired = anyDesired || cachedDesired;
-        if (workCount > 0 || g_nativeHighlightModeActive.load(std::memory_order_acquire) != modeDesired)
+        if (!worldEmpty && !worldSettling &&
+            (workCount > 0 || g_nativeHighlightModeActive.load(std::memory_order_acquire) != modeDesired))
         {
             if (ResolveNativeHighlightOnMainTick())
             {
@@ -1662,7 +1759,7 @@ namespace
     bool ResolveHealthOnMainTick()
     {
         const ULONGLONG now = GetTickCount64();
-        if (g_healthRuntime.attempted && g_healthRuntime.statPoolsSystem && g_healthRuntime.getValue &&
+        if (g_healthRuntime.attempted && g_healthRuntime.getValue &&
             g_healthRuntime.getMaxValue && g_healthRuntime.reachedMin)
             return true;
         if (g_healthRuntime.attempted && now - g_healthRuntime.lastResolveAttempt < 1000)
@@ -1670,43 +1767,45 @@ namespace
         g_healthRuntime.attempted = true;
         g_healthRuntime.lastResolveAttempt = now;
 
+        Game::Rtti::Function* getValue = nullptr;
+        Game::Rtti::Function* getMaxValue = nullptr;
+        Game::Rtti::Function* reachedMin = nullptr;
+        bool resolved = false;
         __try
         {
             void* gameInstance = ResolveGameInstanceOnMainTick();
-            g_healthRuntime.statPoolsSystem = GetSystemOnMainTick(
-                gameInstance, Game::Rtti::Hash("gameStatPoolsSystem"));
-            if (!g_healthRuntime.statPoolsSystem)
-                g_healthRuntime.statPoolsSystem = GetSystemOnMainTick(
-                    gameInstance, Game::Rtti::Hash("gameIStatPoolsSystem"));
-            const Game::Rtti::Class* type = Game::Rtti::NativeType(g_healthRuntime.statPoolsSystem);
-            g_healthRuntime.getValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolValue"));
-            g_healthRuntime.getMaxValue = Game::Rtti::FindFunction(
-                type, Game::Rtti::Hash("GetStatPoolMaxPointValue"));
-            g_healthRuntime.reachedMin = Game::Rtti::FindFunction(
-                type, Game::Rtti::Hash("HasStatPoolValueReachedMin"));
-            if (Game::Rtti::ParameterCount(g_healthRuntime.getValue) != 3 ||
-                Game::Rtti::ParameterCount(g_healthRuntime.getMaxValue) != 2 ||
-                Game::Rtti::ParameterCount(g_healthRuntime.reachedMin) != 2)
-            {
-                g_healthRuntime.statPoolsSystem = nullptr;
-                g_healthRuntime.getValue = nullptr;
-                g_healthRuntime.getMaxValue = nullptr;
-                g_healthRuntime.reachedMin = nullptr;
-            }
+            // This system is only a resolver-local object. The invocation path reacquires the current system for
+            // every nonempty batch, so a save/world transition cannot leave a raw system pointer in the runtime.
+            void* statPoolsSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameStatPoolsSystem"));
+            if (!statPoolsSystem)
+                statPoolsSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIStatPoolsSystem"));
+            const Game::Rtti::Class* type = Game::Rtti::NativeType(statPoolsSystem);
+            getValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolValue"));
+            getMaxValue = Game::Rtti::FindFunction(type, Game::Rtti::Hash("GetStatPoolMaxPointValue"));
+            reachedMin = Game::Rtti::FindFunction(type, Game::Rtti::Hash("HasStatPoolValueReachedMin"));
+            resolved = getValue && getMaxValue && reachedMin && Game::Rtti::ParameterCount(getValue) == 3 &&
+                       Game::Rtti::ParameterCount(getMaxValue) == 2 && Game::Rtti::ParameterCount(reachedMin) == 2;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            g_healthRuntime.statPoolsSystem = nullptr;
+            resolved = false;
+        }
+
+        if (resolved)
+        {
+            g_healthRuntime.getValue = getValue;
+            g_healthRuntime.getMaxValue = getMaxValue;
+            g_healthRuntime.reachedMin = reachedMin;
+        }
+        else
+        {
             g_healthRuntime.getValue = nullptr;
             g_healthRuntime.getMaxValue = nullptr;
             g_healthRuntime.reachedMin = nullptr;
         }
-
-        const bool resolved = g_healthRuntime.statPoolsSystem && g_healthRuntime.getValue &&
-                              g_healthRuntime.getMaxValue && g_healthRuntime.reachedMin;
-        Diagnostics::Log("health stat-pool resolver: system=%p value=%p max=%p reachedMin=%p resolved=%d",
-                         g_healthRuntime.statPoolsSystem, g_healthRuntime.getValue, g_healthRuntime.getMaxValue,
-                         g_healthRuntime.reachedMin, resolved ? 1 : 0);
+        Diagnostics::Log("health stat-pool resolver: value=%p max=%p reachedMin=%p resolved=%d",
+                         g_healthRuntime.getValue, g_healthRuntime.getMaxValue, g_healthRuntime.reachedMin,
+                         resolved ? 1 : 0);
         return resolved;
     }
 
@@ -1781,6 +1880,10 @@ namespace
 
         const bool resolved = ResolveHealthOnMainTick();
         const std::int64_t invokeStart = Diagnostics::Profile::Now();
+        // ResolveHealthOnMainTick only validates static RTTI metadata. Acquire the current world/session system
+        // after the batch is collected and immediately before any stat-pool invocation; this pointer never escapes
+        // this main-tick batch.
+        void* statPoolsSystem = resolved ? AcquireHealthStatPoolsSystemOnMainTick() : nullptr;
         for (std::size_t i = 0; i < workCount; ++i)
         {
             bool valid = false;
@@ -1788,7 +1891,7 @@ namespace
             float maximum = 0.0f;
             float ratio = 0.0f;
             bool reachedMin = false;
-            if (resolved)
+            if (resolved && statPoolsSystem)
             {
                 __try
                 {
@@ -1796,15 +1899,15 @@ namespace
                     bool asPercentage = false;
                     Game::Rtti::Argument valueArguments[] = {{&workItems[i].entityId}, {&pool}, {&asPercentage}};
                     Game::Rtti::Argument maxArguments[] = {{&workItems[i].entityId}, {&pool}};
-                    valid = Game::Rtti::Invoke(g_healthRuntime.getValue, g_healthRuntime.statPoolsSystem,
-                                               valueArguments, 3, &current) &&
-                            Game::Rtti::Invoke(g_healthRuntime.getMaxValue, g_healthRuntime.statPoolsSystem,
-                                               maxArguments, 2, &maximum);
+                    valid = Game::Rtti::Invoke(g_healthRuntime.getValue, statPoolsSystem, valueArguments, 3,
+                                               &current) &&
+                            Game::Rtti::Invoke(g_healthRuntime.getMaxValue, statPoolsSystem, maxArguments, 2,
+                                               &maximum);
                     bool reachedResult = false;
                     if (valid)
                     {
-                        valid = Game::Rtti::Invoke(g_healthRuntime.reachedMin, g_healthRuntime.statPoolsSystem,
-                                                   maxArguments, 2, &reachedResult);
+                        valid = Game::Rtti::Invoke(g_healthRuntime.reachedMin, statPoolsSystem, maxArguments, 2,
+                                                   &reachedResult);
                         reachedMin = reachedResult;
                     }
                     valid = valid && std::isfinite(current) && std::isfinite(maximum) && maximum > 0.001f;
@@ -1869,12 +1972,13 @@ namespace
     {
         bool attempted = false;
         ULONGLONG lastResolveAttempt = 0;
-        void* playerSystem = nullptr;
         Game::Rtti::Function* getLocalPlayer = nullptr;
         Game::Rtti::Function* getAttitudeAgent = nullptr;
         Game::Rtti::Function* getAttitudeTowards = nullptr;
         const Game::Rtti::Class* attitudeAgentClass = nullptr;
         std::uint64_t attitudeGetterOwnerHash = 0;
+        ULONGLONG lastSystemAcquireFailureLog = 0;
+        std::uint64_t systemAcquireFailures = 0;
         bool agentLogged = false;
         bool logged = false;
     };
@@ -1883,6 +1987,36 @@ namespace
     constexpr std::uint64_t kGetAttitudeAgentName = Fnv1a64("GetAttitudeAgent");
     constexpr std::uint64_t kGetAttitudeTowardsName = Fnv1a64("GetAttitudeTowards");
     constexpr std::uint64_t kGameAttitudeAgentName = Fnv1a64("gameAttitudeAgent");
+
+    void* AcquirePlayerSystemOnMainTick()
+    {
+        void* playerSystem = nullptr;
+        __try
+        {
+            void* gameInstance = ResolveGameInstanceOnMainTick();
+            playerSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIPlayerSystem"));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            playerSystem = nullptr;
+        }
+
+        if (!Game::Rtti::IsValidUserPointer(playerSystem))
+            playerSystem = nullptr;
+        if (!playerSystem)
+        {
+            ++g_attitudeRuntime.systemAcquireFailures;
+            const ULONGLONG now = GetTickCount64();
+            if (g_attitudeRuntime.lastSystemAcquireFailureLog == 0 ||
+                now - g_attitudeRuntime.lastSystemAcquireFailureLog >= 1000)
+            {
+                g_attitudeRuntime.lastSystemAcquireFailureLog = now;
+                Diagnostics::Log("attitude player system unavailable: failures=%llu",
+                                 static_cast<unsigned long long>(g_attitudeRuntime.systemAcquireFailures));
+            }
+        }
+        return playerSystem;
+    }
 
     bool ValidateHandleGetter(Game::Rtti::Function* function, Game::Rtti::FunctionInfo& info)
     {
@@ -1927,16 +2061,15 @@ namespace
         return true;
     }
 
-    bool TryAcquireLocalPlayerAgent(Game::Rtti::Handle& playerAgent)
+    bool TryAcquireLocalPlayerAgent(void* playerSystem, Game::Rtti::Handle& playerAgent)
     {
         playerAgent = {};
-        if (!IsPhase2AttitudeEnabled() || !g_attitudeRuntime.playerSystem ||
+        if (!IsPhase2AttitudeEnabled() || !Game::Rtti::IsValidUserPointer(playerSystem) ||
             !g_attitudeRuntime.getLocalPlayer)
             return false;
 
         Game::Rtti::Handle playerEntity;
-        if (!InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, playerEntity,
-                                "local-player-result"))
+        if (!InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, playerSystem, playerEntity, "local-player-result"))
             return false;
 
         const Game::Rtti::Class* playerType = Game::Rtti::NativeType(playerEntity.instance);
@@ -2055,9 +2188,8 @@ namespace
             g_attitudeRttiRuntimeGate.store(false, std::memory_order_release);
             return false;
         }
-        if (g_attitudeRttiRuntimeGate.load(std::memory_order_acquire) && g_attitudeRuntime.playerSystem &&
-            g_attitudeRuntime.getLocalPlayer && g_attitudeRuntime.getAttitudeAgent &&
-            g_attitudeRuntime.getAttitudeTowards &&
+        if (g_attitudeRttiRuntimeGate.load(std::memory_order_acquire) && g_attitudeRuntime.getLocalPlayer &&
+            g_attitudeRuntime.getAttitudeAgent && g_attitudeRuntime.getAttitudeTowards &&
             g_attitudeRuntime.attitudeAgentClass)
             return true;
 
@@ -2067,16 +2199,16 @@ namespace
         g_attitudeRuntime.attempted = true;
         g_attitudeRuntime.lastResolveAttempt = now;
 
-        g_attitudeRuntime.playerSystem = nullptr;
         g_attitudeRuntime.getLocalPlayer = nullptr;
         g_attitudeRuntime.getAttitudeAgent = nullptr;
         g_attitudeRuntime.getAttitudeTowards = nullptr;
         g_attitudeRuntime.attitudeAgentClass = nullptr;
         g_attitudeRuntime.attitudeGetterOwnerHash = 0;
 
-        void* gameInstance = ResolveGameInstanceOnMainTick();
-        g_attitudeRuntime.playerSystem = GetSystemOnMainTick(gameInstance, Game::Rtti::Hash("gameIPlayerSystem"));
-        const Game::Rtti::Class* playerSystemType = Game::Rtti::NativeType(g_attitudeRuntime.playerSystem);
+        // The player system belongs to the current world/session. Keep it resolver-local only; the batch path
+        // reacquires a fresh system immediately before GetLocalPlayer.
+        void* playerSystem = AcquirePlayerSystemOnMainTick();
+        const Game::Rtti::Class* playerSystemType = Game::Rtti::NativeType(playerSystem);
         g_attitudeRuntime.getLocalPlayer = Game::Rtti::FindFunction(
             playerSystemType, Game::Rtti::Hash("GetLocalPlayerControlledGameObject"));
         Game::Rtti::FunctionInfo localPlayerInfo;
@@ -2089,7 +2221,7 @@ namespace
         Game::Rtti::Handle resolverPlayer;
         bool getterValid = false;
         if (localPlayerValid &&
-            InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, g_attitudeRuntime.playerSystem, resolverPlayer,
+            InvokeHandleGetter(g_attitudeRuntime.getLocalPlayer, playerSystem, resolverPlayer,
                                "attitude-resolver-player"))
         {
             const Game::Rtti::Class* playerType = Game::Rtti::NativeType(resolverPlayer.instance);
@@ -2110,18 +2242,18 @@ namespace
         Game::Rtti::FunctionInfo attitudeInfo;
         const bool attitudeValid = ValidateAttitudeTowards(g_attitudeRuntime.getAttitudeTowards, attitudeInfo);
 
-        const bool resolved = g_attitudeRuntime.playerSystem && localPlayerValid && getterValid &&
-                              g_attitudeRuntime.attitudeAgentClass && attitudeValid;
+        const bool resolved = playerSystem && localPlayerValid && getterValid && g_attitudeRuntime.attitudeAgentClass &&
+                              attitudeValid;
         g_attitudeRttiRuntimeGate.store(resolved, std::memory_order_release);
         if (!g_attitudeRuntime.logged || resolved)
         {
             Diagnostics::Log(
-                "phase2 attitude resolver: ownership=1 playerSystem=%p GetLocalPlayer=%p "
+                "phase2 attitude resolver: ownership=1 GetLocalPlayer=%p "
                 "local=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X) "
                 "GetAttitudeAgent=%p getter=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X) "
                 "GetAttitudeTowards=%p agent=(owner=0x%llX params=%zu return=%d type=%u handle=%d flags=0x%X native=%p) "
                 "resolved=%d",
-                g_attitudeRuntime.playerSystem, g_attitudeRuntime.getLocalPlayer,
+                g_attitudeRuntime.getLocalPlayer,
                 static_cast<unsigned long long>(Game::Rtti::ClassNameHash(localPlayerInfo.parent)),
                 localPlayerInfo.parameterCount, localPlayerInfo.hasReturnValue ? 1 : 0,
                 static_cast<unsigned>(localPlayerInfo.returnTypeKind),
@@ -2211,9 +2343,16 @@ namespace
 
         const bool shouldLog = now - g_attitudePathLogTick >= 3000;
         const std::int64_t invokeStart = Diagnostics::Profile::Now();
+        void* playerSystem = nullptr;
         Game::Rtti::Handle playerAgent;
         if (resolved && IsPhase2AttitudeEnabled() && workCount > 0)
-            TryAcquireLocalPlayerAgent(playerAgent);
+        {
+            // A player system belongs to the current world/session. Acquire it only for this nonempty batch and
+            // pass the transient pointer directly to GetLocalPlayer; static RTTI metadata remains cached separately.
+            playerSystem = AcquirePlayerSystemOnMainTick();
+            if (playerSystem)
+                TryAcquireLocalPlayerAgent(playerSystem, playerAgent);
+        }
         for (std::size_t i = 0; i < workCount; ++i)
             workItems[i].hostility = TryResolveAttitudeAgentSafely(workItems[i].entityHandle, &playerAgent);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::AttitudeInvoke,
@@ -2545,6 +2684,10 @@ namespace Game::EntityTracker
         g_cleanupAcknowledged.store(false, std::memory_order_release);
         g_cleanupGeneration.store(0, std::memory_order_release);
         g_highlightRuntime = {};
+        g_healthRuntime.lastSystemAcquireFailureLog = 0;
+        g_healthRuntime.systemAcquireFailures = 0;
+        g_attitudeRuntime.lastSystemAcquireFailureLog = 0;
+        g_attitudeRuntime.systemAcquireFailures = 0;
     }
 
     Stats GetStats()
