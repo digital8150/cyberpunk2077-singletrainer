@@ -63,6 +63,7 @@ namespace
     struct CacheEntry
     {
         std::uint64_t entityId = 0;
+        std::uint64_t generation = 0;
         ULONGLONG tick = 0;
         Game::Visibility::State state = Game::Visibility::State::Unknown;
         bool pending = false;
@@ -71,6 +72,7 @@ namespace
     struct Request
     {
         std::uint64_t entityId = 0;
+        std::uint64_t generation = 0;
         float camera[3]{};
         float primary[3]{};
         float secondary[3]{};
@@ -97,10 +99,66 @@ namespace
     std::size_t g_queueHead = 0;
     std::size_t g_queueCount = 0;
 
+    // Protected by g_lock: the gate and epoch change atomically with queue/cache invalidation.
+    bool g_worldOpen = false;
+    std::uint64_t g_worldGeneration = 0;
+    enum class MainTickStage : std::uint32_t
+    {
+        Idle, WorldGate, ResolveMetadata, AcquireSystem, PrimaryCast, SecondaryCast, Publish
+    };
+    std::atomic<MainTickStage> g_mainTickStage{MainTickStage::Idle};
+    std::atomic_uint64_t g_mainTickGeneration{0};
+    std::atomic_uint64_t g_mainTickEntityId{0};
+
+    struct TickStageReset
+    {
+        ~TickStageReset()
+        {
+            g_mainTickEntityId.store(0, std::memory_order_relaxed);
+            g_mainTickStage.store(MainTickStage::Idle, std::memory_order_release);
+        }
+    };
+
+    ULONGLONG g_lastResolveAttempt = 0;
+
+    bool UpdateWorldGate()
+    {
+        const bool ready = Game::EntityTracker::IsWorldReadyForMainTickConsumers();
+        AcquireSRWLockExclusive(&g_lock);
+        const bool changed = ready != g_worldOpen;
+        if (changed)
+        {
+            ++g_worldGeneration;
+            g_worldOpen = ready;
+            g_state.droppedRequests.fetch_add(g_queueCount, std::memory_order_relaxed);
+            g_cache = {};
+            g_queue = {};
+            g_queueHead = 0;
+            g_queueCount = 0;
+            g_state.raycast.store(nullptr, std::memory_order_release);
+            g_lastResolveAttempt = 0;
+        }
+        const auto generation = g_worldGeneration;
+        ReleaseSRWLockExclusive(&g_lock);
+        g_mainTickGeneration.store(generation, std::memory_order_release);
+        if (changed)
+            Diagnostics::Log("visibility world gate: ready=%d generation=%llu", ready ? 1 : 0,
+                             static_cast<unsigned long long>(generation));
+        return ready;
+    }
+
+    bool IsCurrentRequest(const Request& request)
+    {
+        AcquireSRWLockShared(&g_lock);
+        const bool current = g_worldOpen && request.generation == g_worldGeneration &&
+                             Game::EntityTracker::IsWorldReadyForMainTickConsumers();
+        ReleaseSRWLockShared(&g_lock);
+        return current;
+    }
+
     std::atomic_bool g_loggedFirstMainTick{false};
     DWORD g_mainTickThreadId = 0;
     ULONGLONG g_lastStatsLogTick = 0;
-    ULONGLONG g_lastResolveAttempt = 0;
     ULONGLONG g_lastSystemAcquireFailureLog = 0;
     std::uint64_t g_systemAcquireFailures = 0;
 
@@ -163,6 +221,9 @@ namespace
     bool AcquireSpatialQueriesSystemOnMainTick(void*& spatialQueriesSystem)
     {
         spatialQueriesSystem = nullptr;
+        if (!Game::EntityTracker::IsWorldReadyForMainTickConsumers())
+            return false;
+        const auto previousStage = g_mainTickStage.exchange(MainTickStage::AcquireSystem);
         void* gameInstance = nullptr;
         __try
         {
@@ -175,6 +236,7 @@ namespace
             spatialQueriesSystem = nullptr;
         }
 
+        g_mainTickStage.store(previousStage, std::memory_order_release);
         if (spatialQueriesSystem)
             return true;
 
@@ -299,11 +361,17 @@ namespace
         }
     }
 
-    void PublishResult(std::uint64_t entityId, bool clear)
+    void PublishResult(const Request& request, bool clear)
     {
         AcquireSRWLockExclusive(&g_lock);
-        CacheEntry& entry = g_cache[entityId % kCacheSize];
-        if (entry.entityId == entityId && entry.pending)
+        CacheEntry& entry = g_cache[request.entityId % kCacheSize];
+        if (!g_worldOpen || request.generation != g_worldGeneration ||
+            !Game::EntityTracker::IsWorldReadyForMainTickConsumers())
+        {
+            ReleaseSRWLockExclusive(&g_lock);
+            return;
+        }
+        if (entry.entityId == request.entityId && entry.generation == request.generation && entry.pending)
         {
             entry.tick = GetTickCount64();
             entry.state = clear ? Game::Visibility::State::Visible : Game::Visibility::State::Occluded;
@@ -341,6 +409,10 @@ namespace
 
     std::size_t ProcessPendingOnMainTick()
     {
+        TickStageReset resetStage;
+        g_mainTickStage.store(MainTickStage::WorldGate, std::memory_order_release);
+        if (!UpdateWorldGate() || QueueCount() == 0)
+            return 0;
         g_mainTickThreadId = GetCurrentThreadId();
         if (!g_loggedFirstMainTick.exchange(true, std::memory_order_acq_rel))
         {
@@ -348,6 +420,7 @@ namespace
                              g_state.hookCreated.load(std::memory_order_acquire) ? 1 : 0);
         }
 
+        g_mainTickStage.store(MainTickStage::ResolveMetadata, std::memory_order_release);
         if (!ResolveSpatialQueryOnMainTick())
             return 0;
 
@@ -362,10 +435,18 @@ namespace
             {
                 while (processed < kRequestsPerTick && PopRequest(request))
                 {
+                    if (!IsCurrentRequest(request))
+                        continue;
+                    g_mainTickEntityId.store(request.entityId, std::memory_order_relaxed);
+                    g_mainTickStage.store(MainTickStage::PrimaryCast, std::memory_order_release);
                     bool clear = CastClear(spatialQueriesSystem, request.camera, request.primary);
-                    if (!clear && request.hasSecondary)
+                    if (!clear && request.hasSecondary && IsCurrentRequest(request))
+                    {
+                        g_mainTickStage.store(MainTickStage::SecondaryCast, std::memory_order_release);
                         clear = CastClear(spatialQueriesSystem, request.camera, request.secondary);
-                    PublishResult(request.entityId, clear);
+                    }
+                    g_mainTickStage.store(MainTickStage::Publish, std::memory_order_release);
+                    PublishResult(request, clear);
                     ++processed;
                 }
             }
@@ -453,7 +534,7 @@ namespace Game::Visibility
                 bool priority)
     {
         if (!camera || !primary || entityId == 0 || !g_state.hookCreated.load(std::memory_order_acquire) ||
-            !g_state.raycast.load(std::memory_order_acquire) || HookLifecycle::IsShuttingDown())
+            HookLifecycle::IsShuttingDown())
         {
             return State::Unknown;
         }
@@ -462,11 +543,17 @@ namespace Game::Visibility
         State state = State::Unknown;
 
         AcquireSRWLockExclusive(&g_lock);
+        if (!g_worldOpen || !Game::EntityTracker::IsWorldReadyForMainTickConsumers())
+        {
+            ReleaseSRWLockExclusive(&g_lock);
+            return State::Unknown;
+        }
         CacheEntry& entry = g_cache[entityId % kCacheSize];
-        if (entry.entityId != entityId)
+        if (entry.entityId != entityId || entry.generation != g_worldGeneration)
         {
             entry = {};
             entry.entityId = entityId;
+            entry.generation = g_worldGeneration;
         }
         state = entry.state;
         if (!entry.pending && (entry.state == State::Unknown || now - entry.tick >= kRefreshIntervalMilliseconds))
@@ -484,6 +571,7 @@ namespace Game::Visibility
                 Request& request = g_queue[slot];
                 request = {};
                 request.entityId = entityId;
+                request.generation = g_worldGeneration;
                 for (unsigned i = 0; i < 3; ++i)
                 {
                     request.camera[i] = camera[i];
@@ -506,7 +594,8 @@ namespace Game::Visibility
     Stats GetStats()
     {
         Stats stats;
-        stats.available = g_state.hookCreated.load(std::memory_order_acquire) &&
+        stats.available = Game::EntityTracker::IsWorldReadyForMainTickConsumers() &&
+                          g_state.hookCreated.load(std::memory_order_acquire) &&
                           g_state.raycast.load(std::memory_order_acquire) != nullptr;
         stats.casts = g_state.totalCasts.load(std::memory_order_relaxed);
         stats.visible = g_state.totalVisible.load(std::memory_order_relaxed);
@@ -525,7 +614,10 @@ namespace Game::Visibility
         g_originalOnTick = nullptr;
 
         AcquireSRWLockExclusive(&g_lock);
+        g_worldOpen = false;
+        ++g_worldGeneration;
         g_cache = {};
+        g_queue = {};
         g_queueHead = 0;
         g_queueCount = 0;
         ReleaseSRWLockExclusive(&g_lock);

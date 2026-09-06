@@ -41,3 +41,7 @@ This missing gate is a confirmed code defect, not a confirmed attribution of the
 No source changes, builds, injection, unload or process termination were performed. The observed primary stop is CPU scheduler spin, not a Present/fence wait. Ultimate initiating caller remains unconfirmed.
 
 Artifacts: reports/artifacts/2026-09-06_freeze_pid22660/ contains logs, config, CPU sample, two live stack reports, two dumps and global-state comparison. Dumps are excluded from git. Dump stack_trace returned no candidates for these dumps; stack comparison claims refer exclusively to the separate live reports.
+
+## Implemented follow-up
+
+Visibility now gates metadata/system acquisition and casts on shared world readiness, invalidates queued/cache work on observed gate transitions, and checks a local generation before processing/publication. Dump-readable stage, generation and entity markers were added. Release build and initial closed-gate injection smoke check passed in PID 30040; populated-world clear/reopen reproduction remains unverified. See progress.md (2026-09-06 Visibility world-clear safety). The initiating caller in PID 22660 remains unconfirmed.
