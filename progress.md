@@ -2703,3 +2703,10 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   원래의 순간 압축을 제거했을 가능성이 높지만, 사용자가 같은 시야/Classic Aimbot 조건에서 육안으로
   재현을 시도해 보는 것이 최종 판정이다. 다시 발생하면 이제 같은 entity/sample의 원시 슬롯 값이
   자동으로 남는다.
+
+## 2026-09-06 - PID 22660 freeze analysis
+
+- Collected two dumps and two identical live main-stack reports. TID 14612 consumes one CPU core in original OnTick scheduler; both dumps retain the same job with [r14+0x18]=1.
+- World-empty log precedes a same-thread null+0x60 READ AV at game +0x1118014 by 36ms. First-chance only; no unhandled record in this session.
+- Recoil/spread and Native Highlight are inactive. Visibility lacks the common world gate and retains 63 requests, but its responsibility for this AV is not established.
+- See reports/2026-09-06_freeze_analysis_pid22660.md for evidence, limitations and follow-up. No source edits or process termination. Validated CPU/global samples, PDB/call-site disassembly and git diff --check.
