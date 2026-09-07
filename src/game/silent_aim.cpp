@@ -32,6 +32,8 @@ namespace
     constexpr bool kEnableProjectileMutation = true;
     // Projectile ShootEvent listener hook on gameprojectileComponent (dispatched via setUpEventId listener).
     constexpr bool kEnableProjectileObservationHooks = true;
+    // QueueEvent hook on entIEntity for intercepting spawner and shoot events directly.
+    constexpr bool kEnableQueueHook = true;
     // Native RTTI handlers have one documented VM ABI. These hooks only count calls while a target is armed;
     // they do not inspect stack-frame parameters or modify effect/crosshair data.
     constexpr bool kEnableProducerObservationHooks = false;
@@ -41,6 +43,9 @@ namespace
     constexpr std::uint64_t kShootEventType = Game::Rtti::Hash("gameprojectileShootEvent");
     constexpr std::uint64_t kShootTargetEventType = Game::Rtti::Hash("gameprojectileShootTargetEvent");
     constexpr std::uint64_t kSetUpEventType = Game::Rtti::Hash("gameprojectileSetUpEvent");
+    constexpr std::uint64_t kSpawnerLaunchEventType = Game::Rtti::Hash("gameprojectileSpawnerLaunchEvent");
+    constexpr std::size_t kSpawnerOwnerOffset = 0xA8;
+    constexpr std::size_t kSpawnerTargetPosOffset = 0xD0;
     constexpr std::uint64_t kWeaponShootEventType = Game::Rtti::Hash("gameweaponeventsShootEvent");
     constexpr std::uint64_t kPlayerPuppetType = Game::Rtti::Hash("PlayerPuppet");
     constexpr std::uint64_t kGamePlayerPuppetType = Game::Rtti::Hash("gamePlayerPuppet");
@@ -192,9 +197,15 @@ namespace
         std::atomic_uint64_t defaultCrosshairCalls{0};
         std::atomic_uint64_t nativeCrosshairCoreCalls{0};
         std::atomic_uint64_t nativeCrosshairCoreRedirects{0};
+        std::atomic_uint64_t spawnerLaunchEvents{0};
+        std::atomic_uint64_t spawnerLaunchRedirects{0};
     };
 
     State g_state;
+    std::int16_t g_spawnerLaunchEventId = -1;
+    std::int16_t g_shootEventId = -1;
+    std::int16_t g_shootTargetEventId = -1;
+    std::int16_t g_weaponShootEventId = -1;
     std::array<void*, kMaxListenerHooks> g_hookTargets{};
     std::array<ListenerFn, kMaxListenerHooks> g_originalListeners{};
     std::array<ListenerHookKind, kMaxListenerHooks> g_listenerKinds{};
@@ -501,6 +512,36 @@ namespace
         return true;
     }
 
+    void HandleSpawnerLaunchEvent(void* entity, void* event)
+    {
+        if (!event || !kEnableProjectileMutation)
+            return;
+
+        auto* bytes = static_cast<std::byte*>(event);
+        const auto* owner = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerOwnerOffset);
+        if (!owner || !IsPlayerOwner(owner->instance))
+            return;
+
+        float target[3]{};
+        if (!ReadTarget(target))
+            return;
+
+        auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kSpawnerTargetPosOffset);
+        targetPos->x = target[0];
+        targetPos->y = target[1];
+        targetPos->z = target[2];
+        targetPos->w = 1.0f;
+
+        g_state.spawnerLaunchRedirects.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (redirected <= 8 || (redirected % 16u) == 0)
+        {
+            Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p target=(%.2f,%.2f,%.2f)",
+                             static_cast<unsigned long long>(redirected), entity, owner->instance,
+                             target[0], target[1], target[2]);
+        }
+    }
+
     void RedirectProjectileEvent(void* event)
     {
         if (!event)
@@ -550,15 +591,18 @@ namespace
 
         const auto* start = reinterpret_cast<const Vector4Layout*>(bytes + kShootStartPointOffset);
         auto* velocity = reinterpret_cast<Vector4Layout*>(bytes + kShootStartVelocityOffset);
-        const float speed = std::sqrt(velocity->x * velocity->x + velocity->y * velocity->y +
-                                      velocity->z * velocity->z);
+        float speed = std::sqrt(velocity->x * velocity->x + velocity->y * velocity->y +
+                                velocity->z * velocity->z);
+        if (!std::isfinite(speed) || speed < 0.01f)
+        {
+            speed = 110.0f;
+        }
         const float deltaX = target[0] - start->x;
         const float deltaY = target[1] - start->y;
         const float deltaZ = target[2] - start->z;
         const float distance = std::sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
         const bool vectorsPlausible = std::isfinite(start->x) && std::isfinite(start->y) &&
-                                      std::isfinite(start->z) && std::isfinite(velocity->x) &&
-                                      std::isfinite(velocity->y) && std::isfinite(velocity->z) &&
+                                      std::isfinite(start->z) &&
                                       std::abs(start->x) < 10000000.0f && std::abs(start->y) < 10000000.0f &&
                                       std::abs(start->z) < 10000000.0f;
         if (!vectorsPlausible || !std::isfinite(speed) || !std::isfinite(distance) ||
@@ -853,21 +897,31 @@ namespace
             if (!eventHandle || !eventHandle->instance)
                 return;
             void* event = eventHandle->instance;
-            const Game::Rtti::Class* type = Game::Rtti::NativeType(event);
-            if (!type)
+            if (!Game::Rtti::IsValidUserPointer(event))
                 return;
-            if (Game::Rtti::IsClassOrDerived(type, kWeaponShootEventType))
-            {
-                const auto* entityType = reinterpret_cast<const ClassLayout*>(Game::Rtti::NativeType(entity));
-                Diagnostics::Log("silent aim QueueEvent weapon event: entity=%p entityType=%016llX event=%p",
-                                 entity,
-                                 static_cast<unsigned long long>(entityType ? entityType->nameHash : 0), event);
-                ObserveWeaponShootEvent(event, type);
-            }
-            else if (Game::Rtti::IsClassOrDerived(type, kShootEventType) ||
-                     Game::Rtti::IsClassOrDerived(type, kShootTargetEventType))
+            const auto* classLayout = *reinterpret_cast<const ClassLayout* const*>(
+                static_cast<const std::byte*>(event) + 0x30);
+            if (!Game::Rtti::IsValidUserPointer(classLayout))
+                return;
+
+            const std::int16_t eventId = classLayout->eventTypeId;
+            if (eventId <= 0)
+                return;
+
+            if (g_spawnerLaunchEventId > 0 && eventId == g_spawnerLaunchEventId)
             {
                 g_state.projectileEvents.fetch_add(1, std::memory_order_relaxed);
+                g_state.spawnerLaunchEvents.fetch_add(1, std::memory_order_relaxed);
+                HandleSpawnerLaunchEvent(entity, event);
+            }
+            else if ((g_shootEventId > 0 && eventId == g_shootEventId) ||
+                     (g_shootTargetEventId > 0 && eventId == g_shootTargetEventId))
+            {
+                RedirectProjectileEvent(event);
+            }
+            else if (g_weaponShootEventId > 0 && eventId == g_weaponShootEventId)
+            {
+                ObserveWeaponShootEvent(event, g_weaponShootClass);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1088,6 +1142,7 @@ namespace Game::SilentAim
             created = AddProducerObservationHook("gametargetingTargetingSystem", "GetDefaultCrosshairData",
                                                  ProducerHookKind::DefaultCrosshair) || created;
 
+            auto* spawnerLaunchEvent = reinterpret_cast<ClassLayout*>(Game::Rtti::GetClass(kSpawnerLaunchEventType));
             auto* shootEvent = reinterpret_cast<ClassLayout*>(Game::Rtti::GetClass(kShootEventType));
             auto* shootTargetEvent = reinterpret_cast<ClassLayout*>(Game::Rtti::GetClass(kShootTargetEventType));
             auto* setUpEvent = reinterpret_cast<ClassLayout*>(Game::Rtti::GetClass(kSetUpEventType));
@@ -1103,8 +1158,15 @@ namespace Game::SilentAim
             }
             else
             {
-                Diagnostics::Log("silent aim projectile RTTI: setupId=%d shootId=%d shootTargetId=%d "
+                if (spawnerLaunchEvent)
+                    g_spawnerLaunchEventId = spawnerLaunchEvent->eventTypeId;
+                g_shootEventId = shootEvent->eventTypeId;
+                g_shootTargetEventId = shootTargetEvent->eventTypeId;
+                g_weaponShootEventId = weaponShootEvent->eventTypeId;
+
+                Diagnostics::Log("silent aim projectile RTTI: spawnerLaunchId=%d setupId=%d shootId=%d shootTargetId=%d "
                                  "weaponShootId=%d componentListeners=%u",
+                                 spawnerLaunchEvent ? spawnerLaunchEvent->eventTypeId : -1,
                                  setUpEvent->eventTypeId, shootEvent->eventTypeId, shootTargetEvent->eventTypeId,
                                  weaponShootEvent->eventTypeId, projectileComponent->listeners.size);
                 g_weaponShootClass = reinterpret_cast<Game::Rtti::Class*>(weaponShootEvent);
@@ -1117,11 +1179,16 @@ namespace Game::SilentAim
                                                ListenerHookKind::Projectile) || created;
                 }
             }
+            if (kEnableQueueHook)
+            {
+                created = AddQueueEventObservationHook() || created;
+            }
             g_state.hookCreated.store(created, std::memory_order_release);
             Diagnostics::Log("silent aim hooks created: producers=%u projectileListeners=%u "
-                             "weaponListenerHooks=0 queueHook=0 crosshairCore=%u",
+                             "weaponListenerHooks=0 queueHook=%u crosshairCore=%u",
                              g_state.producerHooks.load(std::memory_order_relaxed),
                              g_state.listenerHooks.load(std::memory_order_relaxed),
+                             g_state.queueHookCreated.load(std::memory_order_acquire) ? 1u : 0u,
                              g_state.crosshairCoreHookCreated.load(std::memory_order_acquire) ? 1u : 0u);
             return created;
         }
@@ -1161,7 +1228,8 @@ namespace Game::SilentAim
         result.hookCreated = g_state.hookCreated.load(std::memory_order_acquire);
         result.queueHookCreated = g_state.queueHookCreated.load(std::memory_order_acquire);
         result.crosshairCoreHookCreated = g_state.crosshairCoreHookCreated.load(std::memory_order_acquire);
-        result.projectileHookCreated = g_state.listenerHooks.load(std::memory_order_relaxed) > 0;
+        result.projectileHookCreated = g_state.queueHookCreated.load(std::memory_order_acquire) ||
+                                       g_state.listenerHooks.load(std::memory_order_relaxed) > 0;
         result.listenerHooks = g_state.listenerHooks.load(std::memory_order_relaxed);
         result.producerHooks = g_state.producerHooks.load(std::memory_order_relaxed);
         result.callbacks = g_state.callbacks.load(std::memory_order_relaxed);
@@ -1196,6 +1264,10 @@ namespace Game::SilentAim
             g_listenerKinds[index] = ListenerHookKind::Unknown;
         }
         g_weaponShootClass = nullptr;
+        g_spawnerLaunchEventId = -1;
+        g_shootEventId = -1;
+        g_shootTargetEventId = -1;
+        g_weaponShootEventId = -1;
         if (g_queueHookTarget)
             MH_RemoveHook(g_queueHookTarget);
         g_queueHookTarget = nullptr;

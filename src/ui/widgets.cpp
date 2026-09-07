@@ -418,15 +418,15 @@ namespace Widgets
             UiKit::MetricRow("failures", Count(modifiers.failures));
 
             const char* silentStatus = "unavailable";
-            if (silent.crosshairCoreHookCreated && silent.listenerHooks > 0)
+            if (silent.crosshairCoreHookCreated && silent.projectileHookCreated)
                 silentStatus = "hitscan + projectile hooked";
             else if (silent.crosshairCoreHookCreated)
                 silentStatus = "crosshair core hooked";
-            else if (silent.listenerHooks > 0)
+            else if (silent.projectileHookCreated)
                 silentStatus = "projectile hooked";
 
             UiKit::MetricGroup("Silent aim", silentStatus,
-                               (silent.crosshairCoreHookCreated || silent.listenerHooks > 0) ? palette.success : palette.warning);
+                               (silent.crosshairCoreHookCreated || silent.projectileHookCreated) ? palette.success : palette.warning);
             UiKit::MetricRow("hitscan redirects", Count(silent.nativeCrosshairCoreRedirects));
             UiKit::MetricRow("projectile redirects", Count(silent.redirectedShots));
             UiKit::MetricRow("rejected", Count(silent.rejectedShots));

@@ -2756,3 +2756,50 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
     - `all hooks enabled`
     - D3D12 오버레이 초기화 및 프레임 제출 정상 동작, 런타임 크래시 및 프리징 없음.
 
+## 2026-09-07 — 투척 무기 Silent Aim `QueueEvent` 인터셉터 및 스포너/발사 궤적 연동 구현
+
+- **1차 구현 실패 원인 규명**:
+  - 인게임 투척 테스트 시 `calls=0, projRedirects=0`으로 투척 무기가 전혀 리다이렉트되지 않는 현상 발생.
+  - 트레이너 로그 및 게임 redmod 스크립트(`meleeTransitions.script`, `projectileHelper.script`, `meleeProjectile.script`, `baseProjectile.script`) 상세 분석:
+    1. `gameprojectileShootEvent`는 컴포넌트(`gameprojectileComponent`)가 아니라 투사체 엔티티(`MeleeProjectile`) 자체로 큐잉되므로 `gameprojectileComponent`의 `setUpEventId`(120) 리스너로 유입되지 않음.
+    2. 투척 무기 발사 시퀀스는 `meleeTransitions.script` -> `SpawnProjectileFromScreenCenter` -> `gameprojectileSpawnerLaunchEvent`(id 167)를 무기(`itemObj`)에 `QueueEvent`로 전달하고, 스포너가 `MeleeProjectile` 엔티티를 생성한 뒤 `gameprojectileShootEvent`(id 789/790)를 큐잉함.
+    3. `src/game/silent_aim.cpp`에 `AddQueueEventObservationHook()`가 작성되어 있었으나 `CreateHook()`에서 호출되지 않아 비활성화 상태였음.
+    4. 발사 이벤트 생성 초기 시점에 `startVelocity`의 속력이 0 또는 미초기화 상태일 경우 `speed < 0.01f` 검사로 인해 샷이 reject될 수 있었음.
+- **RTTI 런타임 메모리 실측 및 레이아웃 검증**:
+  - `Cyberpunk2077.exe` 라이브 메모리 RTTI 구조(CClass `+0x118` 프로퍼티 배열)를 직접 역참조하여 프로퍼티 이름 해시 및 오프셋 실측:
+    - `gameprojectileSpawnerLaunchEvent` (CClass `0x7FF682E10EF8`, eventId 167):
+      `+0x040`: `launchParams` (size 0x58)
+      `+0x0A8`: `owner` (nameHash `0xA692F75AB08B8CF4`, `WeakHandle<GameObject>`)
+      `+0x0D0`: `projectileParams` (`targetPosition` at `+0x0D0`)
+    - `gameprojectileShootEvent` (CClass `0x7FF682E12008`, eventId 789):
+      `+0x040`: `owner` (nameHash `0xA692F75AB08B8CF4`)
+      `+0x0B0`: `localToWorld` (Matrix 4x4)
+      `+0x0F0`: `startPoint` (Vector4)
+      `+0x100`: `startVelocity` (Vector4)
+      `+0x110`: `weaponVelocity` (Vector4)
+      `+0x120`: `params` (`targetPosition` at `+0x120`)
+- **수정 및 구현 내용**:
+  1. **`entIEntity::QueueEvent` 훅 활성화 및 초고속 O(1) 이벤트 필터링**:
+     - `kQueueEventInternalPattern` 시그니처(`0x7FF67EDBA4F0`)로 `entIEntity::QueueEvent` 후킹 활성화 (`kEnableQueueHook = true`).
+     - 이벤트 객체(`+0x30`)의 RTTI `eventTypeId`를 `CreateHook`에서 동적으로 획득한 `g_spawnerLaunchEventId`, `g_shootEventId`, `g_shootTargetEventId`, `g_weaponShootEventId`와 즉시 비교하여 비관련 이벤트는 수 나노초 내에 통과.
+  2. **`HandleSpawnerLaunchEvent` 구현**:
+     - `gameprojectileSpawnerLaunchEvent` 발생 시 플레이어 소유 여부를 확인하고, 에임봇 타깃 좌표를 `projectileParams.targetPosition`(+0x0D0)에 반영.
+  3. **`RedirectProjectileEvent` 속력 fallback 처리**:
+     - `velocity`의 크기가 0이거나 비정상일 경우 vanilla 단검 기본 발사 속력인 `110.0f`로 fallback하여 중력 보정 포물선 탄도학(`CalculateBallisticTrajectory`)이 정상 산출되도록 보장.
+     - `startVelocity`(+0x100), `localToWorld`(+0x0B0), `weaponVelocity`(+0x110), `params.targetPosition`(+0x120) 갱신.
+  4. **진단 및 UI 연동**:
+     - `GetDiagnostics()`에서 `queueHookCreated` 상태를 `projectileHookCreated`에 연동.
+     - UI 오버레이에서 `queueHookCreated` 또는 `listenerHooks > 0`일 때 `"hitscan + projectile hooked"`로 정상 표시.
+- **빌드 및 런타임 인젝션 검증**:
+  - `python tools/scripts/inject.py --name Cyberpunk2077.exe --unload`로 기존 DLL을 안전하게 드레인/언로드 성공.
+  - `cmake --build build --config Release` 정상 컴파일/링크 완료 (경고 0, 에러 0).
+  - `python tools/scripts/inject.py --name Cyberpunk2077.exe --dll build/bin/Release/cp2077_trainer.dll` 주입 성공.
+  - 로그 확인:
+    - `silent aim projectile RTTI: spawnerLaunchId=167 setupId=120 shootId=789 shootTargetId=790 weaponShootId=108 componentListeners=4`
+    - `silent aim QueueEvent internal scan: matches=1 target=00007FF67EDBA4F0`
+    - `silent aim QueueEvent observation hook created: target=00007FF67EDBA4F0 original=00007FF67E850E00 mutation=0`
+    - `silent aim hooks created: producers=0 projectileListeners=1 weaponListenerHooks=0 queueHook=1 crosshairCore=1`
+    - `all hooks enabled`
+  - D3D12 오버레이 제출 정상 및 게임 프로세스(PID 24516) 안정적 응답 유지 확인.
+
+
