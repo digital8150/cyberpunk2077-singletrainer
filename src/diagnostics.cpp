@@ -1,4 +1,5 @@
 #include "diagnostics.h"
+#include "game/shot_trace.h"
 
 #include "profiling.h"
 
@@ -280,6 +281,8 @@ namespace
             // 정지 플래그는 드레인보다 먼저 읽는다. 이 순서면 플래그를 세운 뒤 들어온 줄까지 이번
             // 드레인이 가져가므로 마지막 줄을 흘리지 않는다.
             const bool stopping = g_writerStopping.load(std::memory_order_acquire);
+            if (Game::ShotTrace::Drain(&WriteBatch))
+                dirty = true;
             if (DrainQueueToDisk())
                 dirty = true;
 

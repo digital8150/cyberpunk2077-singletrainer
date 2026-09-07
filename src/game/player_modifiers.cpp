@@ -3,6 +3,7 @@
 #include "entity_tracker.h"
 #include "rtti_invoker.h"
 #include "silent_aim.h"
+#include "shot_trace.h"
 #include "../diagnostics.h"
 #include "../features/features.h"
 #include "../framework.h"
@@ -501,9 +502,10 @@ namespace
     }
 
     EquippedWeaponResult GetEquippedWeaponId(const SystemContext& systems, const Game::Rtti::Handle& player,
-                                              std::uint64_t& weaponId)
+                                              std::uint64_t& weaponId, std::uint64_t& weaponObject)
     {
         weaponId = 0;
+        weaponObject = 0;
         bool hasPlayerInstance = false;
         __try
         {
@@ -568,6 +570,8 @@ namespace
             ReleaseLocalHandle(item);
             return EquippedWeaponResult::InvalidItem;
         }
+        // Numeric identity for trace correlation only; never dereferenced after releasing this owner.
+        weaponObject = reinterpret_cast<std::uint64_t>(item.instance);
         ReleaseLocalHandle(item);
         return EquippedWeaponResult::Found;
     }
@@ -1080,10 +1084,11 @@ namespace Game::PlayerModifiers
         const bool hasPlayer = GetLocalPlayer(systems, player, playerId);
 
         std::uint64_t weaponId = 0;
+        std::uint64_t weaponObject = 0;
         EquippedWeaponResult weaponResult = EquippedWeaponResult::NoItem;
         if (hasPlayer)
         {
-            weaponResult = GetEquippedWeaponId(systems, player, weaponId);
+            weaponResult = GetEquippedWeaponId(systems, player, weaponId, weaponObject);
             const bool usingWeapon = weaponResult == EquippedWeaponResult::Found;
 
             float gravityMultiplier = 1.0f;
@@ -1105,6 +1110,18 @@ namespace Game::PlayerModifiers
         else
         {
             Game::SilentAim::SetProjectileGravityMultiplier(1.0f);
+        }
+
+        if (Game::ShotTrace::WantWeaponSample())
+        {
+            auto trace = Game::ShotTrace::Begin(Game::ShotTrace::Weapon);
+            trace.object = weaponObject;
+            trace.context = reinterpret_cast<std::uint64_t>(player.instance);
+            trace.identity = weaponId;
+            trace.flags = static_cast<unsigned>(weaponResult) | (hasPlayer ? 0x100u : 0u);
+            // Cyberpunk 2.31 SDK gamedataStatType::ProjectilesPerShot. Unknown remains -1, never guessed.
+            trace.origin[0] = weaponObject ? QueryStatValue(systems, weaponId, 1167, -1.0f) : -1.0f;
+            Game::ShotTrace::Submit(trace);
         }
 
         const bool modifierPathNeeded = desiredModifierMask != 0 || modifierActive || retirementPending;

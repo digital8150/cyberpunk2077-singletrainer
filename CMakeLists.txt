@@ -40,6 +40,7 @@ add_library(cp2077_trainer SHARED
     src/game/animation_data.cpp
     src/game/rtti_invoker.cpp
     src/game/silent_aim.cpp
+    src/game/shot_trace.cpp
     src/game/signature_scanner.cpp
     src/game/entity_tracker.cpp
     src/game/player_modifiers.cpp
@@ -94,6 +95,12 @@ if(CP2077_BUILD_TESTS)
         target_compile_options(cp2077_config_tests PRIVATE /utf-8)
     endif()
     add_test(NAME config_profiles COMMAND cp2077_config_tests)
+    add_executable(cp2077_shot_trace_tests tests/shot_trace.cpp src/game/shot_trace.cpp)
+    target_include_directories(cp2077_shot_trace_tests PRIVATE src)
+    target_compile_definitions(cp2077_shot_trace_tests PRIVATE UNICODE _UNICODE)
+    target_compile_options(cp2077_shot_trace_tests PRIVATE /utf-8)
+    target_link_libraries(cp2077_shot_trace_tests PRIVATE user32.lib)
+    add_test(NAME shot_trace COMMAND cp2077_shot_trace_tests)
 endif()
 
 # --- 오버레이 UI 프리뷰 하네스 ---

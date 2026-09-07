@@ -7,6 +7,7 @@
 #include "../diagnostics.h"
 #include "../ui/overlay.h"
 #include "../game/silent_aim.h"
+#include "../game/shot_trace.h"
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
 #include "../game/visibility.h"
@@ -28,6 +29,11 @@ namespace
 
     void UpdateAimbotProfile()
     {
+        const unsigned traceSettings = (g_settings.aimbot.enabled ? 1u : 0u) |
+            (g_settings.aimbot.silentAim ? 2u : 0u) | (g_settings.misc.noSpread ? 4u : 0u) |
+            (g_settings.misc.noRecoil ? 8u : 0u) | (g_settings.aimbot.boneMask << 4) |
+            (g_settings.aimbot.nearestBone ? 512u : 0u) | (g_settings.activeAimbotProfile << 10);
+        Game::ShotTrace::Tick(Overlay::IsVisible(), traceSettings);
         static bool switchHeld = false;
         static Features::AimbotSettings previous;
         static unsigned previousProfile = 0;
@@ -118,6 +124,9 @@ namespace Features
         if (graphEnabled)
             Diagnostics::Profile::EndPresentFrame();
         FpsCounter::Draw(g_settings.debug, menuVisible);
+        if (!menuVisible && Game::ShotTrace::IsCapturing())
+            ImGui::GetForegroundDrawList()->AddText(ImVec2(20.0f, 20.0f), IM_COL32(255, 110, 80, 255),
+                                                   "SHOT TRACE REC - 20s / F8 stop");
         if (!menuVisible && GetTickCount64() < g_profileToastUntil)
         {
             char label[64]{};

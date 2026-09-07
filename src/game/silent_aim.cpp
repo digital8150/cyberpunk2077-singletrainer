@@ -1,4 +1,6 @@
 #include "silent_aim.h"
+#include "shot_trace.h"
+#include <intrin.h>
 
 #include "projection.h"
 #include "rtti_invoker.h"
@@ -354,11 +356,29 @@ namespace
         }
     }
 
+    bool TraceVector(const Vector4Layout* source, float output[3])
+    {
+        if (!source) return false;
+        __try { output[0] = source->x; output[1] = source->y; output[2] = source->z; return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
     void HookNativeCrosshairCore(void* targetingSystem, Vector4Layout* origin,
                                  Vector4Layout* direction, Vector4Layout* crosshairPosition,
                                  void* queryContext, float maxDistance, void* filter, bool useRaycast)
     {
         HookLifecycle::CallbackGuard guard;
+        const bool tracing = Game::ShotTrace::IsCapturing();
+        Game::ShotTrace::Record trace;
+        if (tracing)
+        {
+            trace = Game::ShotTrace::Begin(Game::ShotTrace::Crosshair);
+            trace.caller = reinterpret_cast<std::uint64_t>(_ReturnAddress());
+            trace.object = reinterpret_cast<std::uint64_t>(targetingSystem);
+            trace.context = reinterpret_cast<std::uint64_t>(queryContext);
+            trace.event = reinterpret_cast<std::uint64_t>(filter);
+            trace.flags = useRaycast ? 1u : 0u;
+        }
         if (g_originalNativeCrosshairCore)
         {
             g_originalNativeCrosshairCore(targetingSystem, origin, direction, crosshairPosition,
@@ -375,7 +395,22 @@ namespace
             g_state.lastCameraValid.store(true, std::memory_order_release);
         }
 
+        if (tracing)
+        {
+            const bool vectors = TraceVector(origin, trace.origin) && TraceVector(direction, trace.before);
+            if (vectors) trace.flags |= 4u;
+        }
         const bool redirected = RedirectNativeCrosshairSafely(origin, direction);
+        if (tracing)
+        {
+            if (redirected) trace.flags |= 2u;
+            if (TraceVector(direction, trace.after)) trace.flags |= 8u;
+            trace.identity = g_state.targetGeneration.load(std::memory_order_acquire);
+            LARGE_INTEGER end{};
+            QueryPerformanceCounter(&end);
+            trace.endQpc = end.QuadPart;
+            Game::ShotTrace::Submit(trace);
+        }
 
         const std::uint64_t count =
             g_state.nativeCrosshairCoreCalls.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1250,7 +1285,7 @@ namespace
         return true;
     }
 
-    void ObserveQueuedEventSafely(void* entity, Game::Rtti::Handle* eventHandle)
+    void ObserveQueuedEventSafely(void* entity, Game::Rtti::Handle* eventHandle, void* caller)
     {
         __try
         {
@@ -1267,6 +1302,20 @@ namespace
             const std::int16_t eventId = classLayout->eventTypeId;
             if (eventId <= 0)
                 return;
+
+            // Record observed dispatches, not inferred player shots or pellet IDs. Receivers can be NPCs.
+            if (Game::ShotTrace::IsCapturing() &&
+                (eventId == g_weaponShootEventId || eventId == g_spawnerLaunchEventId ||
+                 eventId == g_shootEventId || eventId == g_shootTargetEventId))
+            {
+                auto trace = Game::ShotTrace::Begin(Game::ShotTrace::QueuedEvent);
+                trace.caller = reinterpret_cast<std::uint64_t>(caller);
+                trace.object = reinterpret_cast<std::uint64_t>(entity);
+                trace.event = reinterpret_cast<std::uint64_t>(event);
+                trace.identity = classLayout->nameHash;
+                trace.flags = static_cast<unsigned>(eventId);
+                Game::ShotTrace::Submit(trace);
+            }
 
             if (g_spawnerLaunchEventId > 0 && eventId == g_spawnerLaunchEventId)
             {
@@ -1295,7 +1344,7 @@ namespace
         HookLifecycle::CallbackGuard guard;
         g_state.queueCallbacks.fetch_add(1, std::memory_order_relaxed);
         if (!HookLifecycle::IsShuttingDown())
-            ObserveQueuedEventSafely(entity, eventHandle);
+            ObserveQueuedEventSafely(entity, eventHandle, _ReturnAddress());
         if (g_originalQueueEventInternal)
             g_originalQueueEventInternal(entity, eventHandle);
     }
@@ -1488,6 +1537,8 @@ namespace Game::SilentAim
 {
     bool CreateHook()
     {
+        Diagnostics::Log("shot trace ready: F8=20s capture/stop ring=4096 budget=24000 "
+                         "output=SHOTTRACE records in trainer log mutation=0");
         __try
         {
             bool created = false;
@@ -1651,6 +1702,7 @@ namespace Game::SilentAim
 
     void Shutdown()
     {
+        Game::ShotTrace::Stop();
         ClearTarget();
         const std::uint32_t count = g_state.listenerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < count && index < kMaxListenerHooks; ++index)
