@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "animation_data.h"
+#include "rtti_invoker.h"
 
 namespace Game::EntityTracker
 {
@@ -112,6 +113,7 @@ namespace Game::EntityTracker
         float healthMax = 0.0f;
         float healthRatio = 0.0f;
         AnimationData::VisualData visual;
+        Game::Rtti::Handle targetingComponent{};
     };
 
     // Called during hook setup before MH_EnableHook(MH_ALL_HOOKS); the optional unregister observer is installed

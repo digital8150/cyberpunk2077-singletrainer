@@ -283,7 +283,7 @@ namespace Aimbot
             if (g_aimActive)
                 Game::AimAssist::ClearMemoryAim();
             g_aimActive = false;
-            Game::SilentAim::PublishTarget(bestWorld, true);
+            Game::SilentAim::PublishTarget(bestWorld, selected ? &selected->targetingComponent : nullptr, true);
             static ULONGLONG lastSilentLogTick = 0;
             if (now - lastSilentLogTick >= 2000)
             {

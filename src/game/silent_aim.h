@@ -2,6 +2,11 @@
 
 #include <cstdint>
 
+namespace Game::Rtti
+{
+    struct Handle;
+}
+
 namespace Game::SilentAim
 {
     struct DiagnosticsSnapshot
@@ -38,7 +43,7 @@ namespace Game::SilentAim
 
     // Present publishes only plain coordinates. Native callbacks use freshness as an early filter, so a target
     // that stops being published (out of FOV, dead, or occluded while visibleOnly is on) stops being redirected.
-    void PublishTarget(const float worldTarget[3], bool active);
+    void PublishTarget(const float worldTarget[3], const Game::Rtti::Handle* targetComponent, bool active);
     void ClearTarget();
     DiagnosticsSnapshot GetDiagnostics();
     void Shutdown();

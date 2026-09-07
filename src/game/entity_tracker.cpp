@@ -243,6 +243,7 @@ namespace
         bool healthReachedMin = false;
         bool highlightKnown = false;
         bool highlightDesired = false;
+        Game::Rtti::Handle targetingComponent;
     };
 
     constexpr std::size_t kMaxTrackedPuppets = 256;
@@ -1543,6 +1544,70 @@ namespace
         Stale,
     };
 
+    bool FindTargetingComponent(const EntityLayout* entity, Game::Rtti::Handle& outHandle)
+    {
+        outHandle = {};
+        if (!Game::Rtti::IsValidUserPointer(entity))
+            return false;
+
+        constexpr std::uint64_t kGameTargetingCompHash = Fnv1a64("gameTargetingComponent");
+        constexpr std::uint64_t kTargetingCompHash = Fnv1a64("TargetingComponent");
+        constexpr std::uint64_t kEntIPlacedCompHash = Fnv1a64("entIPlacedComponent");
+
+        __try
+        {
+            const auto* entries = reinterpret_cast<const ComponentHandleLayout*>(entity->components.entries);
+            const std::uint32_t size = entity->components.size;
+            const std::uint32_t capacity = entity->components.capacity;
+
+            if (!Game::Rtti::IsValidUserPointer(entries) || size > capacity || size > 256)
+                return false;
+
+            ComponentHandleLayout fallbackPlaced{};
+
+            for (std::uint32_t i = 0; i < size; ++i)
+            {
+                const ComponentHandleLayout& handle = entries[i];
+                if (!Game::Rtti::IsValidUserPointer(handle.instance) ||
+                    !Game::Rtti::IsValidUserPointer(handle.refCount))
+                {
+                    continue;
+                }
+
+                const auto* compType = Game::Rtti::NativeType(handle.instance);
+                if (!compType)
+                    continue;
+
+                if (Game::Rtti::IsClassOrDerived(compType, kGameTargetingCompHash) ||
+                    Game::Rtti::IsClassOrDerived(compType, kTargetingCompHash))
+                {
+                    outHandle.instance = handle.instance;
+                    outHandle.refCount = handle.refCount;
+                    return true;
+                }
+
+                if (!fallbackPlaced.instance && Game::Rtti::IsClassOrDerived(compType, kEntIPlacedCompHash))
+                {
+                    fallbackPlaced = handle;
+                }
+            }
+
+            if (fallbackPlaced.instance)
+            {
+                outHandle.instance = fallbackPlaced.instance;
+                outHandle.refCount = fallbackPlaced.refCount;
+                return true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outHandle = {};
+            return false;
+        }
+
+        return false;
+    }
+
     SnapshotResult TrySnapshot(TrackedPuppet& tracked, Game::EntityTracker::PuppetSnapshot& snapshot)
     {
         // Game streaming can free/reuse an entity independently of our list. Validate all identity data at the
@@ -1583,6 +1648,13 @@ namespace
             snapshot.healthMax = tracked.healthMax;
             snapshot.healthRatio = tracked.healthRatio;
             snapshot.visual = tracked.visual;
+
+            if (!tracked.targetingComponent.instance)
+            {
+                FindTargetingComponent(entity, tracked.targetingComponent);
+            }
+            snapshot.targetingComponent = tracked.targetingComponent;
+
             return SnapshotResult::Ready;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
