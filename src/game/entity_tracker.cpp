@@ -1356,9 +1356,9 @@ namespace
 
     void ProcessPoseOnMainTick()
     {
-        // Keep the maximum VM-call budget below the previous 24 x 6 slot batch.
+        // Keep the per-tick entity budget bounded, but sample on every main tick:
+        // an additional wall-clock throttle makes both skeletons and aim points lag animation.
         constexpr std::size_t kPosePerTick = 8;
-        constexpr ULONGLONG kPoseIntervalMilliseconds = 33;
         constexpr ULONGLONG kPoseRequestLifetimeMilliseconds = 250;
         std::array<PoseWork, kPosePerTick> workItems{};
         std::size_t workCount = 0;
@@ -1376,8 +1376,7 @@ namespace
                 continue;
             const TrackedPuppet& tracked = g_puppetList[slot];
             if (!tracked.entity || tracked.entityId == 0 || tracked.poseRequestedAt == 0 ||
-                now - tracked.poseRequestedAt > kPoseRequestLifetimeMilliseconds ||
-                (tracked.visualUpdatedAt != 0 && now - tracked.visualUpdatedAt < kPoseIntervalMilliseconds))
+                now - tracked.poseRequestedAt > kPoseRequestLifetimeMilliseconds)
             {
                 continue;
             }
@@ -3272,7 +3271,7 @@ namespace Game::EntityTracker
         {
             if (!g_poseRequirementActive)
             {
-                Diagnostics::Log("pose capture activated: path=main-tick maxPerTick=24 intervalMs=33 "
+                Diagnostics::Log("pose capture activated: path=main-tick maxPerTick=8 intervalMs=0 "
                                  "requestLifetimeMs=250");
             }
             g_poseRequirementActive = true;
