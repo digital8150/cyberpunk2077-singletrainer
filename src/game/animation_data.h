@@ -6,7 +6,18 @@
 namespace Game::AnimationData
 {
     constexpr std::size_t kMaxSkeletonSegments = 64;
-    constexpr std::size_t kMaxPosePoints = 8;
+    enum Joint : std::size_t
+    {
+        Head, Chest, Hips, RightHand, LeftKnee, RightKnee,
+        Neck, LeftShoulder, RightShoulder, LeftElbow, RightElbow,
+        LeftHand, LeftAnkle, RightAnkle, LeftFoot, RightFoot, JointCount
+    };
+    constexpr std::size_t kMaxPosePoints = JointCount;
+    struct JointPosition
+    {
+        bool valid = false;
+        float position[3]{};
+    };
 
     struct SkeletonSegment
     {
@@ -23,6 +34,7 @@ namespace Game::AnimationData
         bool hasBounds = false;
         float boundsMinimum[3]{};
         float boundsMaximum[3]{};
+        JointPosition joints[JointCount]{};
         bool hasHeadPosition = false;
         float headPosition[3]{};
         // Live slot positions of the current pose. These are far tighter than the animation-system bounds and

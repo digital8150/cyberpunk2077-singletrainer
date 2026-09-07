@@ -168,6 +168,7 @@ namespace Loc
             LOC_KO_EN("Delete", "Delete"),
             LOC_KO_EN("숫자 키패드 %u", "Numpad %u"),
             LOC_KO_EN("F%u", "F%u"),
+            LOC_KO_EN("없음", "None"),
             LOC_KO_EN("0x%02X", "0x%02X"),
         };
 

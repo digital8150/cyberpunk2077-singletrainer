@@ -1037,6 +1037,7 @@ namespace UiKit
         static char text[32]{};
         switch (key)
         {
+        case 0: return Loc::Text(Loc::Str::KeyNone);
         case VK_LBUTTON: return Loc::Text(Loc::Str::KeyMouseLeft);
         case VK_RBUTTON: return Loc::Text(Loc::Str::KeyMouseRight);
         case VK_MBUTTON: return Loc::Text(Loc::Str::KeyMouseMiddle);

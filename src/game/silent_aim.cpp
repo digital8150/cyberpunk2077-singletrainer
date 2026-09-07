@@ -1596,6 +1596,13 @@ namespace Game::SilentAim
         g_state.targetActive.store(true, std::memory_order_release);
     }
 
+    void InvalidateTarget()
+    {
+        g_state.targetActive.store(false, std::memory_order_release);
+        g_state.targetPublishedAt.store(0, std::memory_order_release);
+        g_state.spawnerArmedAt.store(0, std::memory_order_release);
+    }
+
     void ClearTarget()
     {
         g_state.targetActive.store(false, std::memory_order_release);

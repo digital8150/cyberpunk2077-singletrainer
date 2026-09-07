@@ -84,6 +84,18 @@ target_link_libraries(cp2077_trainer PRIVATE
 
 set_target_properties(cp2077_trainer PROPERTIES OUTPUT_NAME "cp2077_trainer")
 
+option(CP2077_BUILD_TESTS "Build configuration regression tests" OFF)
+if(CP2077_BUILD_TESTS)
+    enable_testing()
+    add_executable(cp2077_config_tests tests/config_profiles.cpp src/config.cpp)
+    target_include_directories(cp2077_config_tests PRIVATE src)
+    target_compile_definitions(cp2077_config_tests PRIVATE UNICODE _UNICODE)
+    if(MSVC)
+        target_compile_options(cp2077_config_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME config_profiles COMMAND cp2077_config_tests)
+endif()
+
 # --- 오버레이 UI 프리뷰 하네스 ---
 # 트레이너 DLL은 게임 프로세스 안에서만 살아 있어서 UI를 눈으로 확인하려면 매번 게임에 주입해야 했다.
 # 이 실행 파일은 같은 D3D12 + ImGui 조합으로 창을 띄우고 src/ui의 화면 코드를 그대로 호출한다

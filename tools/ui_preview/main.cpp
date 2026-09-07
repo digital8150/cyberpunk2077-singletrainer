@@ -364,7 +364,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "preview: failed to create the D3D12 device or swap chain\n");
         return 1;
     }
-    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, options.shot.empty() ? SW_SHOW : SW_HIDE);
     UpdateWindow(hwnd);
 
     IMGUI_CHECKVERSION();

@@ -226,12 +226,21 @@ namespace Widgets
         // ── 페이지 ──────────────────────────────────────────────────────────
         void DrawAimbotPage(Features::Settings& settings)
         {
+            const bool ko = settings.ui.language == Features::Language::Korean;
             Features::AimbotSettings& aimbot = settings.aimbot;
             const float width = UiKit::ContentWidth();
             UiKit::ColumnsBegin(UiKit::ResolveColumnCount(2, width), width);
 
             UiKit::Column();
             UiKit::SectionBegin(Loc::Text(Loc::Str::SectionGeneral));
+            int selectedProfile = static_cast<int>(settings.activeAimbotProfile);
+            const char* profiles[] = {"Profile 1", "Profile 2"};
+            if (UiKit::ComboRow("aim_profile", ko ? "프로필" : "Profile", &selectedProfile, profiles, 2))
+            {
+                std::swap(settings.aimbot, settings.alternateAimbot);
+                settings.activeAimbotProfile = static_cast<unsigned>(selectedProfile);
+            }
+            UiKit::KeybindRow("profile_switch", ko ? "프로필 전환 키" : "Switch profile key", &settings.profileSwitchKey);
             UiKit::ToggleRow("aimbot_enabled", Loc::Text(Loc::Str::AimbotEnabled), &aimbot.enabled,
                              aimbot.enabled ? nullptr : Loc::Text(Loc::Str::AimbotDisabledNote));
             UiKit::BeginDisabled(!aimbot.enabled);
@@ -241,10 +250,13 @@ namespace Widgets
                 if (UiKit::ComboRow("aim_mode", Loc::Text(Loc::Str::AimMode), &mode, modes, 2))
                     aimbot.silentAim = mode == 1;
 
-                UiKit::KeybindRow("activation_key", Loc::Text(Loc::Str::ActivationKey), &aimbot.activationKey);
-                UiKit::HelperText(Format(aimbot.silentAim ? Loc::Text(Loc::Str::ActivationSilentHint)
-                                                          : Loc::Text(Loc::Str::ActivationClassicHint),
-                                         UiKit::KeyName(aimbot.activationKey)));
+                UiKit::KeybindRow("activation_key", ko ? "Main 작동키" : "Main key", &aimbot.activationKey);
+                UiKit::KeybindRow("sub_activation_key", ko ? "Sub 작동키" : "Sub key", &aimbot.subActivationKey);
+                bool useSubKey = aimbot.subActivationKey != 0;
+                if (UiKit::CheckRow("sub_key_enabled", ko ? "Sub 키 사용" : "Enable Sub key", &useSubKey))
+                    aimbot.subActivationKey = useSubKey ? 0x05 : 0;
+                UiKit::HelperText(ko ? "Main 또는 Sub 키를 누르면 작동합니다." : "Hold either Main or Sub to aim.");
+
             }
             UiKit::EndDisabled();
             UiKit::SectionEnd();
@@ -284,6 +296,26 @@ namespace Widgets
             UiKit::SectionEnd();
             UiKit::EndDisabled();
 
+            UiKit::BeginDisabled(!aimbot.enabled);
+            UiKit::SectionBegin(ko ? "타겟 본 (다중 선택)" : "Target bones (multiple)");
+            UiKit::CheckRow("nearest_bone", ko ? "Nearest (가장 가까운 본)" : "Nearest bone to crosshair", &aimbot.nearestBone);
+            UiKit::BeginDisabled(aimbot.nearestBone);
+            const char* boneNames[] = {"Head", "Neck", "Chest", "Arm", "Leg"};
+            const char* boneNamesKo[] = {"머리", "목", "가슴", "팔", "다리"};
+            for (unsigned i = 0; i < 5; ++i)
+            {
+                bool checked = (aimbot.boneMask & (1u << i)) != 0;
+                if (UiKit::CheckRow(boneNames[i], ko ? boneNamesKo[i] : boneNames[i], &checked))
+                {
+                    if (checked) aimbot.boneMask |= 1u << i;
+                    else if (aimbot.boneMask != (1u << i)) aimbot.boneMask &= ~(1u << i);
+                }
+            }
+            UiKit::EndDisabled();
+            UiKit::HelperText(ko ? "다중 선택 시 조준점과 가장 가까운 본을 선택합니다." : "Multiple selection aims at the closest selected bone.");
+            UiKit::SectionEnd();
+            UiKit::EndDisabled();
+
             UiKit::ColumnsEnd();
         }
 
@@ -303,6 +335,8 @@ namespace Widgets
             UiKit::SectionBegin(Loc::Text(Loc::Str::SectionVisuals));
             UiKit::ToggleRow("boxes", Loc::Text(Loc::Str::BoundingBoxes), &esp.boundingBoxes);
             UiKit::ToggleRow("skeleton", Loc::Text(Loc::Str::Skeleton), &esp.skeleton);
+            UiKit::ToggleRow("esp_name", settings.ui.language == Features::Language::Korean ? "이름 표시" : "Show name", &esp.showName);
+            UiKit::ToggleRow("esp_distance", settings.ui.language == Features::Language::Korean ? "거리 표시" : "Show distance", &esp.showDistance);
             UiKit::ToggleRow("health_bars", Loc::Text(Loc::Str::HealthBars), &esp.healthBars);
             UiKit::ToggleRow("native_highlight", Loc::Text(Loc::Str::NativeHighlight), &esp.nativeHighlight);
             UiKit::SectionEnd();

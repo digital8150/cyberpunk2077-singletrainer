@@ -209,7 +209,7 @@ namespace
 
     struct PoseMetrics
     {
-        std::uint8_t validMask = 0;
+        std::uint32_t validMask = 0;
         float verticalSpan = 0.0f;
         float headRelativeZ = 0.0f;
         float headToHips = 0.0f;
@@ -999,7 +999,7 @@ namespace
         PoseRightHand,
         PoseLeftLeg,
         PoseRightLeg,
-        PoseSlotCount,
+        PoseSlotCount = Game::AnimationData::JointCount,
     };
 
     struct SlotReadTelemetry
@@ -1100,45 +1100,71 @@ namespace
     {
         Diagnostics::Profile::Scope profileScope(Diagnostics::Profile::Slot::PoseSlots);
 
-        // 컴포넌트 순회와 RTTI 조회는 여기서 한 번이면 된다. 아래 6줄은 Invoke만 남는다.
+        // Resolve component accessors once for the complete joint sample.
         const SlotAccessors accessors = FindSlotAccessors(entity);
         PoseReadTelemetry telemetry;
         telemetry.accessorCount = accessors.count;
         memcpy(telemetry.components, accessors.components, sizeof(telemetry.components));
-        auto& head = telemetry.slots[PoseHead];
-        auto& chest = telemetry.slots[PoseChest];
-        auto& hips = telemetry.slots[PoseHips];
-        auto& rightHand = telemetry.slots[PoseRightHand];
-        auto& leftLeg = telemetry.slots[PoseLeftLeg];
-        auto& rightLeg = telemetry.slots[PoseRightLeg];
-        ReadSlotPosition(accessors, Fnv1a64("Head"), head);
-        ReadSlotPosition(accessors, Fnv1a64("Chest"), chest);
-        ReadSlotPosition(accessors, Fnv1a64("Hips"), hips);
-        ReadSlotPosition(accessors, Fnv1a64("RightHand"), rightHand);
-        ReadSlotPosition(accessors, Fnv1a64("LegLeft"), leftLeg);
-        ReadSlotPosition(accessors, Fnv1a64("LegRight"), rightLeg);
+        using namespace Game::AnimationData;
+        // 2.31 live SlotComponent arrays: arms/forearms/hands, legs and feet are actual authored slots.
+        // Despite their names, LeftUpLeg/RightUpLeg attachment positions are at the ankles (live verified).
+        // GetSlotTransform remains on the retained-entity game-main-tick path, never Present.
+        constexpr const char* names[JointCount] = {
+            "Head", "Chest", "Hips", "RightHand", "LegLeft", "LegRight",
+            "Neck", "LeftArm", "RightArm", "LeftForeArm", "RightForeArm",
+            "LeftHand", "LeftUpLeg", "RightUpLeg", "LeftFoot", "RightFoot"
+        };
+        for (std::size_t i = 0; i < JointCount; ++i)
+            ReadSlotPosition(accessors, Fnv1a64(names[i]), telemetry.slots[i]);
 
+        auto& head = telemetry.slots[Head];
+        auto& chest = telemetry.slots[Chest];
+        auto& neck = telemetry.slots[Neck];
+        // Most NPC rigs do not author a Neck attachment. Interpolate only the central neck landmark;
+        // missing limb joints are never invented or bridged across.
+        if (!neck.valid && head.valid && chest.valid)
+        {
+            neck.valid = true;
+            for (unsigned axis = 0; axis < 3; ++axis)
+                neck.position[axis] = chest.position[axis] + 0.65f * (head.position[axis] - chest.position[axis]);
+        }
         visual.hasHeadPosition = head.valid;
         if (head.valid)
             memcpy(visual.headPosition, head.position, sizeof(visual.headPosition));
         visual.posePointCount = 0;
-        const SlotReadTelemetry* const ordered[] = {&head, &chest, &hips, &rightHand, &leftLeg, &rightLeg};
-        for (const SlotReadTelemetry* point : ordered)
+        for (std::size_t i = 0; i < JointCount; ++i)
         {
-            if (point->valid)
-                AddPosePoint(visual, point->position);
+            visual.joints[i].valid = telemetry.slots[i].valid;
+            if (telemetry.slots[i].valid)
+            {
+                memcpy(visual.joints[i].position, telemetry.slots[i].position, sizeof(visual.joints[i].position));
+                AddPosePoint(visual, telemetry.slots[i].position);
+            }
         }
         visual.skeletonSegmentCount = 0;
-        if (hips.valid && chest.valid)
-            AddSkeletonSegment(visual, hips.position, chest.position);
-        if (chest.valid && head.valid)
-            AddSkeletonSegment(visual, chest.position, head.position);
-        if (chest.valid && rightHand.valid)
-            AddSkeletonSegment(visual, chest.position, rightHand.position);
-        if (hips.valid && leftLeg.valid)
-            AddSkeletonSegment(visual, hips.position, leftLeg.position);
-        if (hips.valid && rightLeg.valid)
-            AddSkeletonSegment(visual, hips.position, rightLeg.position);
+        constexpr Joint edges[][2] = {
+            {Head, Neck}, {Neck, Chest}, {Chest, Hips},
+            {Neck, LeftShoulder}, {LeftShoulder, LeftElbow}, {LeftElbow, LeftHand},
+            {Neck, RightShoulder}, {RightShoulder, RightElbow}, {RightElbow, RightHand},
+            {Hips, LeftKnee}, {LeftKnee, LeftAnkle}, {LeftAnkle, LeftFoot},
+            {Hips, RightKnee}, {RightKnee, RightAnkle}, {RightAnkle, RightFoot}
+        };
+        for (const auto& edge : edges)
+        {
+            const auto& from = telemetry.slots[edge[0]];
+            const auto& to = telemetry.slots[edge[1]];
+            if (from.valid && to.valid)
+                AddSkeletonSegment(visual, from.position, to.position);
+        }
+        static unsigned loggedPoses = 0;
+        if (loggedPoses < 8 && visual.skeletonSegmentCount >= 12)
+        {
+            ++loggedPoses;
+            for (std::size_t i = 0; i < JointCount; ++i)
+                Diagnostics::Log("pose joint: sample=%u joint=%s valid=%u pos=(%.3f,%.3f,%.3f)",
+                                 loggedPoses, names[i], telemetry.slots[i].valid ? 1u : 0u,
+                                 telemetry.slots[i].position[0], telemetry.slots[i].position[1], telemetry.slots[i].position[2]);
+        }
         return telemetry;
     }
 
@@ -1152,7 +1178,7 @@ namespace
             const SlotReadTelemetry& slot = telemetry.slots[i];
             if (!slot.valid)
                 continue;
-            metrics.validMask |= static_cast<std::uint8_t>(1u << i);
+            metrics.validMask |= 1u << i;
             lowest = (std::min)(lowest, slot.position[2]);
             highest = (std::max)(highest, slot.position[2]);
         }
@@ -1330,7 +1356,8 @@ namespace
 
     void ProcessPoseOnMainTick()
     {
-        constexpr std::size_t kPosePerTick = 24;
+        // Keep the maximum VM-call budget below the previous 24 x 6 slot batch.
+        constexpr std::size_t kPosePerTick = 8;
         constexpr ULONGLONG kPoseIntervalMilliseconds = 33;
         constexpr ULONGLONG kPoseRequestLifetimeMilliseconds = 250;
         std::array<PoseWork, kPosePerTick> workItems{};
@@ -1372,7 +1399,7 @@ namespace
             ProcessPoseWorkOnMainTick(workItems[i]);
 
         // Publish complete pose samples as one cache transaction. Present can now only observe the previous or the
-        // new sample, never the six-slot capture in progress.
+        // new sample, never a partial joint capture.
         AcquireSRWLockExclusive(&g_puppetListLock);
         for (std::size_t i = 0; i < workCount; ++i)
         {

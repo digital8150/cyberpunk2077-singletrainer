@@ -42,6 +42,8 @@ namespace Features
         bool enabled = false;
         bool boundingBoxes = true;
         bool skeleton = false;
+        bool showName = true;
+        bool showDistance = true;
         bool healthBars = true;
         bool nativeHighlight = false;
         bool hideDead = true;
@@ -63,6 +65,10 @@ namespace Features
         bool silentAim = false;
         // 에임을 걸어둘 키의 가상 키 코드. 기본값 0x02는 VK_RBUTTON(마우스 오른쪽 버튼).
         unsigned int activationKey = 0x02;
+        unsigned int subActivationKey = 0;
+        // Head, neck, chest, arms, legs. Nearest searches all groups.
+        unsigned int boneMask = 1;
+        bool nearestBone = false;
         bool drawFovCircle = true;
         bool targetEnemies = true;
         bool targetPolice = false;
@@ -82,6 +88,7 @@ namespace Features
         float smoothing = 8.0f;
         float maxDistanceMeters = 150.0f;
         bool leadPrediction = true;
+        bool operator==(const AimbotSettings&) const = default;
     };
 
     struct MiscSettings
@@ -122,6 +129,9 @@ namespace Features
         UiSettings ui;
         EspSettings esp;
         AimbotSettings aimbot;
+        AimbotSettings alternateAimbot;
+        unsigned int activeAimbotProfile = 0;
+        unsigned int profileSwitchKey = 0x75; // F6
         MiscSettings misc;
         DebugSettings debug;
     };

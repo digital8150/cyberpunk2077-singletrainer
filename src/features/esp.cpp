@@ -353,11 +353,18 @@ namespace Esp
             if (settings.skeleton && puppet.visual.skeletonSegmentCount > 0)
                 skeletonLineCount += DrawSkeleton(puppet.visual, io, drawList, color, shadow);
 
-            char label[64]{};
-            snprintf(label, sizeof(label), "%s  %.0fm%s", style.label, distance,
-                     puppet.isDead ? "  DEAD" : "");
-            drawList->AddText(ImVec2(minimum.x, minimum.y - ImGui::GetFontSize() - 2.0f), shadow, label);
-            drawList->AddText(ImVec2(minimum.x + 1.0f, minimum.y - ImGui::GetFontSize() - 3.0f), color, label);
+            if (settings.showName || settings.showDistance)
+            {
+                char label[64]{};
+                if (settings.showName && settings.showDistance)
+                    snprintf(label, sizeof(label), "%s  %.0fm", style.label, distance);
+                else if (settings.showName)
+                    snprintf(label, sizeof(label), "%s", style.label);
+                else
+                    snprintf(label, sizeof(label), "%.0fm", distance);
+                drawList->AddText(ImVec2(minimum.x, minimum.y - ImGui::GetFontSize() - 2.0f), shadow, label);
+                drawList->AddText(ImVec2(minimum.x + 1.0f, minimum.y - ImGui::GetFontSize() - 3.0f), color, label);
+            }
         }
 
         const ULONGLONG now = GetTickCount64();

@@ -96,24 +96,33 @@ namespace Aimbot
             return std::clamp(radius, 6.0f, maximum);
         }
 
-        void GetAimPoint(const Game::EntityTracker::PuppetSnapshot& puppet, float output[3])
+        bool GetAimPoint(const Game::EntityTracker::PuppetSnapshot& puppet,
+                         const Features::AimbotSettings& settings, float width, float height, float output[3])
         {
-            if (puppet.visual.hasHeadPosition)
+            using namespace Game::AnimationData;
+            constexpr unsigned groups[JointCount] = {1, 4, 16, 8, 16, 16, 2, 8, 8, 8, 8, 8, 16, 16, 16, 16};
+            float best = (std::numeric_limits<float>::max)();
+            bool found = false;
+            for (std::size_t i = 0; i < JointCount; ++i)
             {
-                std::copy(std::begin(puppet.visual.headPosition), std::end(puppet.visual.headPosition), output);
-                return;
+                const auto& joint = puppet.visual.joints[i];
+                if (!joint.valid || (!settings.nearestBone && !(settings.boneMask & groups[i])))
+                    continue;
+                Game::Projection::ScreenPoint point;
+                if (!Game::Projection::WorldToScreen(joint.position, width, height, point) || point.behind ||
+                    point.depth <= 0.0f || point.depth > settings.maxDistanceMeters)
+                    continue;
+                const float dx = point.x - width * 0.5f, dy = point.y - height * 0.5f;
+                const float distance = dx * dx + dy * dy;
+                if (distance < best)
+                {
+                    best = distance;
+                    std::copy(std::begin(joint.position), std::end(joint.position), output);
+                    found = true;
+                }
             }
-            if (puppet.visual.hasBounds)
-            {
-                output[0] = (puppet.visual.boundsMinimum[0] + puppet.visual.boundsMaximum[0]) * 0.5f;
-                output[1] = (puppet.visual.boundsMinimum[1] + puppet.visual.boundsMaximum[1]) * 0.5f;
-                const float height = puppet.visual.boundsMaximum[2] - puppet.visual.boundsMinimum[2];
-                output[2] = puppet.visual.boundsMaximum[2] - height * 0.12f;
-                return;
-            }
-            output[0] = puppet.position[0];
-            output[1] = puppet.position[1];
-            output[2] = puppet.position[2] + 1.62f;
+            // An unavailable selected limb must not silently turn into a head shot.
+            return found;
         }
     }
 
@@ -157,9 +166,10 @@ namespace Aimbot
         Game::Projection::ScreenPoint lockedPoint;
         float lockedWorld[3]{};
         bool lockedTargetAvailable = false;
-        const int activationKey = static_cast<int>(settings.activationKey);
-        const bool activationHeld =
-            activationKey > 0 && activationKey < 0xFF && (GetAsyncKeyState(activationKey) & 0x8000) != 0;
+        const auto held = [](unsigned key) {
+            return key > 0 && key < 0xFF && (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
+        };
+        const bool activationHeld = held(settings.activationKey) || held(settings.subActivationKey);
         float camera[3]{};
         const bool visibleOnly = settings.visibleOnly && Game::Projection::GetCameraPosition(camera);
 
@@ -186,7 +196,8 @@ namespace Aimbot
             }
 
             float aimWorld[3]{};
-            GetAimPoint(puppet, aimWorld);
+            if (!GetAimPoint(puppet, settings, displayWidth, displayHeight, aimWorld))
+                continue;
             Game::Projection::ScreenPoint point;
             if (!Game::Projection::WorldToScreen(aimWorld, displayWidth, displayHeight, point) ||
                 point.behind || point.depth <= 0.0f || point.depth > settings.maxDistanceMeters)
@@ -289,16 +300,17 @@ namespace Aimbot
         const ULONGLONG now = GetTickCount64();
 
         float targetVelocity[3] = {0.0f, 0.0f, 0.0f};
-        if (settings.leadPrediction)
+        if (settings.leadPrediction && selected)
         {
+            const float* motionPosition = selected->position;
             if (bestEntityId == g_trackedVelocityEntityId && g_lastTrackedTick != 0 && now > g_lastTrackedTick)
             {
                 const float dt = (now - g_lastTrackedTick) / 1000.0f;
                 if (dt >= 0.005f && dt <= 0.25f)
                 {
-                    const float dx = bestWorld[0] - g_lastTrackedPos[0];
-                    const float dy = bestWorld[1] - g_lastTrackedPos[1];
-                    const float dz = bestWorld[2] - g_lastTrackedPos[2];
+                    const float dx = motionPosition[0] - g_lastTrackedPos[0];
+                    const float dy = motionPosition[1] - g_lastTrackedPos[1];
+                    const float dz = motionPosition[2] - g_lastTrackedPos[2];
                     const float rawVx = dx / dt;
                     const float rawVy = dy / dt;
                     const float rawVz = dz / dt;
@@ -319,9 +331,9 @@ namespace Aimbot
                 g_smoothedVelocity[1] = 0.0f;
                 g_smoothedVelocity[2] = 0.0f;
             }
-            g_lastTrackedPos[0] = bestWorld[0];
-            g_lastTrackedPos[1] = bestWorld[1];
-            g_lastTrackedPos[2] = bestWorld[2];
+            g_lastTrackedPos[0] = motionPosition[0];
+            g_lastTrackedPos[1] = motionPosition[1];
+            g_lastTrackedPos[2] = motionPosition[2];
             g_lastTrackedTick = now;
 
             targetVelocity[0] = g_smoothedVelocity[0];

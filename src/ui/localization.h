@@ -157,6 +157,7 @@ namespace Loc
         KeyDelete,
         KeyNumpadFormat,
         KeyFunctionFormat,
+        KeyNone,
         KeyHexFormat,
     };
 

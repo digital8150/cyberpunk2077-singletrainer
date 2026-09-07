@@ -50,6 +50,7 @@ namespace Game::SilentAim
     // use freshness as an early filter, so a target that stops being published stops being redirected.
     void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3] = nullptr);
     void ClearTarget();
+    void InvalidateTarget();
     DiagnosticsSnapshot GetDiagnostics();
     void Shutdown();
 }

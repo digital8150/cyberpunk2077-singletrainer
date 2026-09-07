@@ -35,19 +35,12 @@ namespace
                lhs.esp.showPolice == rhs.esp.showPolice &&
                lhs.esp.showUnclassified == rhs.esp.showUnclassified &&
                lhs.esp.maxDistanceMeters == rhs.esp.maxDistanceMeters &&
-               lhs.aimbot.enabled == rhs.aimbot.enabled &&
-               lhs.aimbot.silentAim == rhs.aimbot.silentAim &&
-               lhs.aimbot.activationKey == rhs.aimbot.activationKey &&
-               lhs.aimbot.drawFovCircle == rhs.aimbot.drawFovCircle &&
-               lhs.aimbot.targetEnemies == rhs.aimbot.targetEnemies &&
-               lhs.aimbot.targetPolice == rhs.aimbot.targetPolice &&
-               lhs.aimbot.visibleOnly == rhs.aimbot.visibleOnly &&
-               lhs.aimbot.requireHealthPool == rhs.aimbot.requireHealthPool &&
-               lhs.aimbot.limitHealthPool == rhs.aimbot.limitHealthPool &&
-               lhs.aimbot.maxHealthPool == rhs.aimbot.maxHealthPool &&
-               lhs.aimbot.fovRadiusDegrees == rhs.aimbot.fovRadiusDegrees &&
-               lhs.aimbot.smoothing == rhs.aimbot.smoothing &&
-               lhs.aimbot.maxDistanceMeters == rhs.aimbot.maxDistanceMeters &&
+               lhs.aimbot == rhs.aimbot &&
+               lhs.alternateAimbot == rhs.alternateAimbot &&
+               lhs.activeAimbotProfile == rhs.activeAimbotProfile &&
+               lhs.profileSwitchKey == rhs.profileSwitchKey &&
+               lhs.esp.showName == rhs.esp.showName &&
+               lhs.esp.showDistance == rhs.esp.showDistance &&
                lhs.misc.noRecoil == rhs.misc.noRecoil &&
                lhs.misc.noSpread == rhs.misc.noSpread &&
                lhs.debug.showFps == rhs.debug.showFps &&
@@ -132,6 +125,60 @@ namespace
         return WritePrivateProfileStringW(section, key, nullptr, g_configPath) != FALSE;
     }
 
+    void LoadAimbot(const wchar_t* section, Features::AimbotSettings& aimbot)
+    {
+        aimbot.enabled = ReadBool(section, L"enabled", aimbot.enabled);
+        aimbot.silentAim = ReadBool(section, L"silent_aim", aimbot.silentAim);
+        aimbot.activationKey = ReadKey(section, L"activation_key", aimbot.activationKey);
+        aimbot.drawFovCircle =
+            ReadBool(section, L"draw_fov_circle", aimbot.drawFovCircle);
+        aimbot.targetEnemies = ReadBool(section, L"target_enemies", aimbot.targetEnemies);
+        aimbot.targetPolice = ReadBool(section, L"target_police", aimbot.targetPolice);
+        aimbot.visibleOnly = ReadBool(section, L"visible_only", aimbot.visibleOnly);
+        aimbot.requireHealthPool =
+            ReadBool(section, L"require_health_pool", aimbot.requireHealthPool);
+        aimbot.limitHealthPool =
+            ReadBool(section, L"limit_health_pool", aimbot.limitHealthPool);
+        aimbot.maxHealthPool =
+            ReadFloat(section, L"max_health_pool", aimbot.maxHealthPool, 500.0f, 6000.0f);
+        aimbot.fovRadiusDegrees =
+            ReadFloat(section, L"fov_radius_degrees", aimbot.fovRadiusDegrees, 1.0f, 60.0f);
+        aimbot.smoothing = ReadFloat(section, L"smoothing", aimbot.smoothing, 0.0f, 30.0f);
+        aimbot.maxDistanceMeters =
+            ReadFloat(section, L"max_distance_meters", aimbot.maxDistanceMeters, 10.0f, 300.0f);
+
+        const UINT subKey = GetPrivateProfileIntW(section, L"sub_activation_key", 0, g_configPath);
+        aimbot.subActivationKey = subKey < 0xFF ? subKey : 0;
+        aimbot.boneMask = GetPrivateProfileIntW(section, L"bone_mask", 1, g_configPath) & 31u;
+        if (!aimbot.boneMask) aimbot.boneMask = 1;
+        aimbot.nearestBone = ReadBool(section, L"nearest_bone", aimbot.nearestBone);
+        aimbot.leadPrediction = ReadBool(section, L"lead_prediction", aimbot.leadPrediction);
+    }
+
+    bool SaveAimbot(const wchar_t* section, const Features::AimbotSettings& aimbot)
+    {
+        bool ok = true;
+        ok &= WriteBool(section, L"enabled", aimbot.enabled);
+        ok &= WriteBool(section, L"silent_aim", aimbot.silentAim);
+        ok &= WriteKey(section, L"activation_key", aimbot.activationKey);
+        ok &= WriteBool(section, L"draw_fov_circle", aimbot.drawFovCircle);
+        ok &= WriteBool(section, L"target_enemies", aimbot.targetEnemies);
+        ok &= WriteBool(section, L"target_police", aimbot.targetPolice);
+        ok &= WriteBool(section, L"visible_only", aimbot.visibleOnly);
+        ok &= WriteBool(section, L"require_health_pool", aimbot.requireHealthPool);
+        ok &= WriteBool(section, L"limit_health_pool", aimbot.limitHealthPool);
+        ok &= WriteFloat(section, L"max_health_pool", aimbot.maxHealthPool);
+        ok &= WriteFloat(section, L"fov_radius_degrees", aimbot.fovRadiusDegrees);
+        ok &= WriteFloat(section, L"smoothing", aimbot.smoothing);
+        ok &= WriteFloat(section, L"max_distance_meters", aimbot.maxDistanceMeters);
+
+        ok &= WriteKey(section, L"sub_activation_key", aimbot.subActivationKey);
+        ok &= WriteKey(section, L"bone_mask", aimbot.boneMask);
+        ok &= WriteBool(section, L"nearest_bone", aimbot.nearestBone);
+        ok &= WriteBool(section, L"lead_prediction", aimbot.leadPrediction);
+        return ok;
+    }
+
     bool Save(const Features::Settings& settings)
     {
         bool ok = true;
@@ -154,19 +201,12 @@ namespace
         ok &= WriteBool(L"esp", L"show_unclassified", settings.esp.showUnclassified);
         ok &= WriteFloat(L"esp", L"max_distance_meters", settings.esp.maxDistanceMeters);
 
-        ok &= WriteBool(L"aimbot", L"enabled", settings.aimbot.enabled);
-        ok &= WriteBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
-        ok &= WriteKey(L"aimbot", L"activation_key", settings.aimbot.activationKey);
-        ok &= WriteBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
-        ok &= WriteBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
-        ok &= WriteBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
-        ok &= WriteBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
-        ok &= WriteBool(L"aimbot", L"require_health_pool", settings.aimbot.requireHealthPool);
-        ok &= WriteBool(L"aimbot", L"limit_health_pool", settings.aimbot.limitHealthPool);
-        ok &= WriteFloat(L"aimbot", L"max_health_pool", settings.aimbot.maxHealthPool);
-        ok &= WriteFloat(L"aimbot", L"fov_radius_degrees", settings.aimbot.fovRadiusDegrees);
-        ok &= WriteFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing);
-        ok &= WriteFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters);
+        ok &= SaveAimbot(L"aimbot", settings.aimbot);
+        ok &= SaveAimbot(L"aimbot_alternate", settings.alternateAimbot);
+        ok &= WriteKey(L"aimbot_profiles", L"active", settings.activeAimbotProfile);
+        ok &= WriteKey(L"aimbot_profiles", L"switch_key", settings.profileSwitchKey);
+        ok &= WriteBool(L"esp", L"show_name", settings.esp.showName);
+        ok &= WriteBool(L"esp", L"show_distance", settings.esp.showDistance);
 
         ok &= WriteBool(L"misc", L"no_recoil", settings.misc.noRecoil);
         ok &= WriteBool(L"misc", L"no_spread", settings.misc.noSpread);
@@ -256,25 +296,13 @@ namespace Config
         settings.esp.maxDistanceMeters =
             ReadFloat(L"esp", L"max_distance_meters", settings.esp.maxDistanceMeters, 10.0f, 300.0f);
 
-        settings.aimbot.enabled = ReadBool(L"aimbot", L"enabled", settings.aimbot.enabled);
-        settings.aimbot.silentAim = ReadBool(L"aimbot", L"silent_aim", settings.aimbot.silentAim);
-        settings.aimbot.activationKey = ReadKey(L"aimbot", L"activation_key", settings.aimbot.activationKey);
-        settings.aimbot.drawFovCircle =
-            ReadBool(L"aimbot", L"draw_fov_circle", settings.aimbot.drawFovCircle);
-        settings.aimbot.targetEnemies = ReadBool(L"aimbot", L"target_enemies", settings.aimbot.targetEnemies);
-        settings.aimbot.targetPolice = ReadBool(L"aimbot", L"target_police", settings.aimbot.targetPolice);
-        settings.aimbot.visibleOnly = ReadBool(L"aimbot", L"visible_only", settings.aimbot.visibleOnly);
-        settings.aimbot.requireHealthPool =
-            ReadBool(L"aimbot", L"require_health_pool", settings.aimbot.requireHealthPool);
-        settings.aimbot.limitHealthPool =
-            ReadBool(L"aimbot", L"limit_health_pool", settings.aimbot.limitHealthPool);
-        settings.aimbot.maxHealthPool =
-            ReadFloat(L"aimbot", L"max_health_pool", settings.aimbot.maxHealthPool, 500.0f, 6000.0f);
-        settings.aimbot.fovRadiusDegrees =
-            ReadFloat(L"aimbot", L"fov_radius_degrees", settings.aimbot.fovRadiusDegrees, 1.0f, 60.0f);
-        settings.aimbot.smoothing = ReadFloat(L"aimbot", L"smoothing", settings.aimbot.smoothing, 0.0f, 30.0f);
-        settings.aimbot.maxDistanceMeters =
-            ReadFloat(L"aimbot", L"max_distance_meters", settings.aimbot.maxDistanceMeters, 10.0f, 300.0f);
+        LoadAimbot(L"aimbot", settings.aimbot);
+        settings.alternateAimbot = settings.aimbot;
+        LoadAimbot(L"aimbot_alternate", settings.alternateAimbot);
+        settings.activeAimbotProfile = (std::min)(1u, GetPrivateProfileIntW(L"aimbot_profiles", L"active", 0, g_configPath));
+        settings.profileSwitchKey = ReadKey(L"aimbot_profiles", L"switch_key", settings.profileSwitchKey);
+        settings.esp.showName = ReadBool(L"esp", L"show_name", settings.esp.showName);
+        settings.esp.showDistance = ReadBool(L"esp", L"show_distance", settings.esp.showDistance);
 
         settings.misc.noRecoil =
             ReadBoolMigrated(L"misc", L"no_recoil", L"trainer", L"no_recoil", settings.misc.noRecoil);

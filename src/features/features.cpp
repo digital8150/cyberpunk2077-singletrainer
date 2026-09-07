@@ -3,12 +3,19 @@
 #include "esp.h"
 #include "fps_counter.h"
 #include "../config.h"
+#include "../framework.h"
+#include "../diagnostics.h"
+#include "../ui/overlay.h"
+#include "../game/silent_aim.h"
 #include "../game/entity_tracker.h"
 #include "../game/player_modifiers.h"
 #include "../game/visibility.h"
 #include "../profiling.h"
 
 #include <array>
+#include <utility>
+#include <cstdio>
+#include <imgui.h>
 
 namespace
 {
@@ -17,6 +24,33 @@ namespace
     // Present 스레드 전용. OnPresent가 렌더 뮤텍스를 잡은 채로만 들어오므로 프레임당 한 번 채워진다.
     std::array<Game::EntityTracker::PuppetSnapshot, 128> g_frameSnapshots{};
     bool g_aimbotEnabledLastFrame = false;
+    ULONGLONG g_profileToastUntil = 0;
+
+    void UpdateAimbotProfile()
+    {
+        static bool switchHeld = false;
+        static Features::AimbotSettings previous;
+        static unsigned previousProfile = 0;
+        DWORD foregroundProcess = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcess);
+        const unsigned key = g_settings.profileSwitchKey;
+        const bool held = key > 0 && key < 0xFF && (GetAsyncKeyState(static_cast<int>(key)) & 0x8000);
+        if (held && !switchHeld && !Overlay::IsVisible() && foregroundProcess == GetCurrentProcessId())
+        {
+            std::swap(g_settings.aimbot, g_settings.alternateAimbot);
+            g_settings.activeAimbotProfile ^= 1u;
+            g_profileToastUntil = GetTickCount64() + 1800;
+            Diagnostics::Log("aimbot profile switched: profile=%u", g_settings.activeAimbotProfile + 1);
+        }
+        switchHeld = held;
+        if (!(previous == g_settings.aimbot) || previousProfile != g_settings.activeAimbotProfile)
+        {
+            Aimbot::Disable();
+            Game::SilentAim::InvalidateTarget();
+            previous = g_settings.aimbot;
+            previousProfile = g_settings.activeAimbotProfile;
+        }
+    }
 
     Features::FrameSnapshots CaptureFrameSnapshots()
     {
@@ -59,6 +93,7 @@ namespace Features
 
     void DrawOverlay(bool menuVisible)
     {
+        UpdateAimbotProfile();
         Config::Update();
         const bool graphEnabled = g_settings.debug.showGraph;
         if (graphEnabled)
@@ -83,10 +118,24 @@ namespace Features
         if (graphEnabled)
             Diagnostics::Profile::EndPresentFrame();
         FpsCounter::Draw(g_settings.debug, menuVisible);
+        if (!menuVisible && GetTickCount64() < g_profileToastUntil)
+        {
+            char label[64]{};
+            snprintf(label, sizeof(label), g_settings.ui.language == Language::Korean
+                         ? "에임봇 프로필 %u" : "Aimbot profile %u", g_settings.activeAimbotProfile + 1);
+            const ImVec2 size = ImGui::CalcTextSize(label);
+            const ImVec2 origin((ImGui::GetIO().DisplaySize.x - size.x) * 0.5f, 32.0f);
+            auto* draw = ImGui::GetForegroundDrawList();
+            draw->AddRectFilled(ImVec2(origin.x - 14.0f, origin.y - 9.0f),
+                                ImVec2(origin.x + size.x + 14.0f, origin.y + size.y + 9.0f),
+                                IM_COL32(22, 27, 38, 230), 8.0f);
+            draw->AddText(origin, IM_COL32(235, 241, 255, 255), label);
+        }
     }
 
     void UpdateHeadless(float displayWidth, float displayHeight)
     {
+        UpdateAimbotProfile();
         Config::Update();
         Game::PlayerModifiers::PublishDesired(g_settings.misc);
         PublishFeatureRequirements(false);
