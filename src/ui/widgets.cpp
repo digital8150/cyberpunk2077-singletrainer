@@ -418,22 +418,25 @@ namespace Widgets
             UiKit::MetricRow("failures", Count(modifiers.failures));
 
             const char* silentStatus = "unavailable";
-            if (silent.crosshairCoreHookCreated && silent.projectileHookCreated)
+            if (silent.crosshairCoreHookCreated && (silent.projectileHookCreated || silent.orientationHookCreated))
                 silentStatus = "hitscan + projectile hooked";
             else if (silent.crosshairCoreHookCreated)
                 silentStatus = "crosshair core hooked";
-            else if (silent.projectileHookCreated)
+            else if (silent.projectileHookCreated || silent.orientationHookCreated)
                 silentStatus = "projectile hooked";
 
             UiKit::MetricGroup("Silent aim", silentStatus,
-                               (silent.crosshairCoreHookCreated || silent.projectileHookCreated) ? palette.success : palette.warning);
+                               (silent.crosshairCoreHookCreated || silent.projectileHookCreated || silent.orientationHookCreated) ? palette.success : palette.warning);
             UiKit::MetricRow("hitscan redirects", Count(silent.nativeCrosshairCoreRedirects));
             UiKit::MetricRow("projectile redirects", Count(silent.redirectedShots));
+            UiKit::MetricRow("orientation redirects", Count(silent.orientationRedirects));
             UiKit::MetricRow("rejected", Count(silent.rejectedShots));
             if (UiKit::CollapsibleRow("silent_detail", Loc::Text(Loc::Str::SilentAimDiagnostics),
                                       &g_silentDiagnosticsOpen))
             {
                 UiKit::MetricRow("crosshair core calls", Count(silent.nativeCrosshairCoreCalls));
+                UiKit::MetricRow("spawner launch events", Count(silent.spawnerLaunchEvents));
+                UiKit::MetricRow("spawner launch redirects", Count(silent.spawnerLaunchRedirects));
                 if (silent.producerHooks == 0 && silent.listenerHooks == 0)
                 {
                     UiKit::MetricGroup("Observation hooks", "disabled in this build", palette.textDisabled);

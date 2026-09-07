@@ -10,9 +10,10 @@ namespace Game::SilentAim
         bool queueHookCreated = false;
         // Mutation paths:
         // 1. Hitscan firearms: native crosshair core direction out-parameter redirection.
-        // 2. Projectiles (throwing knives/axes): projectile component ShootEvent ballistic trajectory redirection.
+        // 2. Projectiles (throwing knives/axes): spawner orientation provider (entFuncOrientationProvider) redirection.
         bool crosshairCoreHookCreated = false;
         bool projectileHookCreated = false;
+        bool orientationHookCreated = false;
         std::uint32_t listenerHooks = 0;
         std::uint32_t producerHooks = 0;
         std::uint64_t callbacks = 0;
@@ -30,6 +31,9 @@ namespace Game::SilentAim
         std::uint64_t defaultCrosshairCalls = 0;
         std::uint64_t nativeCrosshairCoreCalls = 0;
         std::uint64_t nativeCrosshairCoreRedirects = 0;
+        std::uint64_t spawnerLaunchEvents = 0;
+        std::uint64_t spawnerLaunchRedirects = 0;
+        std::uint64_t orientationRedirects = 0;
     };
 
     // Resolves the native crosshair core (hitscan mutation path) and projectile ShootEvent listeners

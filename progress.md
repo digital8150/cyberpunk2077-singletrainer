@@ -2874,3 +2874,52 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
 - **빌드 및 검증**:
   - `cmake --build build --config Release` 정상 컴파일 및 링크 완료 (경고 0, 에러 0).
   - 유해한 미검증 오프셋 쓰기가 100% 제거되어 엔진 내부 소멸자 포인터 오염 원천 차단.
+
+## 2026-09-07 투척 무기 Silent Aim 발사체 궤적 리다이렉션 완전 구현 (entFuncOrientationProvider 가상 메서드 후킹)
+
+- **사용자 이슈 제기**:
+  - 투척 무기(단검 등) 사용 시 트레이너 오버레이의 프로젝타일 리다이렉트 카운트는 올라가지만 실제 단검은 조준 타깃으로 유도되지 않고 크로스헤어(화면 중앙)로만 날아가는 현상 발생.
+- **근본 원인 규명**:
+  - 기존 `HandleSpawnerLaunchEvent`는 `gameprojectileSpawnerLaunchEvent`의 `projectileParams.targetPosition`(+0xD0)만 갱신하고 있었음.
+  - 게임 스크립트(`meleeTransitions.script`, `meleeProjectile.script`, `projectileHelper.script`, `baseProjectile.script`) 및 TweakDB(`knife_params`) 정밀 분석:
+    1. 단검/도끼 등 투척 무기는 `SpawnProjectileFromScreenCenter`를 통해 `TargetingSystem.GetDefaultCrosshairOrientationProvider`로 생성된 `logicalOrientationProvider`를 발사 파라미터에 지정.
+    2. 투사체 생성 후 `MeleeProjectile::ExecuteParabolicLaunch` -> `ProjectileLaunchHelper::SetParabolicLaunchTrajectory` -> `projectileComponent.AddParabolic`을 호출하여 물리 시뮬레이션 시작.
+    3. `AddParabolic`은 `launchParams.logicalOrientationProvider`를 평가해 초기 발사 각도/방향을 결정하며, `projectileParams.targetPosition`은 스마트 무기 유도(`CurvedLaunchToTarget`) 전용이므로 포물선 투척 로직에서는 **완전히 무시**됨.
+    4. 따라서 방향 프로바이더를 교체/조정하지 않는 한 투척 무기는 항상 화면 중앙 방향으로만 발사됨.
+- **런타임 RTTI 및 Orientation Provider 역공학**:
+  - `gameprojectileSpawnerLaunchEvent` (CClass `0x7FF682E10EF8`, eventId 167) 레이아웃 실측:
+    - `+0x040`: `launchParams` (`gameprojectileLaunchParams`, size 0x58)
+    - `+0x058`: `logicalOrientationProvider` (`Handle<IOrientationProvider>`, nameHash `0x408AC5A34512A87B`)
+    - `+0x078`: `visualOrientationProvider` (`Handle<IOrientationProvider>`, nameHash `0x5DA2AF7057A6E9FC`)
+  - `GetDefaultCrosshairOrientationProvider`가 반환하는 CClass: `entFuncOrientationProvider` (`0x7FF682CC1AA0`, vtable `0x7FF681462228`).
+  - 가상 메서드 슬롯 33: `Vector4Layout* __fastcall GetOrientation(void* thisPtr, Vector4Layout* outQuat)` (`0x7FF67ECD5524`).
+    - 시그니처: `40 53 48 83 EC 30 48 8B 49 78 48 8B DA 48 85 C9 74 ?? 48 8B 01 48 8D 54` (Cyberpunk 2077 2.31 기준 유일 매치).
+    - x64 호출 규약: `rcx = thisPtr`, `rdx = outQuat`. 호출자 스택 버퍼 `[rdx]`에 쿼터니언 `(x, y, z, w)`을 작성하고 `rax = rdx` 반환.
+- **안전하고 무결한 리다이렉션 아키텍처 설계 및 구현**:
+  - 엔진 힙 객체 포인터나 WeakHandle refcount를 일체 건드리지 않고(과거 UAF/오염 사고 원천 차단), 순수 함수 out-parameter(`outQuat`)만 오버라이드.
+  1. `src/game/silent_aim.h`:
+     - `DiagnosticsSnapshot`에 `orientationHookCreated`, `spawnerLaunchEvents`, `spawnerLaunchRedirects`, `orientationRedirects` 필드 추가.
+  2. `src/game/silent_aim.cpp`:
+     - `HookNativeCrosshairCore`: 매 프레임 검증된 카메라 원점(`origin`)을 `lastCameraX/Y/Z`에 atomic 저장하여 탄도학 계산의 정확한 발사 원점 확보.
+     - `MatrixToQuaternion`: Shepperd 알고리즘을 사용해 REDengine 3x3 회전 행렬(Right, Forward, Up)을 정규화된 단위 쿼터니언 `(x, y, z, w)`으로 정밀 변환.
+     - `HandleSpawnerLaunchEvent`:
+       - `launchParams`에서 `logicalOrientationProvider`(+0x58) 및 `visualOrientationProvider`(+0x78) 포인터 추출.
+       - 카메라 위치, 목표물 좌표, TweakDB 단검 속력 `110.0f` 및 중력 가속도 `20.0f`를 이용해 `CalculateBallisticTrajectory`로 중력 보정 포물선 회전 행렬 산출.
+       - 행렬을 쿼터니언으로 변환 후 atomic 상태에 250ms 타임아웃으로 arming.
+     - `HookFuncOrientationGet`:
+       - 원본 함수를 먼저 호출하여 안전하게 기본값을 채운 뒤, arming된 프로바이더 인스턴스(`thisPtr == logical || thisPtr == visual`)에 대해 `outQuat`을 계산된 탄도 쿼터니언으로 오버라이드.
+     - `AddOrientationProviderHook`: 패턴 스캔을 통해 슬롯 33 MinHook 설치 및 `Shutdown` 해제 연동.
+  3. `src/ui/widgets.cpp`:
+     - 오버레이 진단 UI에 `orientation redirects`, `spawner launch events`, `spawner launch redirects` 실시간 메트릭 표시 연동.
+  4. `src/features/aimbot.cpp`:
+     - 정기 진단 로그에 `orientHook`, `orientRedirects` 추가.
+- **빌드 및 런타임 인젝션 검증**:
+  - `python tools/scripts/inject.py --name Cyberpunk2077.exe --unload`로 기존 트레이너 안전 언로드 완료.
+  - `cmake --build build --config Release` 컴파일 및 링크 성공 (0 경고, 0 에러).
+  - `python tools/scripts/inject.py --name Cyberpunk2077.exe --dll build/bin/Release/cp2077_trainer.dll` 재주입 완료.
+  - 로그 확인:
+    - `silent aim func orientation get scan: matches=1 target=00007FF67ECD5524`
+    - `silent aim func orientation get hook created: target=00007FF67ECD5524 original=00007FF67E850DC0 mutation=1`
+    - `silent aim hooks created: producers=0 projectileListeners=1 weaponListenerHooks=0 queueHook=1 crosshairCore=1 orientationHook=1`
+  - 게임 내에서 안정적으로 크래시 없이 동작 확인.
+

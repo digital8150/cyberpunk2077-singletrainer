@@ -1,5 +1,6 @@
 #include "silent_aim.h"
 
+#include "projection.h"
 #include "rtti_invoker.h"
 #include "signature_scanner.h"
 #include "../diagnostics.h"
@@ -44,6 +45,8 @@ namespace
     constexpr std::uint64_t kShootTargetEventType = Game::Rtti::Hash("gameprojectileShootTargetEvent");
     constexpr std::uint64_t kSetUpEventType = Game::Rtti::Hash("gameprojectileSetUpEvent");
     constexpr std::uint64_t kSpawnerLaunchEventType = Game::Rtti::Hash("gameprojectileSpawnerLaunchEvent");
+    constexpr std::size_t kSpawnerLogicalOrientOffset = 0x58;
+    constexpr std::size_t kSpawnerVisualOrientOffset = 0x78;
     constexpr std::size_t kSpawnerOwnerOffset = 0xA8;
     constexpr std::size_t kSpawnerTargetPosOffset = 0xD0;
     constexpr std::uint64_t kWeaponShootEventType = Game::Rtti::Hash("gameweaponeventsShootEvent");
@@ -65,6 +68,15 @@ namespace
     };
     constexpr char kNativeCrosshairMask[] = "xxxxxxxxxx????xxxxxxxxxxxxxxxxxxxxxxx";
     static_assert(sizeof(kNativeCrosshairPattern) == sizeof(kNativeCrosshairMask) - 1);
+    // entFuncOrientationProvider::GetOrientation (slot 33) pattern on Cyberpunk 2077 2.31.
+    // Evaluates launch quaternion for throwing knives/axes spawned from screen center.
+    constexpr std::uint8_t kFuncOrientationGetPattern[] = {
+        0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x49, 0x78,
+        0x48, 0x8B, 0xDA, 0x48, 0x85, 0xC9, 0x74, 0x00, 0x48, 0x8B,
+        0x01, 0x48, 0x8D, 0x54,
+    };
+    constexpr char kFuncOrientationGetMask[] = "xxxxxxxxxxxxxxxxx?xxxxxx";
+    static_assert(sizeof(kFuncOrientationGetPattern) == sizeof(kFuncOrientationGetMask) - 1);
 
     struct DynArrayLayout
     {
@@ -147,6 +159,7 @@ namespace
     using QueueEventInternalFn = void (*)(void*, Game::Rtti::Handle*);
     using NativeCrosshairCoreFn = void (*)(void*, Vector4Layout*, Vector4Layout*, Vector4Layout*,
                                            void*, float, void*, bool);
+    using FuncOrientationGetFn = Vector4Layout* (*)(void*, Vector4Layout*);
     using ResolveAddressFn = std::uintptr_t (*)(std::uint32_t);
 
     enum class ListenerHookKind : std::uint8_t
@@ -171,6 +184,7 @@ namespace
         std::atomic_bool hookCreated{false};
         std::atomic_bool queueHookCreated{false};
         std::atomic_bool crosshairCoreHookCreated{false};
+        std::atomic_bool orientationHookCreated{false};
         std::atomic_uint32_t listenerHooks{0};
         std::atomic_bool targetActive{false};
         std::atomic<float> targetX{0.0f};
@@ -199,6 +213,18 @@ namespace
         std::atomic_uint64_t nativeCrosshairCoreRedirects{0};
         std::atomic_uint64_t spawnerLaunchEvents{0};
         std::atomic_uint64_t spawnerLaunchRedirects{0};
+        std::atomic<void*> spawnerLogicalProvider{nullptr};
+        std::atomic<void*> spawnerVisualProvider{nullptr};
+        std::atomic<float> spawnerQuatX{0.0f};
+        std::atomic<float> spawnerQuatY{0.0f};
+        std::atomic<float> spawnerQuatZ{0.0f};
+        std::atomic<float> spawnerQuatW{1.0f};
+        std::atomic<ULONGLONG> spawnerArmedAt{0};
+        std::atomic_uint64_t orientationRedirects{0};
+        std::atomic<float> lastCameraX{0.0f};
+        std::atomic<float> lastCameraY{0.0f};
+        std::atomic<float> lastCameraZ{0.0f};
+        std::atomic_bool lastCameraValid{false};
     };
 
     State g_state;
@@ -214,6 +240,8 @@ namespace
     QueueEventInternalFn g_originalQueueEventInternal = nullptr;
     void* g_nativeCrosshairCoreTarget = nullptr;
     NativeCrosshairCoreFn g_originalNativeCrosshairCore = nullptr;
+    void* g_funcOrientationGetTarget = nullptr;
+    FuncOrientationGetFn g_originalFuncOrientationGet = nullptr;
     std::array<void*, kMaxProducerHooks> g_producerHookTargets{};
     std::array<NativeHandlerFn, kMaxProducerHooks> g_originalProducerHandlers{};
     std::array<ProducerHookKind, kMaxProducerHooks> g_producerHookKinds{};
@@ -316,6 +344,14 @@ namespace
         if (HookLifecycle::IsShuttingDown())
             return;
 
+        if (origin && std::isfinite(origin->x) && std::isfinite(origin->y) && std::isfinite(origin->z))
+        {
+            g_state.lastCameraX.store(origin->x, std::memory_order_relaxed);
+            g_state.lastCameraY.store(origin->y, std::memory_order_relaxed);
+            g_state.lastCameraZ.store(origin->z, std::memory_order_relaxed);
+            g_state.lastCameraValid.store(true, std::memory_order_release);
+        }
+
         const bool redirected = RedirectNativeCrosshairSafely(origin, direction);
 
         const std::uint64_t count =
@@ -377,6 +413,71 @@ namespace
         g_state.crosshairCoreHookCreated.store(true, std::memory_order_release);
         Diagnostics::Log("silent aim native crosshair core hook created: target=%p original=%p mutation=1",
                          coreTarget, reinterpret_cast<void*>(g_originalNativeCrosshairCore));
+        return true;
+    }
+
+    Vector4Layout* HookFuncOrientationGet(void* thisPtr, Vector4Layout* outQuat)
+    {
+        HookLifecycle::CallbackGuard guard;
+        Vector4Layout* result = nullptr;
+        if (g_originalFuncOrientationGet)
+            result = g_originalFuncOrientationGet(thisPtr, outQuat);
+        if (HookLifecycle::IsShuttingDown())
+            return result;
+
+        if (!outQuat)
+            return result;
+
+        const ULONGLONG armedAt = g_state.spawnerArmedAt.load(std::memory_order_acquire);
+        const ULONGLONG now = GetTickCount64();
+        if (armedAt == 0 || now < armedAt || now - armedAt > kTargetTimeoutMilliseconds)
+            return result;
+
+        void* logical = g_state.spawnerLogicalProvider.load(std::memory_order_acquire);
+        void* visual = g_state.spawnerVisualProvider.load(std::memory_order_acquire);
+        if ((logical != nullptr && thisPtr == logical) || (visual != nullptr && thisPtr == visual))
+        {
+            outQuat->x = g_state.spawnerQuatX.load(std::memory_order_relaxed);
+            outQuat->y = g_state.spawnerQuatY.load(std::memory_order_relaxed);
+            outQuat->z = g_state.spawnerQuatZ.load(std::memory_order_relaxed);
+            outQuat->w = g_state.spawnerQuatW.load(std::memory_order_relaxed);
+
+            const std::uint64_t count =
+                g_state.orientationRedirects.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 12 || (count & (count - 1)) == 0)
+            {
+                Diagnostics::Log("silent aim orientation provider redirected: count=%llu provider=%p "
+                                 "(logical=%p visual=%p) quat=(%.4f,%.4f,%.4f,%.4f)",
+                                 static_cast<unsigned long long>(count), thisPtr, logical, visual,
+                                 outQuat->x, outQuat->y, outQuat->z, outQuat->w);
+            }
+        }
+        return result;
+    }
+
+    bool AddOrientationProviderHook()
+    {
+        const Game::Signatures::ScanResult scan = Game::Signatures::FindInText(
+            GetModuleHandleW(L"Cyberpunk2077.exe"), kFuncOrientationGetPattern, kFuncOrientationGetMask,
+            sizeof(kFuncOrientationGetPattern));
+        Diagnostics::Log("silent aim func orientation get scan: matches=%zu target=%p",
+                         scan.matches, scan.address);
+        if (scan.matches != 1 || !scan.address)
+            return false;
+
+        const MH_STATUS status = MH_CreateHook(
+            scan.address, reinterpret_cast<void*>(&HookFuncOrientationGet),
+            reinterpret_cast<void**>(&g_originalFuncOrientationGet));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("MH_CreateHook(silent aim func orientation get) failed: target=%p status=%s (%d)",
+                             scan.address, MH_StatusToString(status), status);
+            return false;
+        }
+        g_funcOrientationGetTarget = scan.address;
+        g_state.orientationHookCreated.store(true, std::memory_order_release);
+        Diagnostics::Log("silent aim func orientation get hook created: target=%p original=%p mutation=1",
+                         scan.address, reinterpret_cast<void*>(g_originalFuncOrientationGet));
         return true;
     }
 
@@ -514,6 +615,82 @@ namespace
         return true;
     }
 
+    Vector4Layout MatrixToQuaternion(const MatrixLayout& m)
+    {
+        // Shepperd's algorithm for converting rotation matrix to unit quaternion.
+        // Row 0: right (rx, ry, rz)
+        // Row 1: forward (fx, fy, fz)
+        // Row 2: up (ux, uy, uz)
+        const float m00 = m.x.x;
+        const float m01 = m.x.y;
+        const float m02 = m.x.z;
+
+        const float m10 = m.y.x;
+        const float m11 = m.y.y;
+        const float m12 = m.y.z;
+
+        const float m20 = m.z.x;
+        const float m21 = m.z.y;
+        const float m22 = m.z.z;
+
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float w = 1.0f;
+
+        const float trace = m00 + m11 + m22;
+        if (trace > 0.0f)
+        {
+            const float s = std::sqrt(trace + 1.0f) * 2.0f;
+            w = 0.25f * s;
+            x = (m12 - m21) / s;
+            y = (m20 - m02) / s;
+            z = (m01 - m10) / s;
+        }
+        else if (m00 > m11 && m00 > m22)
+        {
+            const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+            w = (m12 - m21) / s;
+            x = 0.25f * s;
+            y = (m10 + m01) / s;
+            z = (m20 + m02) / s;
+        }
+        else if (m11 > m22)
+        {
+            const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+            w = (m20 - m02) / s;
+            x = (m10 + m01) / s;
+            y = 0.25f * s;
+            z = (m21 + m12) / s;
+        }
+        else
+        {
+            const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+            w = (m01 - m10) / s;
+            x = (m20 + m02) / s;
+            y = (m21 + m12) / s;
+            z = 0.25f * s;
+        }
+
+        const float lenSq = x * x + y * y + z * z + w * w;
+        if (lenSq > 0.000001f)
+        {
+            const float invLen = 1.0f / std::sqrt(lenSq);
+            x *= invLen;
+            y *= invLen;
+            z *= invLen;
+            w *= invLen;
+        }
+        else
+        {
+            x = 0.0f;
+            y = 0.0f;
+            z = 0.0f;
+            w = 1.0f;
+        }
+        return {x, y, z, w};
+    }
+
     void HandleSpawnerLaunchEvent(void* entity, void* event)
     {
         if (!event || !kEnableProjectileMutation)
@@ -536,13 +713,64 @@ namespace
             targetPos->z = target[2];
             targetPos->w = 1.0f;
 
+            void* logicalProvider = nullptr;
+            void* visualProvider = nullptr;
+            const auto* logicalHandle = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerLogicalOrientOffset);
+            if (logicalHandle)
+                logicalProvider = logicalHandle->instance;
+            const auto* visualHandle = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerVisualOrientOffset);
+            if (visualHandle)
+                visualProvider = visualHandle->instance;
+
+            Vector4Layout start{};
+            bool startValid = false;
+            if (g_state.lastCameraValid.load(std::memory_order_acquire))
+            {
+                start.x = g_state.lastCameraX.load(std::memory_order_relaxed);
+                start.y = g_state.lastCameraY.load(std::memory_order_relaxed);
+                start.z = g_state.lastCameraZ.load(std::memory_order_relaxed);
+                start.w = 1.0f;
+                startValid = true;
+            }
+            if (!startValid)
+            {
+                float camPos[3]{};
+                if (Game::Projection::GetCameraPosition(camPos))
+                {
+                    start.x = camPos[0];
+                    start.y = camPos[1];
+                    start.z = camPos[2];
+                    start.w = 1.0f;
+                    startValid = true;
+                }
+            }
+
+            if (startValid)
+            {
+                Vector4Layout launchVel{};
+                MatrixLayout launchRot{};
+                constexpr float kDefaultKnifeSpeed = 110.0f;
+                if (CalculateBallisticTrajectory(start, target, kDefaultKnifeSpeed, launchVel, launchRot))
+                {
+                    const Vector4Layout quat = MatrixToQuaternion(launchRot);
+                    g_state.spawnerQuatX.store(quat.x, std::memory_order_relaxed);
+                    g_state.spawnerQuatY.store(quat.y, std::memory_order_relaxed);
+                    g_state.spawnerQuatZ.store(quat.z, std::memory_order_relaxed);
+                    g_state.spawnerQuatW.store(quat.w, std::memory_order_relaxed);
+                    g_state.spawnerLogicalProvider.store(logicalProvider, std::memory_order_release);
+                    g_state.spawnerVisualProvider.store(visualProvider, std::memory_order_release);
+                    g_state.spawnerArmedAt.store(GetTickCount64(), std::memory_order_release);
+                }
+            }
+
             g_state.spawnerLaunchRedirects.fetch_add(1, std::memory_order_relaxed);
             const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
             if (redirected <= 8 || (redirected % 16u) == 0)
             {
-                Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p target=(%.2f,%.2f,%.2f)",
+                Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p "
+                                 "target=(%.2f,%.2f,%.2f) logical=%p visual=%p",
                                  static_cast<unsigned long long>(redirected), entity, owner->instance,
-                                 target[0], target[1], target[2]);
+                                 target[0], target[1], target[2], logicalProvider, visualProvider);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1192,13 +1420,15 @@ namespace Game::SilentAim
             {
                 created = AddQueueEventObservationHook() || created;
             }
+            created = AddOrientationProviderHook() || created;
             g_state.hookCreated.store(created, std::memory_order_release);
             Diagnostics::Log("silent aim hooks created: producers=%u projectileListeners=%u "
-                             "weaponListenerHooks=0 queueHook=%u crosshairCore=%u",
+                             "weaponListenerHooks=0 queueHook=%u crosshairCore=%u orientationHook=%u",
                              g_state.producerHooks.load(std::memory_order_relaxed),
                              g_state.listenerHooks.load(std::memory_order_relaxed),
                              g_state.queueHookCreated.load(std::memory_order_acquire) ? 1u : 0u,
-                             g_state.crosshairCoreHookCreated.load(std::memory_order_acquire) ? 1u : 0u);
+                             g_state.crosshairCoreHookCreated.load(std::memory_order_acquire) ? 1u : 0u,
+                             g_state.orientationHookCreated.load(std::memory_order_acquire) ? 1u : 0u);
             return created;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1239,6 +1469,7 @@ namespace Game::SilentAim
         result.crosshairCoreHookCreated = g_state.crosshairCoreHookCreated.load(std::memory_order_acquire);
         result.projectileHookCreated = g_state.queueHookCreated.load(std::memory_order_acquire) ||
                                        g_state.listenerHooks.load(std::memory_order_relaxed) > 0;
+        result.orientationHookCreated = g_state.orientationHookCreated.load(std::memory_order_acquire);
         result.listenerHooks = g_state.listenerHooks.load(std::memory_order_relaxed);
         result.producerHooks = g_state.producerHooks.load(std::memory_order_relaxed);
         result.callbacks = g_state.callbacks.load(std::memory_order_relaxed);
@@ -1257,6 +1488,9 @@ namespace Game::SilentAim
         result.nativeCrosshairCoreCalls = g_state.nativeCrosshairCoreCalls.load(std::memory_order_relaxed);
         result.nativeCrosshairCoreRedirects =
             g_state.nativeCrosshairCoreRedirects.load(std::memory_order_relaxed);
+        result.spawnerLaunchEvents = g_state.spawnerLaunchEvents.load(std::memory_order_relaxed);
+        result.spawnerLaunchRedirects = g_state.spawnerLaunchRedirects.load(std::memory_order_relaxed);
+        result.orientationRedirects = g_state.orientationRedirects.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -1287,6 +1521,14 @@ namespace Game::SilentAim
         g_nativeCrosshairCoreTarget = nullptr;
         g_originalNativeCrosshairCore = nullptr;
         g_state.crosshairCoreHookCreated.store(false, std::memory_order_release);
+        if (g_funcOrientationGetTarget)
+            MH_RemoveHook(g_funcOrientationGetTarget);
+        g_funcOrientationGetTarget = nullptr;
+        g_originalFuncOrientationGet = nullptr;
+        g_state.orientationHookCreated.store(false, std::memory_order_release);
+        g_state.spawnerLogicalProvider.store(nullptr, std::memory_order_release);
+        g_state.spawnerVisualProvider.store(nullptr, std::memory_order_release);
+        g_state.spawnerArmedAt.store(0, std::memory_order_release);
         const std::uint32_t producerCount = g_state.producerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < producerCount && index < kMaxProducerHooks; ++index)
         {
@@ -1300,7 +1542,7 @@ namespace Game::SilentAim
         Diagnostics::Log("silent aim shutdown: callbacks=%llu queue=%llu projectile=%llu weapon=%llu local=%llu validated=%llu "
                          "redirected=%llu rejected=%llu effectRun=%llu attackStart=%llu attackPrepare=%llu "
                          "crosshair=%llu defaultCrosshair=%llu nativeCrosshairCore=%llu "
-                         "nativeCrosshairRedirects=%llu",
+                         "nativeCrosshairRedirects=%llu spawnerLaunchRedirects=%llu orientationRedirects=%llu",
                          static_cast<unsigned long long>(g_state.callbacks.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.queueCallbacks.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.projectileEvents.load(std::memory_order_relaxed)),
@@ -1315,6 +1557,8 @@ namespace Game::SilentAim
                          static_cast<unsigned long long>(g_state.crosshairCalls.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.defaultCrosshairCalls.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(g_state.nativeCrosshairCoreCalls.load(std::memory_order_relaxed)),
-                         static_cast<unsigned long long>(g_state.nativeCrosshairCoreRedirects.load(std::memory_order_relaxed)));
+                         static_cast<unsigned long long>(g_state.nativeCrosshairCoreRedirects.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_state.spawnerLaunchRedirects.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_state.orientationRedirects.load(std::memory_order_relaxed)));
     }
 }
