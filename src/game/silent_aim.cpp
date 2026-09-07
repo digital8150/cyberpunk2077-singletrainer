@@ -1,6 +1,5 @@
 #include "silent_aim.h"
 
-#include "projection.h"
 #include "rtti_invoker.h"
 #include "signature_scanner.h"
 #include "../diagnostics.h"
@@ -47,9 +46,6 @@ namespace
     constexpr std::uint64_t kSpawnerLaunchEventType = Game::Rtti::Hash("gameprojectileSpawnerLaunchEvent");
     constexpr std::size_t kSpawnerOwnerOffset = 0xA8;
     constexpr std::size_t kSpawnerTargetPosOffset = 0xD0;
-    constexpr std::size_t kSpawnerLogicalOrientOffset = 0x058;
-    constexpr std::size_t kSpawnerVisualOrientOffset = 0x078;
-    constexpr std::size_t kSpawnerGuidedOffset = 0x104;
     constexpr std::uint64_t kWeaponShootEventType = Game::Rtti::Hash("gameweaponeventsShootEvent");
     constexpr std::uint64_t kPlayerPuppetType = Game::Rtti::Hash("PlayerPuppet");
     constexpr std::uint64_t kGamePlayerPuppetType = Game::Rtti::Hash("gamePlayerPuppet");
@@ -143,78 +139,6 @@ namespace
     };
     static_assert(sizeof(MatrixLayout) == 0x40);
 
-    struct QuaternionLayout
-    {
-        float i; // x
-        float j; // y
-        float k; // z
-        float r; // w
-    };
-    static_assert(sizeof(QuaternionLayout) == 0x10);
-
-    // Shortest-arc quaternion from REDengine forward vector (0, 1, 0) to direction (dx, dy, dz).
-    QuaternionLayout FromForwardVector(float dx, float dy, float dz)
-    {
-        const float lenSq = dx * dx + dy * dy + dz * dz;
-        if (!std::isfinite(lenSq) || lenSq < 0.0001f)
-            return {0.0f, 0.0f, 0.0f, 1.0f};
-
-        const float invLen = 1.0f / std::sqrt(lenSq);
-        const float nx = dx * invLen;
-        const float ny = dy * invLen;
-        const float nz = dz * invLen;
-
-        // Base forward = (0, 1, 0).
-        // v0 x v = (1*nz - 0*ny, 0*nx - 0*nz, 0*ny - 1*nx) = (nz, 0, -nx).
-        // v0 . v = ny.
-        float qx = nz;
-        float qy = 0.0f;
-        float qz = -nx;
-        float qw = 1.0f + ny;
-
-        if (qw < 0.0001f)
-        {
-            // Vector pointing backwards (0, -1, 0): 180-degree rotation around up (0, 0, 1).
-            qx = 0.0f;
-            qy = 0.0f;
-            qz = 1.0f;
-            qw = 0.0f;
-        }
-        else
-        {
-            const float qLen = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
-            if (qLen > 0.0001f)
-            {
-                const float invQLen = 1.0f / qLen;
-                qx *= invQLen;
-                qy *= invQLen;
-                qz *= invQLen;
-                qw *= invQLen;
-            }
-        }
-        return {qx, qy, qz, qw};
-    }
-
-    void RedirectOrientationProviderSafely(void* provider, const QuaternionLayout& quat)
-    {
-        if (!provider || !Game::Rtti::IsValidUserPointer(provider))
-            return;
-        __try
-        {
-            auto* quatPtr = reinterpret_cast<QuaternionLayout*>(static_cast<std::byte*>(provider) + 0x30);
-            *quatPtr = quat;
-            void* inner = *reinterpret_cast<void**>(static_cast<std::byte*>(provider) + 0x78);
-            if (inner && Game::Rtti::IsValidUserPointer(inner))
-            {
-                auto* innerQuat = reinterpret_cast<QuaternionLayout*>(static_cast<std::byte*>(inner) + 0x30);
-                *innerQuat = quat;
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-        }
-    }
-
     // Native REDengine event listeners use Callback<void(IScriptable&, Handle<IScriptable>&)> with an unbound
     // function target. Its shared invoke thunk unwraps Handle::instance before tail-calling this target, so the
     // verified native ABI is (listener instance, event instance), not (listener instance, Handle*).
@@ -252,10 +176,6 @@ namespace
         std::atomic<float> targetX{0.0f};
         std::atomic<float> targetY{0.0f};
         std::atomic<float> targetZ{0.0f};
-        std::atomic<float> cameraX{0.0f};
-        std::atomic<float> cameraY{0.0f};
-        std::atomic<float> cameraZ{0.0f};
-        std::atomic_bool cameraValid{false};
         std::atomic_uint64_t targetGeneration{0};
         std::atomic_uint64_t targetPublishedAt{0};
         std::atomic_uint64_t callbacks{0};
@@ -313,7 +233,7 @@ namespace
                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
     }
 
-    bool ReadTarget(float output[3], float outCamera[3] = nullptr)
+    bool ReadTarget(float output[3])
     {
         if (!g_state.targetActive.load(std::memory_order_acquire))
             return false;
@@ -329,28 +249,9 @@ namespace
             output[0] = g_state.targetX.load(std::memory_order_relaxed);
             output[1] = g_state.targetY.load(std::memory_order_relaxed);
             output[2] = g_state.targetZ.load(std::memory_order_relaxed);
-            const bool camValid = g_state.cameraValid.load(std::memory_order_relaxed);
-            const float cx = g_state.cameraX.load(std::memory_order_relaxed);
-            const float cy = g_state.cameraY.load(std::memory_order_relaxed);
-            const float cz = g_state.cameraZ.load(std::memory_order_relaxed);
             const std::uint64_t after = g_state.targetGeneration.load(std::memory_order_acquire);
             if (before == after)
             {
-                if (outCamera)
-                {
-                    if (camValid)
-                    {
-                        outCamera[0] = cx;
-                        outCamera[1] = cy;
-                        outCamera[2] = cz;
-                    }
-                    else
-                    {
-                        outCamera[0] = output[0];
-                        outCamera[1] = output[1];
-                        outCamera[2] = output[2];
-                    }
-                }
                 return std::isfinite(output[0]) && std::isfinite(output[1]) && std::isfinite(output[2]);
             }
         }
@@ -626,8 +527,7 @@ namespace
                 return;
 
             float target[3]{};
-            float camera[3]{};
-            if (!ReadTarget(target, camera))
+            if (!ReadTarget(target))
                 return;
 
             auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kSpawnerTargetPosOffset);
@@ -636,33 +536,11 @@ namespace
             targetPos->z = target[2];
             targetPos->w = 1.0f;
 
-            // Set smartGunIsProjectileGuided at +0x104
-            *reinterpret_cast<bool*>(bytes + kSpawnerGuidedOffset) = true;
-
-            // Redirect logical and visual orientation providers towards target
-            const float dx = target[0] - camera[0];
-            const float dy = target[1] - camera[1];
-            const float dz = target[2] - camera[2];
-            const QuaternionLayout quat = FromForwardVector(dx, dy, dz);
-
-            const auto* logicalHandle = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerLogicalOrientOffset);
-            if (logicalHandle && logicalHandle->instance)
-            {
-                RedirectOrientationProviderSafely(logicalHandle->instance, quat);
-            }
-
-            const auto* visualHandle = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerVisualOrientOffset);
-            if (visualHandle && visualHandle->instance)
-            {
-                RedirectOrientationProviderSafely(visualHandle->instance, quat);
-            }
-
             g_state.spawnerLaunchRedirects.fetch_add(1, std::memory_order_relaxed);
             const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
             if (redirected <= 8 || (redirected % 16u) == 0)
             {
-                Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p "
-                                 "target=(%.2f,%.2f,%.2f) guided=1",
+                Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p target=(%.2f,%.2f,%.2f)",
                                  static_cast<unsigned long long>(redirected), entity, owner->instance,
                                  target[0], target[1], target[2]);
             }
@@ -794,11 +672,6 @@ namespace
             targetPos->y = target[1];
             targetPos->z = target[2];
             targetPos->w = 1.0f;
-        }
-
-        if (Game::Rtti::ClassSize(type) >= 0x154 + sizeof(bool))
-        {
-            *reinterpret_cast<bool*>(bytes + 0x154) = true;
         }
 
         const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1347,18 +1220,6 @@ namespace Game::SilentAim
         g_state.targetX.store(worldTarget[0], std::memory_order_relaxed);
         g_state.targetY.store(worldTarget[1], std::memory_order_relaxed);
         g_state.targetZ.store(worldTarget[2], std::memory_order_relaxed);
-        float cam[3]{};
-        if (Game::Projection::GetCameraPosition(cam))
-        {
-            g_state.cameraX.store(cam[0], std::memory_order_relaxed);
-            g_state.cameraY.store(cam[1], std::memory_order_relaxed);
-            g_state.cameraZ.store(cam[2], std::memory_order_relaxed);
-            g_state.cameraValid.store(true, std::memory_order_relaxed);
-        }
-        else
-        {
-            g_state.cameraValid.store(false, std::memory_order_relaxed);
-        }
         g_state.targetPublishedAt.store(GetTickCount64(), std::memory_order_release);
         g_state.targetGeneration.fetch_add(1, std::memory_order_release);
         g_state.targetActive.store(true, std::memory_order_release);
@@ -1368,7 +1229,6 @@ namespace Game::SilentAim
     {
         g_state.targetActive.store(false, std::memory_order_release);
         g_state.targetPublishedAt.store(0, std::memory_order_release);
-        g_state.cameraValid.store(false, std::memory_order_release);
     }
 
     DiagnosticsSnapshot GetDiagnostics()

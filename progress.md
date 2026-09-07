@@ -2821,3 +2821,56 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
   4. `src/features/aimbot.cpp`: `PublishTarget(bestWorld, true)`로 호출 단순화.
 - **빌드 검증**:
   - `cmake --build build --config Release` 정상 컴파일 및 링크 완료 (경고 0, 에러 0).
+
+## 2026-09-07 — PID 15808 재발 크래시 정밀 역어셈블 및 근본 원인 규명: Orientation Provider `+0x30` 포인터 훼손 제거
+
+- **재발 크래시 현상 및 문제 제기**:
+  - WeakHandle 조작 코드를 전면 제거한 패치 적용 후 테스트 인젝션에서 여전히 동일한 주소(`Cyberpunk2077.exe+0x25161B`)에서 `ACCESS_VIOLATION` (unhandled) 크래시 재발 (`cp2077_fatal.log`, PID 15808).
+  - 폴트 주소: `0x000000003A9F40E1` (`rcx = 0x000000003A9F3E18`, `rcx + 0x2C9 = 0x3A9F40E1`).
+  - PID 3180의 폴트 주소 `0x000000003CFA32BB` (`rcx = 0x000000003CFA2FF2`)와 비교 시 상위 32비트가 `0x00000000`이고 하위 32비트만 미세하게 다른 유저모드 저위 주소 패턴이 완전히 동일함.
+- **`+0x25161B` 및 상위 호출자 역어셈블 분석**:
+  1. `Cyberpunk2077.exe+0x25161B` (`sub_251600+1B`):
+     ```asm
+     test byte ptr [rcx+2C9h], 1
+     jz ...
+     ```
+  2. 호출자 `Cyberpunk2077.exe+0x1493A1` (`sub_14934C+55h`):
+     ```asm
+     mov rcx, [rbx+30h]   ; rbx = 소멸 중인 객체
+     test rcx, rcx
+     jz ...
+     call sub_251600      ; rcx가 가리키는 자식 객체의 플래그 검사
+     ```
+  3. `sub_14934C`는 소멸자 `sub_14A200`에서 호출되는 자식 리소스 정리 루틴임. 즉 `[rbx + 0x30]`은 64비트 포인터임.
+- **수학적·아키텍처적 근본 원인 증명 (IEEE-754 Float Bitfield 포인터 오염)**:
+  - `RedirectOrientationProviderSafely`에서 수행하던 메모리 쓰기:
+    ```cpp
+    auto* quatPtr = reinterpret_cast<QuaternionLayout*>(static_cast<std::byte*>(provider) + 0x30);
+    *quatPtr = quat; // {qx, qy, qz, qw}
+    ```
+  - `provider + 0x30`은 쿼터니언이 아니라 내부 자식 객체의 64비트 포인터(`void*`) 슬롯이었음.
+  - 리틀 엔디안 64비트 메모리에서 `[provider + 0x30]`의 하위 8바이트는 `[qx (4바이트) | qy (4바이트)]`로 해석됨.
+  - `FromForwardVector` 구현:
+    - `float qx = nz;` (타깃을 향한 피치 정규화 z 벡터, 통상 0에 가까운 작은 양수)
+    - `float qy = 0.0f;` (`0x00000000`)
+  - 하위 32비트 IEEE-754 부동소수점 역변환:
+    - PID 15808: `0x3A9F3E18` -> `0.00121492` (`float`)
+    - PID 3180: `0x3CFA2FF2` -> `0.03054044` (`float`)
+  - 상위 32비트: `qy = 0.0f` (`0x00000000`).
+  - 결과적으로 64비트 포인터가 완벽하게 `(0x00000000 << 32) | float_bits(nz)`로 오염되어 `0x000000003A9F3E18` 및 `0x000000003CFA2FF2`가 생성된 것임.
+  - 객체 소멸 시 `[provider + 0x30]`을 포인터로 읽어 `[rcx + 0x2C9]`를 역참조하면서 프로세스 즉사 크래시가 발생함. (이전 가설인 WeakHandle refCount UAF는 잘못된 추정이었음이 수학적으로 최종 반증됨).
+- **조치 사항 (Orientation Provider 조작 및 미검증 메모리 쓰기 전면 제거)**:
+  1. `src/game/silent_aim.cpp`:
+     - `FromForwardVector`, `QuaternionLayout`, `RedirectOrientationProviderSafely` 전면 삭제.
+     - `kSpawnerLogicalOrientOffset`(+0x138), `kSpawnerVisualOrientOffset`(+0x148), `kSpawnerGuidedOffset`(+0x104) 오프셋 정의 제거.
+     - `HandleSpawnerLaunchEvent`: orientation provider 및 `smartGunIsProjectileGuided` 조작 제거, 순수 좌표(`kSpawnerTargetPosOffset`, `targetPosition`) 리다이렉션만 유지.
+     - `RedirectProjectileEvent`: `0x154` 오프셋 쓰기 제거, 탄도학 벡터 및 좌표 리다이렉션만 유지.
+     - `g_state`: 불필요해진 카메라 좌표 원자 변수(`cameraX`, `cameraY`, `cameraZ`, `cameraValid`) 제거.
+     - `ReadTarget`, `PublishTarget`, `ClearTarget`: 카메라 관련 인자 제거 및 단순화.
+  2. `reports/INSIGHTS.md`:
+     - §1.6 "포인터처럼 보이는 낮은 유저모드 주소는 부동소수점(IEEE-754) 비트열일 수 있다" 추가.
+  3. `reports/2026-09-07_crash_analysis_pid15808.md`:
+     - 상세 역어셈블 및 부동소수점 수학적 증명 보고서 작성.
+- **빌드 및 검증**:
+  - `cmake --build build --config Release` 정상 컴파일 및 링크 완료 (경고 0, 에러 0).
+  - 유해한 미검증 오프셋 쓰기가 100% 제거되어 엔진 내부 소멸자 포인터 오염 원천 차단.
