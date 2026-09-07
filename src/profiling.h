@@ -13,6 +13,7 @@ namespace Diagnostics::Profile
         SnapshotPass,      // GetPuppetSnapshots 전체 (락 대기 포함). 프레임당 1회 — esp/aimbot과 형제 슬롯이다.
         SnapshotLockWait,  // 그중 g_puppetListLock 배타 획득 대기
         SnapshotPuppets,   // 패스당 복사된 스냅샷 개수 (시간이 아니라 개수)
+        PoseRequestPass,   // Consumer filtering, projection and request publication on Present.
         EspFrame,          // Esp::DrawOverlay 전체 (스냅샷 패스는 제외 — 호출자가 먼저 돌린다)
         AimbotFrame,       // Aimbot::RunFrame 전체
 
@@ -33,6 +34,17 @@ namespace Diagnostics::Profile
         AttitudeInvoke,
         HighlightCollect,
 
+        PoseRequested,
+        PoseEligible,
+        PoseProcessed,
+        PoseDeferred,
+        PoseIntervalMs,
+        EspPoseAgeMs,
+        AimPoseAgeMs,
+        PoseRequestCivilian,
+        PoseRequestEnemy,
+        PoseRequestPolice,
+        PoseRequestOther,
         Count,
     };
 
@@ -55,7 +67,7 @@ namespace Diagnostics::Profile
     // 기록되지만, 이 경계 사이의 Present 슬롯 합계는 그래프용으로 별도 보존된다.
     void BeginPresentFrame();
     void EndPresentFrame();
-    // 마지막으로 완료된 Present 경로의 SnapshotPass + EspFrame + AimbotFrame 합계(us). profiling이 꺼져
+    // 마지막으로 완료된 Present 경로의 SnapshotPass + PoseRequestPass + EspFrame + AimbotFrame 합계(us). profiling이 꺼져
     // 있으면 0을 반환한다. SnapshotPass는 호출자가 실제로 스냅샷을 요청한 프레임에만 포함된다.
     std::uint64_t LastPresentMicroseconds();
     // 마지막으로 완료된 게임 메인 틱의 TickTotal(us). profiling이 꺼져 있으면 0을 반환한다.

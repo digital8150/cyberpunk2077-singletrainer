@@ -101,6 +101,7 @@ namespace Game::EntityTracker
 
     struct PuppetSnapshot
     {
+        std::uint64_t poseUpdatedAt = 0; // GetTickCount64, zero until first complete sample.
         std::uint64_t entityId = 0;
         float position[3]{};
         float orientation[4]{0.0f, 0.0f, 0.0f, 1.0f};
@@ -136,6 +137,8 @@ namespace Game::EntityTracker
 
     // Refreshes registered NPC pointers defensively and copies only validated ID/position snapshots to the caller.
     std::size_t GetPuppetSnapshots(PuppetSnapshot* output, std::size_t capacity);
+    // Replaces the entire request set; IDs only, no game calls. Unselected requests are cancelled immediately.
+    void PublishPoseRequests(const std::uint64_t* entityIds, std::size_t count);
 
     // Publishes the desired native highlight settings. Event allocation and QueueEvent execution happen only from
     // OnGameMainTick.

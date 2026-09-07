@@ -1,5 +1,6 @@
 #include "esp.h"
 #include "features.h"
+#include "target_filters.h"
 #include "../diagnostics.h"
 #include "../game/entity_tracker.h"
 #include "../game/projection.h"
@@ -30,20 +31,21 @@ namespace Esp
         {
             using Game::EntityTracker::Hostility;
             using Game::EntityTracker::NpcCategory;
+            const bool enabled = Features::TargetFilters::EspCategory(category, hostility, settings);
             // The archetype is fixed at spawn, so an NPC that turns on the player is only red because of this.
             // Police stay under their own toggle even while hostile.
             if (hostility == Hostility::Hostile && category != NpcCategory::Police)
-                return {"HOSTILE", IM_COL32(255, 82, 96, 245), settings.showEnemies};
+                return {"HOSTILE", IM_COL32(255, 82, 96, 245), enabled};
             switch (category)
             {
             case NpcCategory::Civilian:
-                return {"CIVILIAN", IM_COL32(74, 222, 128, 245), settings.showCivilians};
+                return {"CIVILIAN", IM_COL32(74, 222, 128, 245), enabled};
             case NpcCategory::Enemy:
-                return {"ENEMY", IM_COL32(255, 82, 96, 245), settings.showEnemies};
+                return {"ENEMY", IM_COL32(255, 82, 96, 245), enabled};
             case NpcCategory::Police:
-                return {"POLICE", IM_COL32(72, 153, 255, 245), settings.showPolice};
+                return {"POLICE", IM_COL32(72, 153, 255, 245), enabled};
             default:
-                return {"UNCLASSIFIED", IM_COL32(180, 188, 201, 225), settings.showUnclassified};
+                return {"UNCLASSIFIED", IM_COL32(180, 188, 201, 225), enabled};
             }
         }
 
@@ -351,7 +353,12 @@ namespace Esp
                                         ImVec2(barLeft + barWidth - 1.0f, maximum.y - 1.0f), barColor, 1.0f);
             }
             if (settings.skeleton && puppet.visual.skeletonSegmentCount > 0)
+            {
+                if (puppet.poseUpdatedAt != 0)
+                    Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::EspPoseAgeMs,
+                                                     GetTickCount64() - puppet.poseUpdatedAt);
                 skeletonLineCount += DrawSkeleton(puppet.visual, io, drawList, color, shadow);
+            }
 
             if (settings.showName || settings.showDistance)
             {

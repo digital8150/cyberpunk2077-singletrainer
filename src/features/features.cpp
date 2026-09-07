@@ -1,4 +1,5 @@
 #include "features.h"
+#include "target_filters.h"
 #include "aimbot.h"
 #include "esp.h"
 #include "fps_counter.h"
@@ -9,11 +10,13 @@
 #include "../game/silent_aim.h"
 #include "../game/shot_trace.h"
 #include "../game/entity_tracker.h"
+#include "../game/projection.h"
 #include "../game/player_modifiers.h"
 #include "../game/visibility.h"
 #include "../profiling.h"
 
 #include <array>
+#include <algorithm>
 #include <utility>
 #include <cstdio>
 #include <imgui.h>
@@ -23,7 +26,7 @@ namespace
     Features::Settings g_settings;
 
     // Present 스레드 전용. OnPresent가 렌더 뮤텍스를 잡은 채로만 들어오므로 프레임당 한 번 채워진다.
-    std::array<Game::EntityTracker::PuppetSnapshot, 128> g_frameSnapshots{};
+    std::array<Game::EntityTracker::PuppetSnapshot, 256> g_frameSnapshots{};
     bool g_aimbotEnabledLastFrame = false;
     ULONGLONG g_profileToastUntil = 0;
 
@@ -58,11 +61,49 @@ namespace
         }
     }
 
-    Features::FrameSnapshots CaptureFrameSnapshots()
+    Features::FrameSnapshots CaptureFrameSnapshots(bool espConsumerActive)
     {
         Features::FrameSnapshots frame;
         frame.puppets = g_frameSnapshots.data();
         frame.count = Game::EntityTracker::GetPuppetSnapshots(g_frameSnapshots.data(), g_frameSnapshots.size());
+        Diagnostics::Profile::Scope requestScope(Diagnostics::Profile::Slot::PoseRequestPass);
+        std::array<std::uint64_t, g_frameSnapshots.size()> requested{};
+        std::size_t requestCount = 0;
+        std::size_t requestCategories[4]{};
+        for (std::size_t i = 0; i < frame.count; ++i)
+        {
+            auto& puppet = g_frameSnapshots[i];
+            const bool esp = espConsumerActive && Features::TargetFilters::EspPose(puppet, g_settings.esp);
+            const bool aim = Features::TargetFilters::AimPose(puppet, g_settings.aimbot);
+            if (!esp && !aim) { puppet.visual = {}; puppet.poseUpdatedAt = 0; continue; }
+            // Conservative depth gate, independent of cached joints (no pose bootstrap starvation).
+            // Keep a margin for limbs near the distance/near-plane boundary. Failure retries next tick.
+            Game::Projection::ScreenPoint root;
+            if (Game::Projection::WorldToScreen(puppet.position, 1.0f, 1.0f, root))
+            {
+                const float distance = (std::max)(esp ? g_settings.esp.maxDistanceMeters : 0.0f,
+                                                 aim ? g_settings.aimbot.maxDistanceMeters : 0.0f);
+                if (root.depth < -3.0f || root.depth > distance + 3.0f)
+                {
+                    puppet.visual = {};
+                    puppet.poseUpdatedAt = 0;
+                    continue;
+                }
+            }
+            requested[requestCount++] = puppet.entityId;
+            using Game::EntityTracker::NpcCategory;
+            // Count original archetypes; hostile civilians can legitimately be enemy targets.
+            const unsigned category = puppet.category == NpcCategory::Civilian ? 0u :
+                                      puppet.category == NpcCategory::Enemy ? 1u :
+                                      puppet.category == NpcCategory::Police ? 2u : 3u;
+            ++requestCategories[category];
+        }
+        Game::EntityTracker::PublishPoseRequests(requested.data(), requestCount);
+        using Diagnostics::Profile::Slot;
+        Diagnostics::Profile::RecordValue(Slot::PoseRequestCivilian, requestCategories[0]);
+        Diagnostics::Profile::RecordValue(Slot::PoseRequestEnemy, requestCategories[1]);
+        Diagnostics::Profile::RecordValue(Slot::PoseRequestPolice, requestCategories[2]);
+        Diagnostics::Profile::RecordValue(Slot::PoseRequestOther, requestCategories[3]);
         return frame;
     }
 
@@ -112,7 +153,7 @@ namespace Features
 
         FrameSnapshots frame;
         if (g_settings.esp.enabled || g_settings.aimbot.enabled)
-            frame = CaptureFrameSnapshots();
+            frame = CaptureFrameSnapshots(true);
         if (g_settings.esp.enabled)
             Esp::DrawOverlay(g_settings.esp, frame);
         if (g_settings.aimbot.enabled)
@@ -153,7 +194,7 @@ namespace Features
 
         if (g_settings.aimbot.enabled)
         {
-            const FrameSnapshots frame = CaptureFrameSnapshots();
+            const FrameSnapshots frame = CaptureFrameSnapshots(false);
             Aimbot::UpdateHeadless(g_settings.aimbot, frame, displayWidth, displayHeight);
         }
         else if (g_aimbotEnabledLastFrame)

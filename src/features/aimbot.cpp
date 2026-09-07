@@ -1,5 +1,6 @@
 #include "aimbot.h"
 #include "features.h"
+#include "target_filters.h"
 #include "../diagnostics.h"
 #include "../framework.h"
 #include "../game/aim_assist.h"
@@ -58,20 +59,7 @@ namespace Aimbot
         bool IsEligible(const Game::EntityTracker::PuppetSnapshot& puppet,
                         const Features::AimbotSettings& settings)
         {
-            using Game::EntityTracker::Hostility;
-            using Game::EntityTracker::NpcCategory;
-            if (puppet.isDead)
-                return false;
-            // Police keep their own toggle even after they turn on the player.
-            if (puppet.category == NpcCategory::Police)
-                return settings.targetPolice;
-            // Runtime attitude first: an NPC that started neutral and turned hostile keeps its spawn archetype, so
-            // the category alone would leave it untargetable for the whole fight.
-            if (puppet.hostility == Hostility::Hostile)
-                return settings.targetEnemies;
-            if (puppet.category == NpcCategory::Enemy)
-                return settings.targetEnemies;
-            return false;
+            return Features::TargetFilters::AimCategory(puppet, settings);
         }
 
         // 카메라 초점거리를 못 읽는 프레임(투영 미초기화, 컷신 등)에서 쓰는 근사값. 시네마틱이 아닌
@@ -266,6 +254,9 @@ namespace Aimbot
         g_stats.targetEntityId = bestEntityId;
         if (selected)
         {
+            if (selected->poseUpdatedAt != 0)
+                Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::AimPoseAgeMs,
+                                                 GetTickCount64() - selected->poseUpdatedAt);
             g_stats.targetHealthValid = selected->healthValid;
             g_stats.targetHealth = selected->healthCurrent;
             g_stats.targetHealthMax = selected->healthMax;

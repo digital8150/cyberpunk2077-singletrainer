@@ -38,6 +38,7 @@ namespace
         {"snapshot", true},
         {"snapLockWait", true},
         {"snapCount", false},
+        {"poseRequest", true},
         {"esp", true},
         {"aimbot", true},
         {"tickTotal", true},
@@ -53,6 +54,17 @@ namespace
         {"attitudeCollect", true},
         {"attitudeInvoke", true},
         {"highlightCollect", true},
+        {"requested", false},
+        {"eligible", false},
+        {"processed", false},
+        {"deferred", false},
+        {"intervalMs", false},
+        {"espAgeMs", false},
+        {"aimAgeMs", false},
+        {"civilian", false},
+        {"enemy", false},
+        {"police", false},
+        {"other", false},
     };
 
     std::int64_t Frequency()
@@ -140,6 +152,7 @@ namespace
     bool IsPresentDurationSlot(Diagnostics::Profile::Slot slot)
     {
         return slot == Diagnostics::Profile::Slot::SnapshotPass ||
+               slot == Diagnostics::Profile::Slot::PoseRequestPass ||
                slot == Diagnostics::Profile::Slot::EspFrame ||
                slot == Diagnostics::Profile::Slot::AimbotFrame;
     }
@@ -215,6 +228,9 @@ namespace Diagnostics::Profile
         LogGroup("present", Slot::SnapshotPass, Slot::AimbotFrame, elapsed);
         LogGroup("tick", Slot::TickTotal, Slot::TickVisibility, elapsed);
         LogGroup("tickdetail", Slot::PoseSlots, Slot::HighlightCollect, elapsed);
+        LogGroup("pose-work", Slot::PoseRequested, Slot::PoseDeferred, elapsed);
+        LogGroup("pose-age", Slot::PoseIntervalMs, Slot::AimPoseAgeMs, elapsed);
+        LogGroup("pose-request-category", Slot::PoseRequestCivilian, Slot::PoseRequestOther, elapsed);
     }
 
     void Reset()

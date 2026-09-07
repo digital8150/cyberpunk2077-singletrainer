@@ -1362,6 +1362,7 @@ namespace
         constexpr ULONGLONG kPoseRequestLifetimeMilliseconds = 250;
         std::array<PoseWork, kPosePerTick> workItems{};
         std::size_t workCount = 0;
+        std::size_t eligibleCount = 0;
         const ULONGLONG now = GetTickCount64();
         const std::size_t start = static_cast<std::size_t>(g_poseRoundRobin % kMaxTrackedPuppets);
         std::size_t scanned = 0;
@@ -1369,7 +1370,8 @@ namespace
         // Stabilize storage only long enough to copy exact strong owners. No RTTI lookup, Script VM entry, or
         // other game call is allowed while this lock is held.
         AcquireSRWLockShared(&g_puppetListLock);
-        for (; scanned < kMaxTrackedPuppets && workCount < workItems.size(); ++scanned)
+        std::size_t nextStart = start;
+        for (; scanned < kMaxTrackedPuppets; ++scanned)
         {
             const std::size_t slot = (start + scanned) % kMaxTrackedPuppets;
             if (!IsPuppetOccupied(slot))
@@ -1381,6 +1383,10 @@ namespace
                 continue;
             }
 
+            ++eligibleCount;
+            if (workCount >= workItems.size())
+                continue;
+            nextStart = (slot + 1) % kMaxTrackedPuppets;
             PoseWork& work = workItems[workCount];
             if (!Game::Rtti::CopyHandle(&tracked.entityHandle, &work.entityHandle))
                 continue;
@@ -1392,7 +1398,10 @@ namespace
             ++workCount;
         }
         ReleaseSRWLockShared(&g_puppetListLock);
-        g_poseRoundRobin = (start + (scanned == 0 ? 1 : scanned)) % kMaxTrackedPuppets;
+        g_poseRoundRobin = nextStart;
+        Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::PoseEligible, eligibleCount);
+        Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::PoseProcessed, workCount);
+        Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::PoseDeferred, eligibleCount - workCount);
 
         for (std::size_t i = 0; i < workCount; ++i)
             ProcessPoseWorkOnMainTick(workItems[i]);
@@ -1412,6 +1421,9 @@ namespace
                 continue;
             }
             DiagnosePoseSample(tracked, work.visual, work.telemetry, work.position, work.isDead, now);
+            if (tracked.visualUpdatedAt != 0)
+                Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::PoseIntervalMs,
+                                                 now - tracked.visualUpdatedAt);
             tracked.visual = work.visual;
             tracked.visualUpdatedAt = now;
         }
@@ -1608,7 +1620,11 @@ namespace
             snapshot.healthCurrent = tracked.healthCurrent;
             snapshot.healthMax = tracked.healthMax;
             snapshot.healthRatio = tracked.healthRatio;
-            snapshot.visual = tracked.visual;
+            if (tracked.poseRequestedAt != 0 && GetTickCount64() - tracked.poseRequestedAt <= 250)
+            {
+                snapshot.visual = tracked.visual;
+                snapshot.poseUpdatedAt = tracked.visualUpdatedAt;
+            }
 
             return SnapshotResult::Ready;
         }
@@ -3203,7 +3219,6 @@ namespace Game::EntityTracker
         std::uint64_t hostile = 0;
         std::array<Game::Rtti::Handle, kMaxTrackedPuppets> staleHandles{};
         std::size_t staleHandleCount = 0;
-        const ULONGLONG poseRequestNow = GetTickCount64();
         const std::int64_t lockWaitStart = Diagnostics::Profile::Now();
         AcquireSRWLockExclusive(&g_puppetListLock);
         Diagnostics::Profile::Record(Diagnostics::Profile::Slot::SnapshotLockWait,
@@ -3238,7 +3253,6 @@ namespace Game::EntityTracker
             hostile += snapshot.hostility == Hostility::Hostile ? 1u : 0u;
             if (count < capacity)
             {
-                tracked.poseRequestedAt = poseRequestNow;
                 output[count++] = snapshot;
             }
         }
@@ -3252,6 +3266,31 @@ namespace Game::EntityTracker
             ReleaseOwnedHandle(staleHandles[i], "stale-puppet");
         Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::SnapshotPuppets, count);
         return count;
+    }
+
+    void PublishPoseRequests(const std::uint64_t* entityIds, std::size_t count)
+    {
+        const ULONGLONG now = GetTickCount64();
+        AcquireSRWLockExclusive(&g_puppetListLock);
+        for (auto& tracked : g_puppetList)
+        {
+            const ULONGLONG previousRequest = tracked.poseRequestedAt;
+            tracked.poseRequestedAt = 0;
+            if (!tracked.entity || !tracked.entityId) continue;
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                if (entityIds[i] != tracked.entityId) continue;
+                if (previousRequest == 0 || now - previousRequest > 250)
+                {
+                    tracked.visual = {};
+                    tracked.visualUpdatedAt = 0;
+                }
+                tracked.poseRequestedAt = now;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_puppetListLock);
+        Diagnostics::Profile::RecordValue(Diagnostics::Profile::Slot::PoseRequested, count);
     }
 
     void OnGameMainTick()

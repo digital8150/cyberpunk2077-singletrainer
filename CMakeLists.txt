@@ -104,6 +104,10 @@ if(CP2077_BUILD_TESTS)
     add_executable(cp2077_pellet_tests tests/pellet_targets.cpp)
     target_include_directories(cp2077_pellet_tests PRIVATE src)
     add_test(NAME pellet_targets COMMAND cp2077_pellet_tests)
+    add_executable(cp2077_target_filter_tests tests/target_filters.cpp)
+    target_include_directories(cp2077_target_filter_tests PRIVATE src)
+    target_compile_options(cp2077_target_filter_tests PRIVATE /utf-8)
+    add_test(NAME target_filters COMMAND cp2077_target_filter_tests)
 endif()
 
 # --- 오버레이 UI 프리뷰 하네스 ---
