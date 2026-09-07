@@ -2802,4 +2802,22 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
     - `all hooks enabled`
   - D3D12 오버레이 제출 정상 및 게임 프로세스(PID 24516) 안정적 응답 유지 확인.
 
+## 2026-09-07 — PID 3180 Silent Aim WeakHandle 크래시 원인 제거 및 순수 좌표 기반 리다이렉션 복구
 
+- **크래시 분석 결과 반영 (`reports/2026-09-07_crash_analysis_pid3180.md`)**:
+  - PID 3180에서 Silent Aim 발사체 리다이렉션(`HandleSpawnerLaunchEvent`, `RedirectProjectileEvent`) 시 이벤트 슬롯 내 `WeakHandle<IPlacedComponent>`(+0x0F0 / +0x140)의 refCount를 `InterlockedIncrement`로 조작한 후, 해당 엔티티/컴포넌트 해제 시 엔진(`Cyberpunk2077.exe+0x25161B`)에서 dangling weak ref 역참조로 `ACCESS_VIOLATION` (unhandled) 크래시 발생.
+  - 외부에서 엔진 내부의 ref-counting 라이프사이클 계약을 안전하게 모사할 수 없으며 UAF/double-free를 유발함을 확정.
+- **조치 사항 (WeakHandle 조작 전면 제거)**:
+  1. `src/game/silent_aim.cpp`:
+     - `HandleSpawnerLaunchEvent`: `kSpawnerTrackedTargetCompOffset`(+0x0F0) 슬롯 조작 및 `InterlockedIncrement` 제거. 순수 좌표(`kSpawnerTargetPosOffset`), `smartGunIsProjectileGuided`(+0x104), orientation provider 방향 조작(`RedirectOrientationProviderSafely`)만 유지.
+     - `RedirectProjectileEvent`: `0x140` 슬롯 Handle 조작 및 `InterlockedIncrement` 제거.
+     - `g_state`: `targetComponentInstance`, `targetComponentRefCount` 원자 변수 제거.
+     - `ReadTarget`, `PublishTarget`, `ClearTarget`: 컴포넌트 핸들 관련 인자 및 상태 전달 로직 제거.
+  2. `src/game/silent_aim.h`: `PublishTarget` 시그니처에서 `targetComponent` 인자 제거, `Game::Rtti::Handle` 전방 선언 제거.
+  3. `src/game/entity_tracker.h` & `src/game/entity_tracker.cpp`:
+     - `TrackedPuppet` 및 `PuppetSnapshot`에서 `targetingComponent` 필드 제거.
+     - `FindTargetingComponent()` 함수 및 `TrySnapshot()` 내 컴포넌트 탐색 호출 제거.
+     - 불필요해진 `#include "rtti_invoker.h"` 제거.
+  4. `src/features/aimbot.cpp`: `PublishTarget(bestWorld, true)`로 호출 단순화.
+- **빌드 검증**:
+  - `cmake --build build --config Release` 정상 컴파일 및 링크 완료 (경고 0, 에러 0).
