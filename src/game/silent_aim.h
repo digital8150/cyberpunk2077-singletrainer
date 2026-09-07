@@ -8,8 +8,11 @@ namespace Game::SilentAim
     {
         bool hookCreated = false;
         bool queueHookCreated = false;
-        // The only mutation path: the native crosshair core's caller-visible direction out-parameter.
+        // Mutation paths:
+        // 1. Hitscan firearms: native crosshair core direction out-parameter redirection.
+        // 2. Projectiles (throwing knives/axes): projectile component ShootEvent ballistic trajectory redirection.
         bool crosshairCoreHookCreated = false;
+        bool projectileHookCreated = false;
         std::uint32_t listenerHooks = 0;
         std::uint32_t producerHooks = 0;
         std::uint64_t callbacks = 0;
@@ -29,9 +32,8 @@ namespace Game::SilentAim
         std::uint64_t nativeCrosshairCoreRedirects = 0;
     };
 
-    // Resolves the native crosshair core (the single mutation path) plus observation-only effect/attack/crosshair
-    // native handlers and projectile ShootEvent listeners. Projectile and effect mutation stay gated off.
-    // Call after MH_Initialize and before MH_EnableHook(MH_ALL_HOOKS).
+    // Resolves the native crosshair core (hitscan mutation path) and projectile ShootEvent listeners
+    // (throwing knife/axe ballistic mutation path). Call after MH_Initialize and before MH_EnableHook.
     bool CreateHook();
 
     // Present publishes only plain coordinates. Native callbacks use freshness as an early filter, so a target

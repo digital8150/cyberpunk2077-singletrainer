@@ -19,23 +19,22 @@ namespace
 {
     constexpr std::size_t kMaxListenerHooks = 4;
     constexpr std::size_t kMaxProducerHooks = 5;
+    constexpr std::size_t kShootLocalToWorldOffset = 0xB0;
     constexpr std::size_t kShootStartPointOffset = 0xF0;
     constexpr std::size_t kShootStartVelocityOffset = 0x100;
+    constexpr std::size_t kShootWeaponVelocityOffset = 0x110;
+    constexpr std::size_t kShootParamsOffset = 0x120;
     constexpr std::size_t kSetUpOwnerOffset = 0x40;
     constexpr ULONGLONG kTargetTimeoutMilliseconds = 250;
-    // The first validated local-player event is observation-only. This separates callback/field validation from
-    // mutation and prevents a burst or shotgun volley from being rewritten during the initial live ABI probe.
-    constexpr ULONGLONG kValidationObservationMilliseconds = 1000;
-    // Live observation must establish the exact event path and payload before any projectile field is modified.
-    constexpr bool kEnableProjectileMutation = false;
+    // Cyberpunk 2077 projectile simulation gravity for throwing knives and axes (from tweakDB knife_params/axe_params).
+    constexpr float kProjectileGravity = 20.0f;
+    // Live projectile redirection for throwing knives/axes via gameprojectileShootEvent listener.
+    constexpr bool kEnableProjectileMutation = true;
+    // Projectile ShootEvent listener hook on gameprojectileComponent (dispatched via setUpEventId listener).
+    constexpr bool kEnableProjectileObservationHooks = true;
     // Native RTTI handlers have one documented VM ABI. These hooks only count calls while a target is armed;
-    // they do not inspect stack-frame parameters or modify effect/crosshair data. The crosshair core redirect alone
-    // drives silent aim on 2.31, so the shipped trainer installs none of them - keep them off unless a producer
-    // path has to be re-investigated.
+    // they do not inspect stack-frame parameters or modify effect/crosshair data.
     constexpr bool kEnableProducerObservationHooks = false;
-    // Same reasoning for the projectile ShootEvent listeners: with projectile mutation permanently gated off they
-    // only counted events on a hot native dispatch path.
-    constexpr bool kEnableProjectileObservationHooks = false;
     // Hooking the two RTTI event-108 callback targets is unsafe: those code targets are reused outside the typed
     // listener dispatch, and the live game crashed before a valid weapon payload was observed.
     constexpr bool kEnableWeaponListenerObservationHooks = false;
@@ -125,6 +124,15 @@ namespace
         float w;
     };
     static_assert(sizeof(Vector4Layout) == 0x10);
+
+    struct MatrixLayout
+    {
+        Vector4Layout x; // 0x00 Right
+        Vector4Layout y; // 0x10 Forward
+        Vector4Layout z; // 0x20 Up
+        Vector4Layout w; // 0x30 Translation
+    };
+    static_assert(sizeof(MatrixLayout) == 0x40);
 
     // Native REDengine event listeners use Callback<void(IScriptable&, Handle<IScriptable>&)> with an unbound
     // function target. Its shared invoke thunk unwraps Handle::instance before tail-calling this target, so the
@@ -386,6 +394,113 @@ namespace
         }
     }
 
+    bool CalculateBallisticTrajectory(const Vector4Layout& start, const float target[3],
+                                      float speed, Vector4Layout& outVelocity, MatrixLayout& outOrientation)
+    {
+        const float dx = target[0] - start.x;
+        const float dy = target[1] - start.y;
+        const float dz = target[2] - start.z;
+        const float distHorizontalSq = dx * dx + dy * dy;
+        const float distHorizontal = std::sqrt(distHorizontalSq);
+        const float distTotalSq = distHorizontalSq + dz * dz;
+        const float distTotal = std::sqrt(distTotalSq);
+
+        if (!std::isfinite(distTotal) || distTotal < 0.05f || !std::isfinite(speed) || speed < 0.01f)
+            return false;
+
+        float vx = 0.0f;
+        float vy = 0.0f;
+        float vz = 0.0f;
+
+        const float g = kProjectileGravity;
+        const float A = 0.25f * g * g;
+        const float B = g * dz - speed * speed;
+        const float C = distTotalSq;
+        const float disc = B * B - 4.0f * A * C;
+
+        if (disc >= 0.0f && distHorizontal > 0.05f)
+        {
+            const float u = (-B - std::sqrt(disc)) / (2.0f * A);
+            if (u > 0.0001f)
+            {
+                const float t = std::sqrt(u);
+                vx = dx / t;
+                vy = dy / t;
+                vz = dz / t + 0.5f * g * t;
+            }
+            else
+            {
+                const float scale = speed / distTotal;
+                vx = dx * scale;
+                vy = dy * scale;
+                vz = dz * scale;
+            }
+        }
+        else
+        {
+            const float scale = speed / distTotal;
+            vx = dx * scale;
+            vy = dy * scale;
+            vz = dz * scale;
+        }
+
+        outVelocity.x = vx;
+        outVelocity.y = vy;
+        outVelocity.z = vz;
+        outVelocity.w = 0.0f;
+
+        // REDengine basis: +X Right, +Y Forward, +Z Up, +W Translation.
+        const float invSpeed = 1.0f / speed;
+        const float fx = vx * invSpeed;
+        const float fy = vy * invSpeed;
+        const float fz = vz * invSpeed;
+
+        const float horizLen = std::sqrt(fx * fx + fy * fy);
+        float rx = 0.0f;
+        float ry = 0.0f;
+        float rz = 0.0f;
+        float ux = 0.0f;
+        float uy = 0.0f;
+        float uz = 0.0f;
+
+        if (horizLen > 0.001f)
+        {
+            const float invH = 1.0f / horizLen;
+            rx = fy * invH;
+            ry = -fx * invH;
+            rz = 0.0f;
+
+            ux = ry * fz;
+            uy = -rx * fz;
+            uz = horizLen;
+        }
+        else
+        {
+            rx = 1.0f;
+            ry = 0.0f;
+            rz = 0.0f;
+            if (fz > 0.0f)
+            {
+                ux = 0.0f;
+                uy = -1.0f;
+                uz = 0.0f;
+            }
+            else
+            {
+                ux = 0.0f;
+                uy = 1.0f;
+                uz = 0.0f;
+            }
+        }
+
+        outOrientation.x = {rx, ry, rz, 0.0f};
+        outOrientation.y = {fx, fy, fz, 0.0f};
+        outOrientation.z = {ux, uy, uz, 0.0f};
+        outOrientation.w = {start.x, start.y, start.z, 1.0f};
+
+        return true;
+    }
+
     void RedirectProjectileEvent(void* event)
     {
         if (!event)
@@ -433,7 +548,7 @@ namespace
         if (!ReadTarget(target))
             return;
 
-        auto* start = reinterpret_cast<Vector4Layout*>(bytes + kShootStartPointOffset);
+        const auto* start = reinterpret_cast<const Vector4Layout*>(bytes + kShootStartPointOffset);
         auto* velocity = reinterpret_cast<Vector4Layout*>(bytes + kShootStartVelocityOffset);
         const float speed = std::sqrt(velocity->x * velocity->x + velocity->y * velocity->y +
                                       velocity->z * velocity->z);
@@ -461,31 +576,61 @@ namespace
             ULONGLONG expected = 0;
             if (g_state.validationEstablishedAt.compare_exchange_strong(expected, now, std::memory_order_acq_rel))
             {
-                Diagnostics::Log("silent aim live layout validated (observation only): event=%p owner=%p "
+                Diagnostics::Log("silent aim live layout validated: event=%p owner=%p "
                                  "start=(%.2f,%.2f,%.2f) velocity=(%.2f,%.2f,%.2f) speed=%.2f",
                                  event, owner->instance, start->x, start->y, start->z,
                                  velocity->x, velocity->y, velocity->z, speed);
-                return;
             }
-            establishedAt = expected;
         }
-        if (now < establishedAt || now - establishedAt < kValidationObservationMilliseconds)
-            return;
 
         if (!kEnableProjectileMutation)
             return;
 
-        const float scale = speed / distance;
-        velocity->x = deltaX * scale;
-        velocity->y = deltaY * scale;
-        velocity->z = deltaZ * scale;
-        const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (redirected <= 4 || (redirected % 32u) == 0)
+        Vector4Layout newVelocity{};
+        MatrixLayout newOrientation{};
+        if (!CalculateBallisticTrajectory(*start, target, speed, newVelocity, newOrientation))
         {
-            Diagnostics::Log("silent aim redirected projectile: count=%llu owner=%p start=(%.2f,%.2f,%.2f) "
-                             "target=(%.2f,%.2f,%.2f) speed=%.2f",
+            g_state.rejectedShots.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        *velocity = newVelocity;
+
+        if (Game::Rtti::ClassSize(type) >= kShootLocalToWorldOffset + sizeof(MatrixLayout))
+        {
+            auto* localToWorld = reinterpret_cast<MatrixLayout*>(bytes + kShootLocalToWorldOffset);
+            newOrientation.w = localToWorld->w;
+            *localToWorld = newOrientation;
+        }
+
+        if (Game::Rtti::ClassSize(type) >= kShootWeaponVelocityOffset + sizeof(Vector4Layout))
+        {
+            auto* weaponVelocity = reinterpret_cast<Vector4Layout*>(bytes + kShootWeaponVelocityOffset);
+            weaponVelocity->x = 0.0f;
+            weaponVelocity->y = 0.0f;
+            weaponVelocity->z = 0.0f;
+            weaponVelocity->w = 0.0f;
+        }
+
+        if (Game::Rtti::ClassSize(type) >= kShootParamsOffset + sizeof(Vector4Layout))
+        {
+            auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kShootParamsOffset);
+            targetPos->x = target[0];
+            targetPos->y = target[1];
+            targetPos->z = target[2];
+            targetPos->w = 1.0f;
+        }
+
+        const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (redirected <= 8 || (redirected % 16u) == 0)
+        {
+            Diagnostics::Log("silent aim redirected projectile: count=%llu owner=%p "
+                             "start=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) speed=%.2f "
+                             "vel=(%.2f,%.2f,%.2f) fwd=(%.3f,%.3f,%.3f)",
                              static_cast<unsigned long long>(redirected), owner->instance,
-                             start->x, start->y, start->z, target[0], target[1], target[2], speed);
+                             start->x, start->y, start->z, target[0], target[1], target[2], speed,
+                             newVelocity.x, newVelocity.y, newVelocity.z,
+                             newOrientation.y.x, newOrientation.y.y, newOrientation.y.z);
         }
     }
 
@@ -1016,6 +1161,7 @@ namespace Game::SilentAim
         result.hookCreated = g_state.hookCreated.load(std::memory_order_acquire);
         result.queueHookCreated = g_state.queueHookCreated.load(std::memory_order_acquire);
         result.crosshairCoreHookCreated = g_state.crosshairCoreHookCreated.load(std::memory_order_acquire);
+        result.projectileHookCreated = g_state.listenerHooks.load(std::memory_order_relaxed) > 0;
         result.listenerHooks = g_state.listenerHooks.load(std::memory_order_relaxed);
         result.producerHooks = g_state.producerHooks.load(std::memory_order_relaxed);
         result.callbacks = g_state.callbacks.load(std::memory_order_relaxed);

@@ -291,7 +291,7 @@ namespace Aimbot
                 Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) "
                                  "healthValid=%u health=%.2f/%.2f dead=%u "
                                  "candidates=%u eligible=%u noPool=%u overCap=%u occluded=%u "
-                                 "crosshairCoreHook=%u calls=%llu redirects=%llu rejected=%llu",
+                                 "crosshairCoreHook=%u projHook=%u calls=%llu redirects=%llu projRedirects=%llu rejected=%llu",
                                  static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
                                  selected && selected->healthValid ? 1u : 0u,
                                  selected ? selected->healthCurrent : 0.0f,
@@ -300,8 +300,10 @@ namespace Aimbot
                                  g_stats.candidates, g_stats.eligible, g_stats.skippedNoHealthPool,
                                  g_stats.skippedHealthCap, g_stats.skippedOccluded,
                                  diagnostics.crosshairCoreHookCreated ? 1u : 0u,
+                                 diagnostics.projectileHookCreated ? 1u : 0u,
                                  static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreCalls),
                                  static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreRedirects),
+                                 static_cast<unsigned long long>(diagnostics.redirectedShots),
                                  static_cast<unsigned long long>(diagnostics.rejectedShots));
                 lastSilentLogTick = now;
             }

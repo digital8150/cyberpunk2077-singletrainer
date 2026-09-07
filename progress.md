@@ -2719,3 +2719,40 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
 - Validation: Release build passed with no warnings; git diff --check passed. Injected into fresh PID 30040 at 18:06:59. Through 18:07:24, tracked=0, the process remained Responding=True, Visibility tick profiling averaged 0.2us, and no Visibility resolver/cast logs appeared. Diagnostics: logging=1 profiling=1 veh=1 dbgout=0 fatal=1.
 - Live validation covers the initially closed gate only. Queue invalidation/reopen after a populated-world transition and the absent/off/on reproduction matrix still need in-game validation. The shared gate is based on observed tracker emptiness, so transitions that never appear empty are outside its coverage. This fixes the confirmed missing gate; it does not establish Visibility as the source of PID 22660's AV or prove the scheduler freeze eliminated.
 - DLL SHA-256: `08DAF88113B7C4E8C5B71CB64D5A57FFE1EFC1DE8877D62DAEA9992854959D80`. New DLL remains loaded in PID 30040.
+
+## 2026-09-07 — 투척 무기(단검/도끼) Silent Aim 지원 구현 (방안 A)
+
+- **배경 및 원인 분석**:
+  - 기존 Silent Aim은 총기류 화기 전용인 native crosshair core(`TargetingSystem::GetCrosshairData`, `Cyberpunk2077.exe+0x4D8354`)만 인터셉트하여 방향 벡터를 조작했기 때문에, 투척 단검/도끼(`MeleeProjectile`) 투척 시에는 무기 궤적이 전혀 보정되지 않았음.
+  - 게임 스크립트(`meleeTransitions.script`, `projectileHelper.script`, `meleeProjectile.script`, `baseProjectile.script`) 분석 결과:
+    - 투척 무기는 1인칭 조준(RMB) + 투척(LMB) 시 `SpawnProjectileFromScreenCenter`를 통해 `gameprojectileSpawnerLaunchEvent`를 큐잉함.
+    - 투사체 엔티티 생성 시 `gameprojectileComponent`를 거치며 `gameprojectileSetUpEvent`(id 120), 그리고 파생 이벤트인 `gameprojectileShootEvent`(id 789) 또는 `gameprojectileShootTargetEvent`(id 790)가 전달됨.
+    - 기존 `src/game/silent_aim.cpp`에 실험용 리스너 구조가 있었으나 `kEnableProjectileObservationHooks`와 `kEnableProjectileMutation`이 영구 비활성화(`false`)되어 있었음.
+- **방안 A 구현 내용**:
+  1. **네이티브 리스너 후킹 활성화**:
+     - `gameprojectileComponent`의 `setUpEventId`(120) 네이티브 리스너(`0x7FF67F117984`) 후킹을 활성화(`kEnableProjectileObservationHooks = true`, `kEnableProjectileMutation = true`).
+     - 이 리스너는 파생된 `gameprojectileShootEvent` 및 `gameprojectileShootTargetEvent`도 그대로 수신함.
+  2. **TweakDB 투사체 파라미터 및 중력 실측**:
+     - `knife.tweak` 및 `axe.tweak` 분석 결과, 단검/도끼 투사체는 기본 중력 가속도가 일반 물리(-9.81)가 아닌 `gravitySimulation = -20.0`($g = 20.0\text{ m/s}^2$), `startVelocity = 110.0`으로 설정되어 있음을 확인.
+  3. **폐쇄형 포물선 탄도학 중력 보정 알고리즘(`CalculateBallisticTrajectory`) 구현**:
+     - 중력 $g = 20.0\text{ m/s}^2$를 반영하여 $u = t^2$에 대한 2차 방정식 $\frac{1}{4}g^2 u^2 + (g \Delta z - v^2)u + d^2 = 0$을 해석적으로 풀이 ($A = 0.25 g^2$, $B = g \Delta z - v^2$, $C = d^2$, $\text{disc} = B^2 - 4AC$).
+     - 도달 가능한 경우 최단 시간 저각 탄도 비행 시간 $t = \sqrt{u}$를 계산하고 $v_x = \frac{\Delta x}{t}$, $v_y = \frac{\Delta y}{t}$, $v_z = \frac{\Delta z}{t} + 0.5gt$로 발사 속도를 결정 (원래 발사 속력 $|V| = v$ 완전 보존).
+     - 최대 사거리 초과($\text{disc} < 0$) 또는 직상/직하 투척 시에는 무한대/NaN 방지를 위해 직선 방향 벡터로 안전 fallback.
+  4. **REDengine 좌표계 정렬 및 관성 보정**:
+     - REDengine 기준 좌표계(+X Right, +Y Forward, +Z Up, +W Translation)에 따라 새 발사 속도 벡터로부터 정규 직교 기저(Orthonormal basis)를 계산하여 `localToWorld` 회전 행렬(+0xB0) 갱신 (단검 3D 메시가 비행 궤적 방향을 자연스럽게 향하도록 정렬).
+     - 플레이어 이동/스트레이프 관성으로 인한 빗맞음 방지를 위해 `weaponVelocity`(+0x110) 0 초기화.
+     - `params.targetPosition`(+0x120)에도 타깃 좌표를 반영.
+     - 첫 번째 투척부터 즉시 유효 리다이렉트되도록 1초 관찰 지연(`kValidationObservationMilliseconds`) 제거.
+  5. **진단 및 UI 연동**:
+     - `DiagnosticsSnapshot`에 `projectileHookCreated` 추가.
+     - 오버레이 UI의 "Silent aim" 섹션에서 `hitscan redirects`와 `projectile redirects`를 구분하여 표시하고, 상태를 `"hitscan + projectile hooked"`로 갱신.
+     - 주기적 에임봇 로그에 `projHook` 및 `projRedirects` 카운터 추가.
+- **빌드 및 런타임 검증**:
+  - `cmake --build build --config Release` 정상 컴파일 및 링크 (경고 0, 에러 0).
+  - 라이브 Cyberpunk 2077(PID 24516)에 `python tools/scripts/inject.py`로 주입 성공.
+  - 트레이너 로그 확인:
+    - `silent aim native listener candidate: class=6830916AC1506EFB eventId=120 target=00007FF67F117984`
+    - `silent aim hooks created: producers=0 projectileListeners=1 weaponListenerHooks=0 queueHook=0 crosshairCore=1`
+    - `all hooks enabled`
+    - D3D12 오버레이 초기화 및 프레임 제출 정상 동작, 런타임 크래시 및 프리징 없음.
+
