@@ -9,6 +9,36 @@
 #include "../../src/game/player_modifiers.h"
 #include "../../src/game/silent_aim.h"
 #include "../../src/game/visibility.h"
+#include "../../src/profiling.h"
+#include "../../src/framework.h"
+#include <imgui.h>
+#include <cmath>
+
+// Synthetic performance data is confined to this preview executable, never the injected DLL.
+namespace Diagnostics::Profile
+{
+    std::uint64_t LastPresentMicroseconds() { return Enabled() ? 140 + static_cast<unsigned>(40 * (1 + std::sin(ImGui::GetTime() * 3))) : 0; }
+    std::uint64_t LastTickTotalMicroseconds() { return Enabled() ? 240 + static_cast<unsigned>(70 * (1 + std::sin(ImGui::GetTime() * 2))) : 0; }
+    bool ReadWindow(WindowSnapshot& output)
+    {
+        if (!Enabled()) return false;
+        output = {};
+        output.capturedAt = GetTickCount64();
+        output.durationMs = 5000;
+        for (unsigned i = 0; i <= static_cast<unsigned>(Slot::HighlightCollect); ++i)
+            output.metrics[i] = {600, 3600.0 + i * 200, 21.5 + i};
+        output.metrics[static_cast<unsigned>(Slot::PresentTotal)] = {600, 120000, 395};
+        output.metrics[static_cast<unsigned>(Slot::TickTotal)] = {600, 180000, 540};
+        output.metrics[static_cast<unsigned>(Slot::PoseSlots)] = {2400, 42000, 47.25};
+        output.metrics[static_cast<unsigned>(Slot::PoseRequested)] = {600, 2400, 6};
+        output.metrics[static_cast<unsigned>(Slot::PoseProcessed)] = {600, 2400, 6};
+        output.metrics[static_cast<unsigned>(Slot::PoseDeferred)] = {600, 0, 0};
+        output.metrics[static_cast<unsigned>(Slot::PoseIntervalMs)] = {2400, 24000, 31};
+        output.metrics[static_cast<unsigned>(Slot::EspPoseAgeMs)] = {2400, 9600, 16};
+        output.metrics[static_cast<unsigned>(Slot::AimPoseAgeMs)] = {600, 2100, 16};
+        return true;
+    }
+}
 
 namespace Features
 {

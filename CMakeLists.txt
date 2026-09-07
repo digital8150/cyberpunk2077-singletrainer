@@ -108,6 +108,10 @@ if(CP2077_BUILD_TESTS)
     target_include_directories(cp2077_target_filter_tests PRIVATE src)
     target_compile_options(cp2077_target_filter_tests PRIVATE /utf-8)
     add_test(NAME target_filters COMMAND cp2077_target_filter_tests)
+    add_executable(cp2077_profiling_tests tests/profiling_window.cpp src/profiling.cpp)
+    target_include_directories(cp2077_profiling_tests PRIVATE src)
+    target_compile_options(cp2077_profiling_tests PRIVATE /utf-8)
+    add_test(NAME profiling_window COMMAND cp2077_profiling_tests)
 endif()
 
 # --- 오버레이 UI 프리뷰 하네스 ---
@@ -119,6 +123,7 @@ if(CP2077_BUILD_UI_PREVIEW)
     add_executable(cp2077_ui_preview
         tools/ui_preview/main.cpp
         tools/ui_preview/stubs.cpp
+        src/features/fps_counter.cpp
         src/ui/localization.cpp
         src/ui/theme.cpp
         src/ui/ui_kit.cpp

@@ -107,7 +107,7 @@ namespace Loc
 
             LOC_KO_EN("FPS 표시", "FPS counter"),
             LOC_KO_EN("성능 그래프", "Performance graph"),
-            LOC_KO_EN("그래프 투명도", "Graph opacity"),
+            LOC_KO_EN("그래프 글자·선 불투명도", "Graph text / line opacity"),
             LOC_KO_EN("내부 통계", "Internal stats"),
             LOC_KO_EN("아래 런타임 통계 패널을 표시합니다.", "Shows the runtime statistics panel below."),
             LOC_KO_EN("진단 로깅", "Diagnostic logging"),

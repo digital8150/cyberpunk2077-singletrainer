@@ -11,6 +11,8 @@
 #include "../../src/framework.h"
 #include "../../src/features/features.h"
 #include "../../src/ui/widgets.h"
+#include "../../src/features/fps_counter.h"
+#include "../../src/profiling.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_dx12.h>
@@ -270,6 +272,7 @@ namespace
         std::string variant;
         // 시작 안내 토스트는 메뉴가 닫혀 있을 때 뜨는 요소라 따로 확인해야 한다.
         bool toast = false;
+        bool performance = false;
         float mouseX = -1.0f;
         float mouseY = -1.0f;
         // 스크롤 끝(푸터와 겹치지 않는지, 마지막 섹션이 잘리지 않는지)을 확인하기 위한 휠 입력.
@@ -323,6 +326,7 @@ namespace
             {
                 options.toast = true;
             }
+            else if (argument == "--performance") options.performance = true;
             else if (!value("--variant=").empty())
             {
                 options.variant = value("--variant=");
@@ -391,6 +395,8 @@ int main(int argc, char** argv)
     settings.aimbot.enabled = true;
     settings.esp.enabled = true;
     settings.debug.showInternalStats = true;
+    settings.debug.showGraph = options.performance;
+    if (options.performance) Diagnostics::Profile::g_enabled.store(options.variant != "off");
     if (options.variant == "off")
     {
         // 기능이 꺼져 있을 때 하위 설정이 "꺼짐"이 아니라 "비활성"으로 보이는지 확인한다.
@@ -436,6 +442,7 @@ int main(int argc, char** argv)
             ImGui::GetIO().AddMousePosEvent(options.width * 0.5f, options.height * 0.5f);
             ImGui::GetIO().AddMouseWheelEvent(0.0f, -options.scroll);
         }
+        if (options.performance) ImGui::GetIO().DeltaTime = 1.0f / 60.0f;
         ImGui::NewFrame();
 
         // 게임 장면 대용 체커보드. 오버레이가 실제로 불투명한지(뒤가 비치지 않는지)는 단색
@@ -460,7 +467,9 @@ int main(int argc, char** argv)
                                  ImVec2(static_cast<float>(options.width), static_cast<float>(options.height)),
                                  ImGuiCond_Always);
         }
-        if (options.toast)
+        if (options.performance)
+            FpsCounter::Draw(settings.debug, true);
+        else if (options.toast)
             Widgets::DrawStartupHint();
         else
             Widgets::DrawMainMenu();

@@ -1,331 +1,290 @@
 #include "fps_counter.h"
-
 #include "features.h"
 #include "../profiling.h"
-#include "../ui/theme.h"
+#include "../framework.h"
 #include "../ui/ui_kit.h"
-
 #include <imgui.h>
-
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstddef>
 #include <cstdio>
 
 namespace FpsCounter
 {
     namespace
     {
-        constexpr std::size_t kHistorySize = 120;
-        constexpr float kGraphWidth = 356.0f;
-        constexpr float kGraphHeight = 220.0f;
-        constexpr float kGraphMargin = 14.0f;
-        constexpr float kHeaderHeight = 34.0f;
-        constexpr float kSampleIntervalSeconds = 0.10f;
-        constexpr float kSmoothingTimeSeconds = 0.28f;
-        constexpr int kFpsBadgeAlpha = 224;
-
+        using Slot = Diagnostics::Profile::Slot;
+        constexpr unsigned kHistory = 120;
+        constexpr float kWidth = 640.0f;
+        constexpr ImU32 kText = IM_COL32(239, 245, 252, 255);
+        constexpr ImU32 kMuted = IM_COL32(169, 187, 205, 255);
+        constexpr ImU32 kPresent = IM_COL32(93, 213, 255, 255);
+        constexpr ImU32 kTick = IM_COL32(123, 235, 172, 255);
+        constexpr ImU32 kFrame = IM_COL32(255, 199, 104, 255);
+        struct Row { const char* label; Slot slot; unsigned depth; unsigned branch; };
+        constexpr Row kRows[] = {
+            {"PRESENT / measured features", Slot::PresentTotal, 0, 0},
+            {"Snapshot", Slot::SnapshotPass, 1, 0},
+            {"Lock wait", Slot::SnapshotLockWait, 2, 0},
+            {"Pose requests", Slot::PoseRequestPass, 1, 0},
+            {"ESP draw", Slot::EspFrame, 1, 0},
+            {"Aim selection / update", Slot::AimbotFrame, 1, 0},
+            {"MAIN TICK / trainer", Slot::TickTotal, 0, 1},
+            {"Pose", Slot::TickPose, 1, 1},
+            {"Joint slot reads", Slot::PoseSlots, 2, 1},
+            {"Health", Slot::TickHealth, 1, 1},
+            {"Collect", Slot::HealthCollect, 2, 1},
+            {"Invoke", Slot::HealthInvoke, 2, 1},
+            {"Attitude", Slot::TickAttitude, 1, 1},
+            {"Collect", Slot::AttitudeCollect, 2, 1},
+            {"Invoke", Slot::AttitudeInvoke, 2, 1},
+            {"Native highlight", Slot::TickHighlight, 1, 1},
+            {"Collect", Slot::HighlightCollect, 2, 1},
+            {"Player modifiers", Slot::TickPlayerModifiers, 1, 1},
+            {"Visibility", Slot::TickVisibility, 1, 1},
+        };
         struct History
         {
-            std::array<float, kHistorySize> fps{};
-            std::array<float, kHistorySize> frameTimeMs{};
-            std::array<float, kHistorySize> trainerCpuUs{};
-            std::size_t next = 0;
-            std::size_t count = 0;
+            std::array<float, kHistory> frame{}, peak{}, present{}, tick{};
+            unsigned next = 0, count = 0, samples = 0;
+            float elapsed = 0, frameSum = 0, framePeak = 0, presentSum = 0, tickSum = 0;
+        } g_history;
+        Diagnostics::Profile::WindowSnapshot g_window;
+        bool g_wasEnabled = false;
+        bool g_expanded[2] = {true, true};
+        float g_alpha = 1.0f;
 
-            void Clear()
-            {
-                next = 0;
-                count = 0;
-            }
-
-            void Push(float fpsValue, float frameTimeValue, float cpuValue)
-            {
-                fps[next] = fpsValue;
-                frameTimeMs[next] = frameTimeValue;
-                trainerCpuUs[next] = cpuValue;
-                next = (next + 1) % kHistorySize;
-                count = (std::min)(count + 1, kHistorySize);
-            }
-        };
-
-        struct SmoothedSample
+        ImU32 Ink(ImU32 color)
         {
-            float fps = 0.0f;
-            float frameTimeMs = 0.0f;
-            float trainerCpuUs = 0.0f;
-            float sampleAccumulator = 0.0f;
-            bool initialized = false;
-
-            void Clear() { *this = {}; }
-        };
-
-        History g_history;
-        SmoothedSample g_smoothed;
-        bool g_graphWasEnabled = false;
-
-        float Sanitize(float value)
-        {
-            return std::isfinite(value) && value >= 0.0f ? value : 0.0f;
+            return (color & 0x00FFFFFFu) | (static_cast<ImU32>((color >> 24) * g_alpha) << 24);
         }
-
-        ImVec2 ClampGraphPosition(ImVec2 position, const ImGuiIO& io)
+        void Text(ImDrawList* draw, float x, float y, const char* text, ImU32 color = kText,
+                  UiKit::Font font = UiKit::Font::Micro)
         {
-            const float maximumX = (std::max)(0.0f, io.DisplaySize.x - kGraphWidth);
-            const float maximumY = (std::max)(0.0f, io.DisplaySize.y - kGraphHeight);
-            position.x = std::clamp(position.x, 0.0f, maximumX);
-            position.y = std::clamp(position.y, 0.0f, maximumY);
-            return position;
+            UiKit::PaintText(draw, font, ImVec2(x + 1, y + 1), Ink(IM_COL32(0, 0, 0, 220)), text);
+            UiKit::PaintText(draw, font, ImVec2(x, y), Ink(color), text);
         }
-
-        void UpdateHistory(const ImGuiIO& io)
+        void Right(ImDrawList* draw, float x, float y, const char* text, ImU32 color = kText)
         {
-            const float delta = std::clamp(Sanitize(io.DeltaTime), 0.0f, 0.25f);
-            const float rawFrameTime = Sanitize(io.DeltaTime * 1000.0f);
-            const float rawFps = Sanitize(io.Framerate > 0.0f
-                                              ? io.Framerate
-                                              : (rawFrameTime > 0.0f ? 1000.0f / rawFrameTime : 0.0f));
-            const float rawCpu = Sanitize(static_cast<float>(Diagnostics::Profile::LastPresentMicroseconds() +
-                                                              Diagnostics::Profile::LastTickTotalMicroseconds()));
-
-            if (!g_smoothed.initialized)
-            {
-                g_smoothed.fps = rawFps;
-                g_smoothed.frameTimeMs = rawFrameTime;
-                g_smoothed.trainerCpuUs = rawCpu;
-                g_smoothed.sampleAccumulator = kSampleIntervalSeconds;
-                g_smoothed.initialized = true;
-            }
-            else
-            {
-                // 프레임률에 독립적인 EMA. 10Hz로만 히스토리에 넣어 고FPS에서도 약 12초의 추세가 보인다.
-                const float alpha = 1.0f - std::exp(-delta / kSmoothingTimeSeconds);
-                g_smoothed.fps += (rawFps - g_smoothed.fps) * alpha;
-                g_smoothed.frameTimeMs += (rawFrameTime - g_smoothed.frameTimeMs) * alpha;
-                g_smoothed.trainerCpuUs += (rawCpu - g_smoothed.trainerCpuUs) * alpha;
-                g_smoothed.sampleAccumulator += delta;
-            }
-
-            if (g_smoothed.sampleAccumulator >= kSampleIntervalSeconds)
-            {
-                g_smoothed.sampleAccumulator = std::fmod(g_smoothed.sampleAccumulator, kSampleIntervalSeconds);
-                g_history.Push(g_smoothed.fps, g_smoothed.frameTimeMs, g_smoothed.trainerCpuUs);
-            }
+            Text(draw, x - UiKit::MeasureText(UiKit::Font::Mono, text).x, y, text, color, UiKit::Font::Mono);
         }
-
-        void DrawPlot(ImDrawList* drawList, const ImVec2& origin, float width, float height, int plotAlpha,
-                      int borderAlpha, const char* label,
-                      const char* format, const std::array<float, kHistorySize>& values, std::size_t count,
-                      std::size_t next, ImU32 color)
+        void Rule(ImDrawList* draw, float x, float y, float width)
         {
-            const UiTheme::Palette& palette = UiTheme::Current();
-            const ImVec2 maximum(origin.x + width, origin.y + height);
-            drawList->AddRectFilled(origin, maximum, UiTheme::WithAlpha(palette.background, plotAlpha), 5.0f);
-            drawList->AddRect(origin, maximum, UiTheme::WithAlpha(palette.borderSubtle, borderAlpha), 5.0f,
-                              1.0f, ImDrawFlags_None);
-
-            char valueText[40]{};
-            const std::size_t lastIndex = count == 0 ? 0 : (next + kHistorySize - 1) % kHistorySize;
-            snprintf(valueText, sizeof(valueText), format, count == 0 ? 0.0f : values[lastIndex]);
-
-            UiKit::PaintText(drawList, UiKit::Font::Micro, ImVec2(origin.x + 8.0f, origin.y + 5.0f),
-                             palette.textSecondary, label);
-            const ImVec2 valueSize = UiKit::MeasureText(UiKit::Font::Mono, valueText);
-            UiKit::PaintText(drawList, UiKit::Font::Mono,
-                             ImVec2(maximum.x - valueSize.x - 8.0f, origin.y + 4.0f), color, valueText);
-
-            const float plotLeft = origin.x + 8.0f;
-            const float plotRight = maximum.x - 8.0f;
-            const float plotTop = origin.y + 22.0f;
-            const float plotBottom = maximum.y - 7.0f;
-            const float plotHeight = (std::max)(1.0f, plotBottom - plotTop);
-            const float plotWidth = (std::max)(1.0f, plotRight - plotLeft);
-
-            float minimum = 0.0f;
-            float maximumValue = 0.0f;
-            if (count > 0)
-            {
-                minimum = values[(next + kHistorySize - count) % kHistorySize];
-                maximumValue = minimum;
-                for (std::size_t i = 1; i < count; ++i)
-                {
-                    const float value = values[(next + kHistorySize - count + i) % kHistorySize];
-                    minimum = (std::min)(minimum, value);
-                    maximumValue = (std::max)(maximumValue, value);
-                }
-            }
-            if (maximumValue - minimum < 0.001f)
-            {
-                const float padding = (std::max)(1.0f, maximumValue * 0.10f);
-                minimum = (std::max)(0.0f, minimum - padding);
-                maximumValue += padding;
-            }
-            else
-            {
-                const float padding = (maximumValue - minimum) * 0.10f;
-                minimum = (std::max)(0.0f, minimum - padding);
-                maximumValue += padding;
-            }
-
-            const float range = (std::max)(0.001f, maximumValue - minimum);
-            for (unsigned row = 1; row < 3; ++row)
-            {
-                const float y = plotTop + plotHeight * static_cast<float>(row) * 0.3333333f;
-                drawList->AddLine(ImVec2(plotLeft, y), ImVec2(plotRight, y),
-                                  UiTheme::WithAlpha(palette.borderSubtle, 150), 1.0f);
-            }
-            if (count == 0)
-                return;
-
+            draw->AddLine(ImVec2(x, y), ImVec2(x + width, y), Ink(IM_COL32(190, 211, 230, 65)));
+        }
+        void Update(const ImGuiIO& io)
+        {
+            const float dt = std::isfinite(io.DeltaTime) && io.DeltaTime > 0 ? io.DeltaTime : 0;
+            if (dt == 0) return;
+            auto& h = g_history;
+            h.elapsed += dt;
+            h.frameSum += dt * 1000;
+            h.framePeak = (std::max)(h.framePeak, dt * 1000);
+            h.presentSum += static_cast<float>(Diagnostics::Profile::LastPresentMicroseconds());
+            h.tickSum += static_cast<float>(Diagnostics::Profile::LastTickTotalMicroseconds());
+            ++h.samples;
+            if (h.elapsed < 0.1f) return;
+            h.frame[h.next] = h.frameSum / h.samples;
+            h.peak[h.next] = h.framePeak;
+            h.present[h.next] = h.presentSum / h.samples;
+            h.tick[h.next] = h.tickSum / h.samples;
+            h.next = (h.next + 1) % kHistory;
+            h.count = (std::min)(h.count + 1, kHistory);
+            h.elapsed = h.frameSum = h.framePeak = h.presentSum = h.tickSum = 0;
+            h.samples = 0;
+        }
+        void Curve(ImDrawList* draw, ImVec2 origin, float width, float height,
+                   const std::array<float, kHistory>& values, float ceiling, ImU32 color, float thickness)
+        {
             ImVec2 previous;
-            for (std::size_t i = 0; i < count; ++i)
+            for (unsigned i = 0; i < g_history.count; ++i)
             {
-                const float value = values[(next + kHistorySize - count + i) % kHistorySize];
-                const float normalized = std::clamp((value - minimum) / range, 0.0f, 1.0f);
-                const float x = count == 1
-                                    ? plotLeft
-                                    : plotLeft + plotWidth * static_cast<float>(i) /
-                                                     static_cast<float>(count - 1);
-                const ImVec2 point(x, plotBottom - normalized * plotHeight);
-                if (i > 0)
-                    drawList->AddLine(previous, point, color, 1.5f);
+                const unsigned index = (g_history.next + kHistory - g_history.count + i) % kHistory;
+                const float x = origin.x + width * (kHistory - g_history.count + i) / (kHistory - 1);
+                const float y = origin.y + height * (1 - std::clamp(values[index] / ceiling, 0.0f, 1.0f));
+                const ImVec2 point(x, y);
+                if (i) draw->AddLine(previous, point, Ink(color), thickness);
                 previous = point;
             }
         }
-
+        void Plots(ImDrawList* draw, ImVec2 p)
+        {
+            const auto& h = g_history;
+            const unsigned last = (h.next + kHistory - 1) % kHistory;
+            char label[128];
+            snprintf(label, sizeof(label), "%.0f FPS   /   %.2f ms", ImGui::GetIO().Framerate,
+                     h.count ? h.frame[last] : 0);
+            Text(draw, p.x, p.y, label, kFrame, UiKit::Font::Mono);
+            Text(draw, p.x + 330, p.y, "PRESENT", kPresent);
+            Text(draw, p.x + 450, p.y, "MAIN TICK", kTick);
+            float frameTop = 16.67f, cpuTop = 100;
+            for (unsigned i = 0; i < h.count; ++i)
+            {
+                const unsigned j = (h.next + kHistory - h.count + i) % kHistory;
+                frameTop = (std::max)(frameTop, h.peak[j]);
+                cpuTop = (std::max)(cpuTop, (std::max)(h.present[j], h.tick[j]));
+            }
+            frameTop *= 1.15f;
+            cpuTop *= 1.15f;
+            for (unsigned graph = 0; graph < 2; ++graph)
+            {
+                const float left = p.x + graph * 330;
+                const float top = p.y + 28;
+                for (unsigned line = 0; line < 3; ++line) Rule(draw, left, top + line * 25, 300);
+                snprintf(label, sizeof(label), "0 - %.0f %s", graph ? cpuTop : frameTop, graph ? "us" : "ms");
+                Text(draw, left, top + 54, label, kMuted);
+            }
+            Curve(draw, ImVec2(p.x, p.y + 28), 300, 50, h.peak, frameTop, IM_COL32(255, 199, 104, 90), 1);
+            Curve(draw, ImVec2(p.x, p.y + 28), 300, 50, h.frame, frameTop, kFrame, 1.5f);
+            if (Diagnostics::Profile::Enabled())
+            {
+                Curve(draw, ImVec2(p.x + 330, p.y + 28), 300, 50, h.present, cpuTop, kPresent, 1.5f);
+                Curve(draw, ImVec2(p.x + 330, p.y + 28), 300, 50, h.tick, cpuTop, kTick, 1.5f);
+            }
+        }
+        float Table(ImDrawList* draw, ImVec2 p, bool menuVisible, bool valid)
+        {
+            Text(draw, p.x, p.y, "SCOPE", kMuted);
+            Text(draw, p.x + 294, p.y, "AVG us / F|T", kMuted);
+            Text(draw, p.x + 424, p.y, "MAX us / CALL", kMuted);
+            Text(draw, p.x + 552, p.y, "CALLS / F|T", kMuted);
+            float y = p.y + 24;
+            for (const auto& row : kRows)
+            {
+                if (row.depth && !g_expanded[row.branch]) continue;
+                const ImU32 color = row.branch ? kTick : kPresent;
+                const auto& metric = g_window.Get(row.slot);
+                const auto& root = g_window.Get(row.branch ? Slot::TickTotal : Slot::PresentTotal);
+                if (row.depth == 0)
+                {
+                    Rule(draw, p.x, y - 3, 630);
+                    Text(draw, p.x, y, g_expanded[row.branch] ? "-" : "+", color);
+                    if (menuVisible)
+                    {
+                        ImGui::PushID(static_cast<int>(row.branch));
+                        ImGui::SetCursorScreenPos(ImVec2(p.x, y));
+                        ImGui::InvisibleButton("##branch", ImVec2(280, 20));
+                        if (ImGui::IsItemClicked()) g_expanded[row.branch] = !g_expanded[row.branch];
+                        ImGui::PopID();
+                    }
+                }
+                Text(draw, p.x + 14 + row.depth * 13, y, row.label,
+                     row.depth == 0 ? color : row.depth == 2 ? kMuted : kText);
+                char value[48];
+                if (valid && metric.count && root.count)
+                {
+                    snprintf(value, sizeof(value), "%.2f", metric.total / root.count);
+                    Right(draw, p.x + 400, y, value, color);
+                    snprintf(value, sizeof(value), "%.2f", metric.maximum);
+                    Right(draw, p.x + 530, y, value);
+                    snprintf(value, sizeof(value), "%.2f", static_cast<double>(metric.count) / root.count);
+                    Right(draw, p.x + 630, y, value, kMuted);
+                }
+                else
+                {
+                    Right(draw, p.x + 400, y, "--", kMuted);
+                    Right(draw, p.x + 530, y, "--", kMuted);
+                    Right(draw, p.x + 630, y, "--", kMuted);
+                }
+                y += 21;
+            }
+            return y;
+        }
+        void ValueLine(ImDrawList* draw, float x, float y, const char* title, Slot slot, bool valid, const char* unit)
+        {
+            Text(draw, x, y, title, kMuted);
+            const auto& metric = g_window.Get(slot);
+            char text[80];
+            if (valid && metric.count)
+                snprintf(text, sizeof(text), "%.1f / %.1f %s", metric.Average(), metric.maximum, unit);
+            else snprintf(text, sizeof(text), "--");
+            Right(draw, x + 300, y, text);
+        }
         void DrawGraph(Features::DebugSettings& settings, bool menuVisible, const ImGuiIO& io)
         {
+            unsigned rows = 0;
+            for (auto& row : kRows) if (!row.depth || g_expanded[row.branch]) ++rows;
+            const float contentHeight = 286 + rows * 21.0f;
+            const float height = (std::min)(contentHeight, io.DisplaySize.y - 16);
+            const float width = (std::min)(kWidth, io.DisplaySize.x);
+            auto clamp = [&](ImVec2 p) {
+                return ImVec2(std::clamp(p.x, 0.0f, (std::max)(0.0f, io.DisplaySize.x - width)),
+                              std::clamp(p.y, 0.0f, (std::max)(0.0f, io.DisplaySize.y - height)));
+            };
             ImVec2 position(settings.graphPositionX, settings.graphPositionY);
-            if (position.x < 0.0f || position.y < 0.0f)
-                position = ImVec2(kGraphMargin,
-                                  (std::max)(kGraphMargin, io.DisplaySize.y - kGraphHeight - kGraphMargin));
-            position = ClampGraphPosition(position, io);
+            if (position.x < 0 || position.y < 0) position = ImVec2(14, io.DisplaySize.y - height - 14);
+            position = clamp(position);
             settings.graphPositionX = position.x;
             settings.graphPositionY = position.y;
-
-            ImGui::SetNextWindowPos(position, ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(kGraphWidth, kGraphHeight), ImGuiCond_Always);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-            ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
-                                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBackground;
-            if (!menuVisible)
-                flags |= ImGuiWindowFlags_NoInputs;
-            if (!ImGui::Begin("##performance_graph", nullptr, flags))
-            {
-                ImGui::End();
-                ImGui::PopStyleVar(2);
-                return;
-            }
-
-            const UiTheme::Palette& palette = UiTheme::Current();
-            const int panelAlpha = static_cast<int>(
-                std::clamp(settings.graphOpacityPercent, 35.0f, 100.0f) * 2.55f + 0.5f);
-            const int plotAlpha = (std::max)(0, panelAlpha - 14);
-            const int borderAlpha = (std::max)(0, panelAlpha - 19);
-            const ImVec2 origin = ImGui::GetWindowPos();
-            const ImVec2 maximum(origin.x + kGraphWidth, origin.y + kGraphHeight);
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
-            drawList->AddRectFilled(ImVec2(origin.x + 3.0f, origin.y + 5.0f),
-                                    ImVec2(maximum.x + 3.0f, maximum.y + 5.0f), palette.shadow, 9.0f);
-            drawList->AddRectFilled(origin, maximum, UiTheme::WithAlpha(palette.surface, panelAlpha), 8.0f);
-            drawList->AddRect(origin, maximum, UiTheme::WithAlpha(palette.border, borderAlpha), 8.0f, 1.0f,
-                              ImDrawFlags_None);
-            drawList->AddRectFilled(ImVec2(origin.x, origin.y + 9.0f),
-                                    ImVec2(origin.x + 3.0f, origin.y + kHeaderHeight - 9.0f), palette.accent, 1.5f);
-            drawList->AddRectFilled(ImVec2(origin.x, origin.y + kHeaderHeight - 1.0f),
-                                    ImVec2(maximum.x, origin.y + kHeaderHeight),
-                                    UiTheme::WithAlpha(palette.borderSubtle, borderAlpha));
-            UiKit::PaintText(drawList, UiKit::Font::Section, ImVec2(origin.x + 14.0f, origin.y + 9.0f),
-                             palette.text, "Performance");
-            UiKit::PaintText(drawList, UiKit::Font::Micro, ImVec2(maximum.x - 58.0f, origin.y + 11.0f),
-                             menuVisible ? palette.accent : palette.textDisabled,
-                             menuVisible ? "DRAG" : "LIVE");
-
+            ImGui::SetNextWindowPos(position);
+            ImGui::SetNextWindowSize(ImVec2(width, height));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
+            ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar;
+            if (!menuVisible) flags |= ImGuiWindowFlags_NoInputs;
+            ImGui::Begin("##performance_graph", nullptr, flags);
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            const ImVec2 p(position.x + 5, position.y + 4 - ImGui::GetScrollY());
+            g_alpha = std::clamp(settings.graphOpacityPercent / 100.0f, 0.35f, 1.0f);
+            const bool enabled = Diagnostics::Profile::Enabled();
+            if (enabled) Diagnostics::Profile::ReadWindow(g_window);
+            else g_window = {};
+            const bool valid = enabled && g_window.capturedAt != 0 && GetTickCount64() - g_window.capturedAt < 10000;
+            Text(draw, p.x, p.y, "PERFORMANCE", kText, UiKit::Font::Section);
+            char status[128];
+            snprintf(status, sizeof(status), "%s / %s", !enabled ? "PROFILING OFF" : !valid ? "WAITING" : "LIVE",
+                     menuVisible ? "DRAG HEADER" : "INSERT TO INSPECT");
+            Right(draw, p.x + 630, p.y + 2, status, enabled ? kMuted : kFrame);
             if (menuVisible)
             {
-                ImGui::SetCursorScreenPos(origin);
-                ImGui::InvisibleButton("##drag_header", ImVec2(kGraphWidth, kHeaderHeight));
+                ImGui::SetCursorScreenPos(ImVec2(p.x, p.y));
+                ImGui::InvisibleButton("##drag", ImVec2(630, 26));
                 if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
                 {
-                    position.x += io.MouseDelta.x;
-                    position.y += io.MouseDelta.y;
-                    position = ClampGraphPosition(position, io);
-                    settings.graphPositionX = position.x;
-                    settings.graphPositionY = position.y;
+                    const auto next = clamp(ImVec2(position.x + io.MouseDelta.x, position.y + io.MouseDelta.y));
+                    settings.graphPositionX = next.x;
+                    settings.graphPositionY = next.y;
                 }
             }
-
-            constexpr float inset = 8.0f;
-            constexpr float plotGap = 4.0f;
-            constexpr float plotHeight = 55.0f;
-            const float plotWidth = kGraphWidth - inset * 2.0f;
-            const float plotY = origin.y + kHeaderHeight + 6.0f;
-            DrawPlot(drawList, ImVec2(origin.x + inset, plotY), plotWidth, plotHeight, plotAlpha, borderAlpha,
-                     "FPS", "%.0f fps",
-                     g_history.fps, g_history.count, g_history.next, palette.accent);
-            DrawPlot(drawList, ImVec2(origin.x + inset, plotY + plotHeight + plotGap), plotWidth, plotHeight,
-                     plotAlpha, borderAlpha, "FRAME TIME", "%.2f ms", g_history.frameTimeMs, g_history.count,
-                     g_history.next,
-                     palette.warning);
-            DrawPlot(drawList, ImVec2(origin.x + inset, plotY + (plotHeight + plotGap) * 2.0f), plotWidth,
-                     plotHeight, plotAlpha, borderAlpha, "TRAINER CPU", "%.0f us", g_history.trainerCpuUs,
-                     g_history.count, g_history.next, palette.success);
-
+            Plots(draw, ImVec2(p.x, p.y + 32));
+            snprintf(status, sizeof(status), "TREND ~12s / 100ms bins     DETAIL %.1fs window / F = Present, T = main tick",
+                     g_window.durationMs / 1000.0);
+            Text(draw, p.x, p.y + 130, status, kMuted);
+            const float y = Table(draw, ImVec2(p.x, p.y + 151), menuVisible, valid);
+            Rule(draw, p.x, y + 2, 630);
+            Text(draw, p.x, y + 9, "POSE DELIVERY    average / maximum", kText);
+            ValueLine(draw, p.x, y + 31, "Requested", Slot::PoseRequested, valid, "NPC");
+            ValueLine(draw, p.x + 330, y + 31, "Update gap", Slot::PoseIntervalMs, valid, "ms");
+            ValueLine(draw, p.x, y + 51, "Deferred", Slot::PoseDeferred, valid, "NPC");
+            ValueLine(draw, p.x + 330, y + 51, "ESP age", Slot::EspPoseAgeMs, valid, "ms");
+            ValueLine(draw, p.x, y + 71, "Processed", Slot::PoseProcessed, valid, "NPC");
+            ValueLine(draw, p.x + 330, y + 71, "Aim age", Slot::AimPoseAgeMs, valid, "ms");
+            Text(draw, p.x, y + 94, "Inclusive scopes: nested rows are not additive. CPU paths exclude GPU work.", kMuted);
+            ImGui::SetCursorPos(ImVec2(0, contentHeight));
+            ImGui::Dummy(ImVec2(1, 1));
             ImGui::End();
             ImGui::PopStyleVar(2);
         }
     }
-
     void Draw(Features::DebugSettings& settings, bool menuVisible)
     {
-        if (!settings.showFps && !settings.showGraph)
-        {
-            g_graphWasEnabled = false;
-            return;
-        }
-
-        const ImGuiIO& io = ImGui::GetIO();
-        if (io.DisplaySize.x <= 0.0f || io.DisplaySize.y <= 0.0f)
-            return;
-
+        const auto& io = ImGui::GetIO();
+        if (io.DisplaySize.x <= 0 || io.DisplaySize.y <= 0) return;
         if (settings.showGraph)
         {
-            if (!g_graphWasEnabled)
-            {
-                g_history.Clear();
-                g_smoothed.Clear();
-            }
-            g_graphWasEnabled = true;
-            UpdateHistory(io);
-        }
-        else
-        {
-            g_graphWasEnabled = false;
-        }
-
-        if (settings.showFps && io.Framerate > 0.0f)
-        {
-            char text[32]{};
-            snprintf(text, sizeof(text), "%.0f FPS", io.Framerate);
-            const UiTheme::Palette& palette = UiTheme::Current();
-            const ImVec2 textSize = UiKit::MeasureText(UiKit::Font::Mono, text);
-            constexpr float paddingX = 9.0f;
-            constexpr float paddingY = 5.0f;
-            const ImVec2 maximum(io.DisplaySize.x - kGraphMargin,
-                                 kGraphMargin + textSize.y + paddingY * 2.0f);
-            const ImVec2 minimum(maximum.x - textSize.x - paddingX * 2.0f, kGraphMargin);
-            ImDrawList* drawList = ImGui::GetForegroundDrawList();
-            drawList->AddRectFilled(minimum, maximum, UiTheme::WithAlpha(palette.surface, kFpsBadgeAlpha), 6.0f);
-            drawList->AddRect(minimum, maximum, UiTheme::WithAlpha(palette.border, kFpsBadgeAlpha - 19), 6.0f, 1.0f,
-                              ImDrawFlags_None);
-            UiKit::PaintText(drawList, UiKit::Font::Mono,
-                             ImVec2(minimum.x + paddingX, minimum.y + paddingY), palette.text, text);
-        }
-
-        if (settings.showGraph)
+            if (!g_wasEnabled) { g_history = {}; g_window = {}; }
+            Update(io);
             DrawGraph(settings, menuVisible, io);
+        }
+        g_wasEnabled = settings.showGraph;
+        if (settings.showFps && io.Framerate > 0)
+        {
+            g_alpha = 1;
+            char text[40];
+            snprintf(text, sizeof(text), "%.0f FPS", io.Framerate);
+            Right(ImGui::GetForegroundDrawList(), io.DisplaySize.x - 14, 14, text);
+        }
     }
 }

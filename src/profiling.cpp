@@ -26,6 +26,8 @@ namespace
     ULONGLONG g_lastCadenceTick = 0;
     std::uint64_t g_presentFrameTicks = 0;
     std::atomic_bool g_presentFrameActive{false};
+    SRWLOCK g_windowLock = SRWLOCK_INIT;
+    Diagnostics::Profile::WindowSnapshot g_window;
 
     struct SlotInfo
     {
@@ -35,6 +37,7 @@ namespace
 
     // Slot 열거 순서와 반드시 일치해야 한다.
     constexpr SlotInfo kSlotInfo[kSlotCount] = {
+        {"presentFeatures", true},
         {"snapshot", true},
         {"snapLockWait", true},
         {"snapCount", false},
@@ -132,7 +135,7 @@ namespace
     }
 
     void LogGroup(const char* label, Diagnostics::Profile::Slot first, Diagnostics::Profile::Slot last,
-                  std::uint64_t elapsedMilliseconds)
+                  std::uint64_t elapsedMilliseconds, Diagnostics::Profile::WindowSnapshot& window)
     {
         char buffer[512]{};
         std::size_t offset = 0;
@@ -140,6 +143,8 @@ namespace
         for (unsigned index = static_cast<unsigned>(first); index <= static_cast<unsigned>(last); ++index)
         {
             const Sample sample = DrainSlot(g_slots[index]);
+            const double scale = kSlotInfo[index].isDuration ? 1000000.0 / static_cast<double>(Frequency()) : 1.0;
+            window.metrics[index] = {sample.count, sample.total * scale, sample.maximum * scale};
             any = any || sample.count != 0;
             AppendSample(buffer, sizeof(buffer), offset, kSlotInfo[index], sample);
         }
@@ -225,12 +230,28 @@ namespace Diagnostics::Profile
             return;
         g_lastCadenceTick = now;
 
-        LogGroup("present", Slot::SnapshotPass, Slot::AimbotFrame, elapsed);
-        LogGroup("tick", Slot::TickTotal, Slot::TickVisibility, elapsed);
-        LogGroup("tickdetail", Slot::PoseSlots, Slot::HighlightCollect, elapsed);
-        LogGroup("pose-work", Slot::PoseRequested, Slot::PoseDeferred, elapsed);
-        LogGroup("pose-age", Slot::PoseIntervalMs, Slot::AimPoseAgeMs, elapsed);
-        LogGroup("pose-request-category", Slot::PoseRequestCivilian, Slot::PoseRequestOther, elapsed);
+        WindowSnapshot window;
+        window.capturedAt = now;
+        window.durationMs = elapsed;
+        LogGroup("present", Slot::PresentTotal, Slot::AimbotFrame, elapsed, window);
+        LogGroup("tick", Slot::TickTotal, Slot::TickVisibility, elapsed, window);
+        LogGroup("tickdetail", Slot::PoseSlots, Slot::HighlightCollect, elapsed, window);
+        LogGroup("pose-work", Slot::PoseRequested, Slot::PoseDeferred, elapsed, window);
+        LogGroup("pose-age", Slot::PoseIntervalMs, Slot::AimPoseAgeMs, elapsed, window);
+        LogGroup("pose-request-category", Slot::PoseRequestCivilian, Slot::PoseRequestOther, elapsed, window);
+        if (TryAcquireSRWLockExclusive(&g_windowLock))
+        {
+            g_window = window;
+            ReleaseSRWLockExclusive(&g_windowLock);
+        }
+    }
+
+    bool ReadWindow(WindowSnapshot& output)
+    {
+        if (!Enabled() || !TryAcquireSRWLockShared(&g_windowLock)) return false;
+        output = g_window;
+        ReleaseSRWLockShared(&g_windowLock);
+        return output.capturedAt != 0;
     }
 
     void Reset()
@@ -247,6 +268,9 @@ namespace Diagnostics::Profile
         g_presentFrameTicks = 0;
         g_presentFrameActive.store(false, std::memory_order_release);
         g_lastCadenceTick = 0;
+        AcquireSRWLockExclusive(&g_windowLock);
+        g_window = {};
+        ReleaseSRWLockExclusive(&g_windowLock);
     }
 
     void BeginPresentFrame()
@@ -261,6 +285,7 @@ namespace Diagnostics::Profile
             return;
         g_lastPresentTicks.store(g_presentFrameTicks, std::memory_order_release);
         g_presentFrameActive.store(false, std::memory_order_release);
+        Record(Slot::PresentTotal, static_cast<std::int64_t>(g_presentFrameTicks));
     }
 
     std::uint64_t LastPresentMicroseconds()

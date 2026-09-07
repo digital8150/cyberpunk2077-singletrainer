@@ -105,7 +105,7 @@ namespace Features
         bool showFps = true;
         // FPS/프레임타임/트레이너 CPU 시간 그래프.
         bool showGraph = false;
-        // 35~100%. 완전 투명에 가까우면 그래프 자체가 기능을 잃으므로 UI와 config 양쪽에서 하한을 둔다.
+        // Text/line opacity only (35-100%); the performance HUD has no background.
         float graphOpacityPercent = 88.0f;
         // 음수는 아직 사용자가 배치하지 않은 상태다. 첫 표시 때 좌하단 기본 위치를 계산하고, 이후에는
         // 실제 화면 좌표를 저장한다. 해상도가 바뀌면 렌더러가 현재 디스플레이 안으로 다시 clamp한다.
