@@ -101,6 +101,9 @@ if(CP2077_BUILD_TESTS)
     target_compile_options(cp2077_shot_trace_tests PRIVATE /utf-8)
     target_link_libraries(cp2077_shot_trace_tests PRIVATE user32.lib)
     add_test(NAME shot_trace COMMAND cp2077_shot_trace_tests)
+    add_executable(cp2077_pellet_tests tests/pellet_targets.cpp)
+    target_include_directories(cp2077_pellet_tests PRIVATE src)
+    add_test(NAME pellet_targets COMMAND cp2077_pellet_tests)
 endif()
 
 # --- 오버레이 UI 프리뷰 하네스 ---

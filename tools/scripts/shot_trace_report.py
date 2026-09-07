@@ -72,11 +72,24 @@ def summarize(text):
             events = [r for r in records if r['kind'] == 5]
             weapons = [r for r in records if r['kind'] == 3]
             known_weapons = {r['object'] for r in weapons if r['object']}
+            shots = []
+            for begin in (r for r in records if r['kind'] == 6):
+                shot_id = begin['event']
+                end = next((r for r in records if r['kind'] == 7 and r['event'] == shot_id), None)
+                pellets = [r for r in records if r['kind'] == 8 and r['event'] == shot_id]
+                replays = [r for r in records if r['kind'] == 9 and r['event'] == shot_id and r['flags'] & 65536]
+                shots.append({'shot': shot_id, 'ms': ms(begin), 'expected': begin['flags'] & 255,
+                              'regions': begin['flags'] >> 8, 'observed': end['flags'] >> 8 if end else None,
+                              'pellets': [{'index': p['flags'] & 255, 'bone': p['id'],
+                                           'distributed': bool(p['flags'] & 65536), 'target': p['origin']} for p in pellets],
+                              'replays': [{'index': p['flags'] & 255, 'bone': p['id'], 'target': p['origin']} for p in replays]})
             result.append({
                 'capture': cap, 'start_qpc': start['qpc'], 'complete_stop': stop is not None,
                 'dropped': max(0, stop['id'] - start['event']) if stop else None,
                 'duration_ms': ms(stop) if stop else ms(records[-1]),
                 'crosshair_calls': len(calls), 'callers': caller_stats,
+                'shots': shots,
+                'unmatched_replays': sum(r['kind'] == 9 and not (r['flags'] & 65536) for r in records),
                 'input_edges': [{'ms': ms(r), 'buttons': r['flags'] & 3,
                                  'aim_enabled': bool(r['flags'] & 256), 'silent': bool(r['flags'] & 512),
                                  'no_spread': bool(r['flags'] & 1024), 'no_recoil': bool(r['flags'] & 2048),
@@ -116,6 +129,10 @@ def main():
         for caller in report['callers']:
             print('  caller:', caller)
         print('  projectiles/shot samples:', sorted({r['projectiles_per_shot'] for r in report['weapon_samples']}))
+        for shot in report['shots']:
+            print(f"  shot {shot['shot']}: expected={shot['expected']} observed={shot['observed']} "
+                  f"regions={shot['regions']} bones={[p['bone'] for p in shot['pellets']]} "
+                  f"replayed_indices={[p['index'] for p in shot['replays']]}")
         print('  NOTE:', report['limitations'])
 
 

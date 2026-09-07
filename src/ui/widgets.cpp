@@ -312,7 +312,8 @@ namespace Widgets
                 }
             }
             UiKit::EndDisabled();
-            UiKit::HelperText(ko ? "다중 선택 시 조준점과 가장 가까운 본을 선택합니다." : "Multiple selection aims at the closest selected bone.");
+            UiKit::HelperText(ko ? "다중 선택: 사일런트 펠릿을 선택 부위에 순서대로 배정." : "Silent pellets cycle through selected body regions.");
+            UiKit::HelperText(ko ? "Nearest / 스프레드 제거 시 가장 가까운 본을 사용합니다." : "Nearest / no-spread uses the closest bone.");
             UiKit::SectionEnd();
             UiKit::EndDisabled();
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "pellet_targets.h"
 
 namespace Game::SilentAim
 {
@@ -48,7 +49,9 @@ namespace Game::SilentAim
 
     // Present publishes coordinates and estimated target velocity for lead prediction. Native callbacks
     // use freshness as an early filter, so a target that stops being published stops being redirected.
-    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3] = nullptr);
+    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3] = nullptr,
+                       const PelletTargets::Plan* pellets = nullptr);
+    void PublishLocalWeapon(std::uint64_t weapon, bool noSpread);
     void ClearTarget();
     void InvalidateTarget();
     DiagnosticsSnapshot GetDiagnostics();

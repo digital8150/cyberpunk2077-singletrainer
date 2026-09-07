@@ -1112,6 +1112,7 @@ namespace Game::PlayerModifiers
             Game::SilentAim::SetProjectileGravityMultiplier(1.0f);
         }
 
+        Game::SilentAim::PublishLocalWeapon(weaponObject, (desiredModifierMask & kNoSpreadMask) != 0);
         if (Game::ShotTrace::WantWeaponSample())
         {
             auto trace = Game::ShotTrace::Begin(Game::ShotTrace::Weapon);

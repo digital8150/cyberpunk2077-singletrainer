@@ -4,7 +4,8 @@
 
 namespace Game::ShotTrace
 {
-    enum Kind : unsigned { CaptureStart, CaptureStop, Input, Weapon, Crosshair, QueuedEvent };
+    enum Kind : unsigned { CaptureStart, CaptureStop, Input, Weapon, Crosshair, QueuedEvent,
+                           ShotBegin, ShotEnd, Pellet, PelletReplay };
     struct Record
     {
         std::uint64_t sequence = 0, capture = 0, qpc = 0, endQpc = 0;

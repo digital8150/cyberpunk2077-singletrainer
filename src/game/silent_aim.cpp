@@ -249,6 +249,23 @@ namespace
     void* g_queueHookTarget = nullptr;
     QueueEventInternalFn g_originalQueueEventInternal = nullptr;
     void* g_nativeCrosshairCoreTarget = nullptr;
+    using ShotLoopFn = std::uintptr_t(*)(void*, void*);
+    ShotLoopFn g_originalShotLoop = nullptr;
+    void* g_shotLoopTarget = nullptr;
+    std::uintptr_t g_pelletCaller = 0, g_replayCaller = 0;
+    std::atomic<std::uint64_t> g_localWeapon{0}, g_localWeaponAt{0}, g_pelletEpoch{1}, g_nextShot{0};
+    std::atomic<bool> g_noSpread{false};
+    std::atomic<unsigned> g_planCount{0};
+    struct AtomicPoint { std::atomic<float> world[3]{}; std::atomic<unsigned> bone{0}; };
+    AtomicPoint g_planPoints[5];
+    Game::PelletTargets::Cache g_pelletCache;
+    struct ShotScope
+    {
+        Game::PelletTargets::Plan plan{};
+        std::uint64_t shot = 0, epoch = 0;
+        unsigned count = 0, index = 0;
+    };
+    thread_local ShotScope* g_currentShot = nullptr;
     NativeCrosshairCoreFn g_originalNativeCrosshairCore = nullptr;
     void* g_funcOrientationGetTarget = nullptr;
     FuncOrientationGetFn g_originalFuncOrientationGet = nullptr;
@@ -320,12 +337,14 @@ namespace
         return false;
     }
 
-    bool RedirectNativeCrosshair(Vector4Layout* origin, Vector4Layout* direction)
+    bool RedirectNativeCrosshair(Vector4Layout* origin, Vector4Layout* direction, const float* pelletTarget)
     {
         if (!origin || !direction)
             return false;
         float target[3]{};
-        if (!ReadTarget(target))
+        if (pelletTarget)
+            std::copy_n(pelletTarget, 3, target);
+        else if (!ReadTarget(target))
             return false;
 
         const float dx = target[0] - origin->x;
@@ -343,11 +362,11 @@ namespace
         return true;
     }
 
-    bool RedirectNativeCrosshairSafely(Vector4Layout* origin, Vector4Layout* direction)
+    bool RedirectNativeCrosshairSafely(Vector4Layout* origin, Vector4Layout* direction, const float* pelletTarget = nullptr)
     {
         __try
         {
-            return RedirectNativeCrosshair(origin, direction);
+            return RedirectNativeCrosshair(origin, direction, pelletTarget);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -363,11 +382,101 @@ namespace
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
 
+    bool ReadSpreadKey(void* system, const void* rotation, Game::PelletTargets::Key& key)
+    {
+        if (!rotation) return false;
+        __try
+        {
+            key.system = reinterpret_cast<std::uint64_t>(system);
+            std::memcpy(key.rotation.data(), rotation, 16);
+            const auto* q = static_cast<const float*>(rotation);
+            const float norm = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+            return std::isfinite(norm) && norm > 0.9f && norm < 1.1f;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    unsigned ReadPelletCount(void* event)
+    {
+        if (!event) return 0;
+        __try { return *(static_cast<const unsigned char*>(event) + 0x1C0); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    }
+
+    Game::PelletTargets::Plan ReadPelletPlan()
+    {
+        Game::PelletTargets::Plan plan;
+        float target[3];
+        if (!ReadTarget(target) || g_noSpread.load(std::memory_order_acquire)) return plan;
+        for (unsigned attempt = 0; attempt < 3; ++attempt)
+        {
+            const auto before = g_state.targetGeneration.load(std::memory_order_acquire);
+            if (before & 1) continue;
+            plan.count = (std::min)(g_planCount.load(std::memory_order_relaxed), 5u);
+            for (unsigned i = 0; i < plan.count; ++i)
+            {
+                for (unsigned axis = 0; axis < 3; ++axis)
+                    plan.points[i].world[axis] = g_planPoints[i].world[axis].load(std::memory_order_relaxed);
+                plan.points[i].bone = g_planPoints[i].bone.load(std::memory_order_relaxed);
+            }
+            if (before == g_state.targetGeneration.load(std::memory_order_acquire)) return plan;
+        }
+        return {};
+    }
+
+    std::uintptr_t InvokeShotLoop(void* weapon, void* event, ShotScope* scope)
+    {
+        ShotScope* previous = g_currentShot;
+        g_currentShot = scope;
+        __try { return g_originalShotLoop ? g_originalShotLoop(weapon, event) : 0; }
+        __finally { g_currentShot = previous; }
+    }
+
+    std::uintptr_t HookShotLoop(void* weapon, void* event)
+    {
+        HookLifecycle::CallbackGuard guard;
+        ShotScope scope;
+        const auto now = GetTickCount64();
+        const auto sampled = g_localWeaponAt.load(std::memory_order_acquire);
+        const bool local = !HookLifecycle::IsShuttingDown() && sampled && now >= sampled && now - sampled <= 1000 &&
+            reinterpret_cast<std::uint64_t>(weapon) == g_localWeapon.load(std::memory_order_acquire);
+        if (local)
+        {
+            scope.shot = g_nextShot.fetch_add(1, std::memory_order_relaxed) + 1;
+            scope.count = ReadPelletCount(event);
+            scope.epoch = g_pelletEpoch.load(std::memory_order_acquire);
+            if (scope.count > 1 && scope.count <= 64) scope.plan = ReadPelletPlan();
+        }
+        const bool tracing = local && Game::ShotTrace::IsCapturing();
+        auto record = tracing ? Game::ShotTrace::Begin(Game::ShotTrace::ShotBegin) : Game::ShotTrace::Record{};
+        if (tracing)
+        {
+            record.object = reinterpret_cast<std::uint64_t>(weapon);
+            record.context = reinterpret_cast<std::uint64_t>(event);
+            record.event = scope.shot;
+            record.identity = scope.epoch;
+            record.flags = scope.count | (scope.plan.count << 8);
+            Game::ShotTrace::Submit(record);
+        }
+        // Preserve any integer return bits; the original's return is otherwise unused at the known call sites.
+        const auto result = InvokeShotLoop(weapon, event, local ? &scope : nullptr);
+        if (tracing)
+        {
+            auto end = Game::ShotTrace::Begin(Game::ShotTrace::ShotEnd);
+            end.object = record.object; end.context = record.context;
+            end.event = scope.shot; end.identity = scope.epoch;
+            end.flags = scope.count | (scope.index << 8);
+            Game::ShotTrace::Submit(end);
+        }
+        return result;
+    }
+
     void HookNativeCrosshairCore(void* targetingSystem, Vector4Layout* origin,
                                  Vector4Layout* direction, Vector4Layout* crosshairPosition,
                                  void* queryContext, float maxDistance, void* filter, bool useRaycast)
     {
         HookLifecycle::CallbackGuard guard;
+        const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
         const bool tracing = Game::ShotTrace::IsCapturing();
         Game::ShotTrace::Record trace;
         if (tracing)
@@ -400,7 +509,47 @@ namespace
             const bool vectors = TraceVector(origin, trace.origin) && TraceVector(direction, trace.before);
             if (vectors) trace.flags |= 4u;
         }
-        const bool redirected = RedirectNativeCrosshairSafely(origin, direction);
+        Game::PelletTargets::Mapping mapping;
+        Game::PelletTargets::Key key;
+        bool distributed = false;
+        const auto epoch = g_pelletEpoch.load(std::memory_order_acquire);
+        const bool firstPass = caller == g_pelletCaller && g_currentShot;
+        if (firstPass)
+        {
+            auto& shot = *g_currentShot;
+            mapping.shot = shot.shot;
+            mapping.index = shot.index++;
+            mapping.count = shot.count;
+            mapping.epoch = shot.epoch;
+            mapping.expires = GetTickCount64() + kTargetTimeoutMilliseconds;
+            if (shot.plan.count > 1 && mapping.index < shot.count && shot.epoch == epoch &&
+                g_state.targetActive.load(std::memory_order_acquire) && ReadSpreadKey(targetingSystem, queryContext, key))
+            {
+                mapping.key = key;
+                mapping.point = shot.plan.At(mapping.index);
+                distributed = g_pelletCache.Store(mapping);
+            }
+        }
+        else if (caller == g_replayCaller && g_state.targetActive.load(std::memory_order_acquire) &&
+                 ReadSpreadKey(targetingSystem, queryContext, key))
+        {
+            distributed = g_pelletCache.Find(key, epoch, GetTickCount64(), mapping);
+        }
+        const bool redirected = RedirectNativeCrosshairSafely(origin, direction, distributed ? mapping.point.world : nullptr);
+        if (tracing && (firstPass || caller == g_replayCaller))
+        {
+            auto pellet = Game::ShotTrace::Begin(firstPass ? Game::ShotTrace::Pellet : Game::ShotTrace::PelletReplay);
+            pellet.caller = caller;
+            pellet.object = reinterpret_cast<std::uint64_t>(targetingSystem);
+            pellet.context = reinterpret_cast<std::uint64_t>(queryContext);
+            pellet.event = mapping.shot;
+            pellet.identity = mapping.point.bone;
+            pellet.flags = mapping.index | (mapping.count << 8) | (distributed ? 0x10000u : 0u);
+            std::copy_n(mapping.point.world, 3, pellet.origin);
+            TraceVector(static_cast<Vector4Layout*>(queryContext), pellet.before);
+            TraceVector(direction, pellet.after);
+            Game::ShotTrace::Submit(pellet);
+        }
         if (tracing)
         {
             if (redirected) trace.flags |= 2u;
@@ -424,6 +573,42 @@ namespace
                              origin->x, origin->y, origin->z,
                              direction->x, direction->y, direction->z);
         }
+    }
+
+    bool MatchesCode(const unsigned char* code, std::size_t size, std::uint64_t expected)
+    {
+        __try
+        {
+            std::uint64_t hash = 14695981039346656037ull;
+            for (std::size_t i = 0; i < size; ++i) hash = (hash ^ code[i]) * 1099511628211ull;
+            return hash == expected;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    void AddShotLoopHook()
+    {
+        // Cyberpunk 2077 2.31 only. Verify all three complete functions before using their offsets/ABI.
+        // The loop tests event+0x1C0, increments R15B, and invokes the first wrapper once per iteration.
+        auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(L"Cyberpunk2077.exe"));
+        if (!base || !MatchesCode(base + 0x659C5C, 0x42C, 0x3A01B78848BFF920ull) ||
+            !MatchesCode(base + 0x2048B7C, 0x76, 0xEE5EEB944F9CD877ull) ||
+            !MatchesCode(base + 0x6573A8, 0x6D, 0x05BDA25B7D38B3F2ull))
+        {
+            Diagnostics::Log("silent aim pellet hook unavailable: 2.31 full-function validation failed");
+            return;
+        }
+        auto* target = base + 0x659C5C;
+        const auto status = MH_CreateHook(target, &HookShotLoop, reinterpret_cast<void**>(&g_originalShotLoop));
+        if (status != MH_OK)
+        {
+            Diagnostics::Log("silent aim pellet hook failed: %s", MH_StatusToString(status));
+            return;
+        }
+        g_shotLoopTarget = target;
+        g_pelletCaller = reinterpret_cast<std::uintptr_t>(base + 0x2048BED);
+        g_replayCaller = reinterpret_cast<std::uintptr_t>(base + 0x657410);
+        Diagnostics::Log("silent aim pellet loop hook created: target=%p maxPellets=64 replay=exact-spread-rotation", target);
     }
 
     bool AddNativeCrosshairCoreHook()
@@ -1543,6 +1728,7 @@ namespace Game::SilentAim
         {
             bool created = false;
             created = AddNativeCrosshairCoreHook() || created;
+            if (g_nativeCrosshairCoreTarget) AddShotLoopHook();
             created = AddProducerObservationHook("gameEffectInstance", "Run", ProducerHookKind::EffectRun) || created;
             created = AddProducerObservationHook("gameAttack_GameEffect", "StartAttack",
                                                  ProducerHookKind::AttackStart) || created;
@@ -1617,7 +1803,14 @@ namespace Game::SilentAim
         g_state.projectileGravityMultiplier.store(multiplier, std::memory_order_release);
     }
 
-    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3])
+    void PublishLocalWeapon(std::uint64_t weapon, bool noSpread)
+    {
+        g_localWeapon.store(weapon, std::memory_order_release);
+        g_noSpread.store(noSpread, std::memory_order_release);
+        g_localWeaponAt.store(GetTickCount64(), std::memory_order_release);
+    }
+
+    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3], const PelletTargets::Plan* pellets)
     {
         if (!active || !worldTarget || !g_state.hookCreated.load(std::memory_order_acquire) ||
             !std::isfinite(worldTarget[0]) || !std::isfinite(worldTarget[1]) || !std::isfinite(worldTarget[2]))
@@ -1629,6 +1822,14 @@ namespace Game::SilentAim
         g_state.targetX.store(worldTarget[0], std::memory_order_relaxed);
         g_state.targetY.store(worldTarget[1], std::memory_order_relaxed);
         g_state.targetZ.store(worldTarget[2], std::memory_order_relaxed);
+        const unsigned count = pellets ? (std::min)(pellets->count, 5u) : 0u;
+        g_planCount.store(count, std::memory_order_relaxed);
+        for (unsigned i = 0; i < count; ++i)
+        {
+            for (unsigned axis = 0; axis < 3; ++axis)
+                g_planPoints[i].world[axis].store(pellets->points[i].world[axis], std::memory_order_relaxed);
+            g_planPoints[i].bone.store(pellets->points[i].bone, std::memory_order_relaxed);
+        }
         if (worldVelocity && std::isfinite(worldVelocity[0]) &&
             std::isfinite(worldVelocity[1]) && std::isfinite(worldVelocity[2]))
         {
@@ -1649,6 +1850,7 @@ namespace Game::SilentAim
 
     void InvalidateTarget()
     {
+        g_pelletEpoch.fetch_add(1, std::memory_order_acq_rel);
         g_state.targetActive.store(false, std::memory_order_release);
         g_state.targetPublishedAt.store(0, std::memory_order_release);
         g_state.spawnerArmedAt.store(0, std::memory_order_release);
@@ -1656,7 +1858,8 @@ namespace Game::SilentAim
 
     void ClearTarget()
     {
-        g_state.targetActive.store(false, std::memory_order_release);
+        if (g_state.targetActive.exchange(false, std::memory_order_acq_rel))
+            g_pelletEpoch.fetch_add(1, std::memory_order_acq_rel);
         // Retain targetPublishedAt and target coordinates so in-flight projectile launch
         // animations (which fire 200-500ms after the player releases aim) can still acquire
         // the target during the 1200ms grace period.
@@ -1725,6 +1928,10 @@ namespace Game::SilentAim
         g_state.queueHookCreated.store(false, std::memory_order_release);
         if (g_nativeCrosshairCoreTarget)
             MH_RemoveHook(g_nativeCrosshairCoreTarget);
+        if (g_shotLoopTarget) MH_RemoveHook(g_shotLoopTarget);
+        g_shotLoopTarget = nullptr;
+        g_originalShotLoop = nullptr;
+        g_pelletCaller = g_replayCaller = 0;
         g_nativeCrosshairCoreTarget = nullptr;
         g_originalNativeCrosshairCore = nullptr;
         g_state.crosshairCoreHookCreated.store(false, std::memory_order_release);

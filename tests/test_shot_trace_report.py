@@ -15,6 +15,27 @@ def record(seq, kind, qpc, identity=0, flags=0):
 
 
 class TraceReportTests(unittest.TestCase):
+    def test_explicit_shot_and_async_replay(self):
+        def shot_record(seq, kind, qpc, identity=0, flags=0):
+            return record(seq, kind, qpc, identity, flags).replace('event=0', 'event=2A')
+        lines = record(0, 0, 100, identity=1000)
+        lines += shot_record(1, 6, 101, flags=6 | (2 << 8))
+        # Writer ordering and worker scheduling do not define pellet indices.
+        for i in reversed(range(6)):
+            lines += shot_record(i + 2, 8, 110 + i, identity=1 if i % 2 == 0 else 4,
+                                 flags=i | (6 << 8) | 65536)
+            lines += shot_record(i + 10, 9, 140 + i, identity=1 if i % 2 == 0 else 4,
+                                 flags=i | (6 << 8) | 65536)
+        lines += shot_record(8, 7, 120, flags=6 | (6 << 8))
+        lines += record(9, 9, 130)  # unrelated extra downstream query
+        lines += record(20, 1, 160)
+        result = report.summarize(lines)[0]
+        shot = result['shots'][0]
+        self.assertEqual((shot['shot'], shot['expected'], shot['observed'], shot['regions']), (42, 6, 6, 2))
+        self.assertEqual([p['bone'] for p in shot['pellets']], [1, 4, 1, 4, 1, 4])
+        self.assertEqual([p['index'] for p in shot['replays']], list(range(6)))
+        self.assertEqual(result['unmatched_replays'], 1)
+
     def test_ring_order_and_reinjection(self):
         lines = (record(2, 4, 120, flags=2) + record(0, 0, 100, identity=1000) +
                  record(1, 3, 110, identity=42) + record(3, 5, 130, flags=108) +

@@ -351,7 +351,27 @@ namespace Aimbot
             if (g_aimActive)
                 Game::AimAssist::ClearMemoryAim();
             g_aimActive = false;
-            Game::SilentAim::PublishTarget(bestWorld, true, settings.leadPrediction ? targetVelocity : nullptr);
+            Game::PelletTargets::Plan pellets;
+            if (selected && !settings.nearestBone)
+            {
+                for (unsigned bone = 1; bone <= 16; bone <<= 1)
+                {
+                    if (!(settings.boneMask & bone)) continue;
+                    auto groupSettings = settings;
+                    groupSettings.boneMask = bone;
+                    auto& candidate = pellets.points[pellets.count];
+                    if (GetAimPoint(*selected, groupSettings, displayWidth, displayHeight, candidate.world))
+                    {
+                        Game::Projection::ScreenPoint point;
+                        if (!Game::Projection::WorldToScreen(candidate.world, displayWidth, displayHeight, point)) continue;
+                        const float dx = point.x - center.x, dy = point.y - center.y;
+                        if (dx * dx + dy * dy > fovRadiusPixels * fovRadiusPixels) continue;
+                        candidate.bone = bone;
+                        ++pellets.count;
+                    }
+                }
+            }
+            Game::SilentAim::PublishTarget(bestWorld, true, settings.leadPrediction ? targetVelocity : nullptr, &pellets);
             static ULONGLONG lastSilentLogTick = 0;
             if (now - lastSilentLogTick >= 2000)
             {
