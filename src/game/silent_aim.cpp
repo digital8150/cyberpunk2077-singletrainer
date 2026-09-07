@@ -9,6 +9,7 @@
 
 #include <MinHook.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -26,7 +27,8 @@ namespace
     constexpr std::size_t kShootWeaponVelocityOffset = 0x110;
     constexpr std::size_t kShootParamsOffset = 0x120;
     constexpr std::size_t kSetUpOwnerOffset = 0x40;
-    constexpr ULONGLONG kTargetTimeoutMilliseconds = 250;
+    constexpr ULONGLONG kTargetTimeoutMilliseconds = 350;
+    constexpr ULONGLONG kProjectileGracePeriodMs = 1200;
     // Cyberpunk 2077 projectile simulation gravity for throwing knives and axes (from tweakDB knife_params/axe_params).
     constexpr float kProjectileGravity = 20.0f;
     // Live projectile redirection for throwing knives/axes via gameprojectileShootEvent listener.
@@ -52,6 +54,8 @@ namespace
     constexpr std::uint64_t kWeaponShootEventType = Game::Rtti::Hash("gameweaponeventsShootEvent");
     constexpr std::uint64_t kPlayerPuppetType = Game::Rtti::Hash("PlayerPuppet");
     constexpr std::uint64_t kGamePlayerPuppetType = Game::Rtti::Hash("gamePlayerPuppet");
+    constexpr std::uint64_t kWeaponObjectType = Game::Rtti::Hash("gameweaponObject");
+    constexpr std::uint64_t kItemObjectType = Game::Rtti::Hash("gameItemObject");
     constexpr std::uint32_t kRttiSystemGetAddressHash = 0x4A610F64u;
     constexpr std::uint8_t kQueueEventInternalPattern[] = {
         0x48, 0x83, 0xEC, 0x28, 0x8A, 0x81, 0x56, 0x01, 0x00, 0x00, 0x2C, 0x06, 0x3C, 0x01, 0x76, 0x00,
@@ -190,6 +194,9 @@ namespace
         std::atomic<float> targetX{0.0f};
         std::atomic<float> targetY{0.0f};
         std::atomic<float> targetZ{0.0f};
+        std::atomic<float> targetVx{0.0f};
+        std::atomic<float> targetVy{0.0f};
+        std::atomic<float> targetVz{0.0f};
         std::atomic_uint64_t targetGeneration{0};
         std::atomic_uint64_t targetPublishedAt{0};
         std::atomic_uint64_t callbacks{0};
@@ -262,13 +269,15 @@ namespace
                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
     }
 
-    bool ReadTarget(float output[3])
+    bool ReadTarget(float output[3], float outVelocity[3] = nullptr, bool allowGracePeriod = false)
     {
-        if (!g_state.targetActive.load(std::memory_order_acquire))
+        const bool active = g_state.targetActive.load(std::memory_order_acquire);
+        if (!active && !allowGracePeriod)
             return false;
         const ULONGLONG publishedAt = g_state.targetPublishedAt.load(std::memory_order_acquire);
         const ULONGLONG now = GetTickCount64();
-        if (publishedAt == 0 || now < publishedAt || now - publishedAt > kTargetTimeoutMilliseconds)
+        const ULONGLONG maxAge = allowGracePeriod ? kProjectileGracePeriodMs : kTargetTimeoutMilliseconds;
+        if (publishedAt == 0 || now < publishedAt || now - publishedAt > maxAge)
             return false;
         for (unsigned attempt = 0; attempt < 3; ++attempt)
         {
@@ -278,6 +287,12 @@ namespace
             output[0] = g_state.targetX.load(std::memory_order_relaxed);
             output[1] = g_state.targetY.load(std::memory_order_relaxed);
             output[2] = g_state.targetZ.load(std::memory_order_relaxed);
+            if (outVelocity)
+            {
+                outVelocity[0] = g_state.targetVx.load(std::memory_order_relaxed);
+                outVelocity[1] = g_state.targetVy.load(std::memory_order_relaxed);
+                outVelocity[2] = g_state.targetVz.load(std::memory_order_relaxed);
+            }
             const std::uint64_t after = g_state.targetGeneration.load(std::memory_order_acquire);
             if (before == after)
             {
@@ -292,8 +307,15 @@ namespace
         if (!owner)
             return false;
         const Game::Rtti::Class* type = Game::Rtti::NativeType(owner);
-        return Game::Rtti::IsClassOrDerived(type, kPlayerPuppetType) ||
-               Game::Rtti::IsClassOrDerived(type, kGamePlayerPuppetType);
+        if (!type)
+            return false;
+        if (Game::Rtti::IsClassOrDerived(type, kPlayerPuppetType) ||
+            Game::Rtti::IsClassOrDerived(type, kGamePlayerPuppetType))
+            return true;
+        if (Game::Rtti::IsClassOrDerived(type, kWeaponObjectType) ||
+            Game::Rtti::IsClassOrDerived(type, kItemObjectType))
+            return true;
+        return false;
     }
 
     bool RedirectNativeCrosshair(Vector4Layout* origin, Vector4Layout* direction)
@@ -712,18 +734,39 @@ namespace
         {
             auto* bytes = static_cast<std::byte*>(event);
             const auto* owner = reinterpret_cast<const Game::Rtti::Handle*>(bytes + kSpawnerOwnerOffset);
-            if (!owner || !IsPlayerOwner(owner->instance))
+            void* ownerInstance = owner ? owner->instance : nullptr;
+            const bool isPlayer = IsPlayerOwner(ownerInstance);
+            if (!owner || !isPlayer)
+            {
+                static std::atomic_uint32_t s_rejectedOwner{0};
+                const std::uint32_t count = s_rejectedOwner.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 16)
+                {
+                    const auto* type = ownerInstance ? Game::Rtti::NativeType(ownerInstance) : nullptr;
+                    const auto* classLayout = reinterpret_cast<const ClassLayout*>(type);
+                    Diagnostics::Log("silent aim spawner launch rejected owner: count=%u owner=%p inst=%p type=%016llX",
+                                     count, owner, ownerInstance,
+                                     static_cast<unsigned long long>(classLayout ? classLayout->nameHash : 0));
+                }
                 return;
+            }
 
             float target[3]{};
-            if (!ReadTarget(target))
+            float targetVel[3]{};
+            if (!ReadTarget(target, targetVel, true /* allowGracePeriod */))
+            {
+                static std::atomic_uint32_t s_rejectedTarget{0};
+                const std::uint32_t count = s_rejectedTarget.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 16)
+                {
+                    const ULONGLONG publishedAt = g_state.targetPublishedAt.load(std::memory_order_acquire);
+                    const ULONGLONG now = GetTickCount64();
+                    Diagnostics::Log("silent aim spawner launch rejected target: count=%u active=%d publishedAt=%llu age=%llu",
+                                     count, g_state.targetActive.load(std::memory_order_relaxed) ? 1 : 0,
+                                     publishedAt, publishedAt == 0 ? 0 : (now >= publishedAt ? now - publishedAt : 0));
+                }
                 return;
-
-            auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kSpawnerTargetPosOffset);
-            targetPos->x = target[0];
-            targetPos->y = target[1];
-            targetPos->z = target[2];
-            targetPos->w = 1.0f;
+            }
 
             void* logicalProvider = nullptr;
             void* visualProvider = nullptr;
@@ -757,14 +800,49 @@ namespace
                 }
             }
 
+            constexpr float kDefaultKnifeSpeed = 110.0f;
+            float leadTarget[3] = {target[0], target[1], target[2]};
+            const float vx = targetVel[0];
+            const float vy = targetVel[1];
+            const float vz = targetVel[2];
+            const float targetSpeedSq = vx * vx + vy * vy + vz * vz;
+            if (startValid && targetSpeedSq > 0.01f && targetSpeedSq < 900.0f)
+            {
+                const float dx0 = target[0] - start.x;
+                const float dy0 = target[1] - start.y;
+                const float dz0 = target[2] - start.z;
+                const float dist0 = std::sqrt(dx0 * dx0 + dy0 * dy0 + dz0 * dz0);
+                if (dist0 > 0.1f)
+                {
+                    float tFlight = dist0 / kDefaultKnifeSpeed;
+                    const float px1 = target[0] + vx * tFlight;
+                    const float py1 = target[1] + vy * tFlight;
+                    const float pz1 = target[2] + vz * tFlight;
+                    const float dx1 = px1 - start.x;
+                    const float dy1 = py1 - start.y;
+                    const float dz1 = pz1 - start.z;
+                    const float dist1 = std::sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1);
+                    tFlight = std::clamp(dist1 / kDefaultKnifeSpeed, 0.0f, 1.5f);
+
+                    leadTarget[0] = target[0] + vx * tFlight;
+                    leadTarget[1] = target[1] + vy * tFlight;
+                    leadTarget[2] = target[2] + vz * tFlight;
+                }
+            }
+
+            auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kSpawnerTargetPosOffset);
+            targetPos->x = leadTarget[0];
+            targetPos->y = leadTarget[1];
+            targetPos->z = leadTarget[2];
+            targetPos->w = 1.0f;
+
             if (startValid)
             {
                 Vector4Layout launchVel{};
                 MatrixLayout launchRot{};
-                constexpr float kDefaultKnifeSpeed = 110.0f;
                 const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
                 const float effectiveGravity = kProjectileGravity * ((std::isfinite(mult) && mult >= 0.0f) ? mult : 1.0f);
-                if (CalculateBallisticTrajectory(start, target, kDefaultKnifeSpeed, effectiveGravity, launchVel, launchRot))
+                if (CalculateBallisticTrajectory(start, leadTarget, kDefaultKnifeSpeed, effectiveGravity, launchVel, launchRot))
                 {
                     const Vector4Layout quat = MatrixToQuaternion(launchRot);
                     g_state.spawnerQuatX.store(quat.x, std::memory_order_relaxed);
@@ -783,9 +861,13 @@ namespace
             {
                 const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
                 Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p "
-                                 "target=(%.2f,%.2f,%.2f) logical=%p visual=%p gMult=%.2f",
-                                 static_cast<unsigned long long>(redirected), entity, owner->instance,
-                                 target[0], target[1], target[2], logicalProvider, visualProvider, mult);
+                                 "target=(%.2f,%.2f,%.2f) lead=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f,%.2f) "
+                                 "logical=%p visual=%p gMult=%.2f",
+                                 static_cast<unsigned long long>(redirected), entity, ownerInstance,
+                                 target[0], target[1], target[2],
+                                 leadTarget[0], leadTarget[1], leadTarget[2],
+                                 vx, vy, vz,
+                                 logicalProvider, visualProvider, mult);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -838,7 +920,8 @@ namespace
         }
 
         float target[3]{};
-        if (!ReadTarget(target))
+        float targetVel[3]{};
+        if (!ReadTarget(target, targetVel, true /* allowGracePeriod */))
             return;
 
         const auto* start = reinterpret_cast<const Vector4Layout*>(bytes + kShootStartPointOffset);
@@ -882,11 +965,33 @@ namespace
         if (!kEnableProjectileMutation)
             return;
 
+        float leadTarget[3] = {target[0], target[1], target[2]};
+        const float vx = targetVel[0];
+        const float vy = targetVel[1];
+        const float vz = targetVel[2];
+        const float targetSpeedSq = vx * vx + vy * vy + vz * vz;
+        if (targetSpeedSq > 0.01f && targetSpeedSq < 900.0f && distance > 0.1f)
+        {
+            float tFlight = distance / speed;
+            const float px1 = target[0] + vx * tFlight;
+            const float py1 = target[1] + vy * tFlight;
+            const float pz1 = target[2] + vz * tFlight;
+            const float dx1 = px1 - start->x;
+            const float dy1 = py1 - start->y;
+            const float dz1 = pz1 - start->z;
+            const float dist1 = std::sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1);
+            tFlight = std::clamp(dist1 / speed, 0.0f, 1.5f);
+
+            leadTarget[0] = target[0] + vx * tFlight;
+            leadTarget[1] = target[1] + vy * tFlight;
+            leadTarget[2] = target[2] + vz * tFlight;
+        }
+
         Vector4Layout newVelocity{};
         MatrixLayout newOrientation{};
         const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
         const float effectiveGravity = kProjectileGravity * ((std::isfinite(mult) && mult >= 0.0f) ? mult : 1.0f);
-        if (!CalculateBallisticTrajectory(*start, target, speed, effectiveGravity, newVelocity, newOrientation))
+        if (!CalculateBallisticTrajectory(*start, leadTarget, speed, effectiveGravity, newVelocity, newOrientation))
         {
             g_state.rejectedShots.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -913,9 +1018,9 @@ namespace
         if (Game::Rtti::ClassSize(type) >= kShootParamsOffset + sizeof(Vector4Layout))
         {
             auto* targetPos = reinterpret_cast<Vector4Layout*>(bytes + kShootParamsOffset);
-            targetPos->x = target[0];
-            targetPos->y = target[1];
-            targetPos->z = target[2];
+            targetPos->x = leadTarget[0];
+            targetPos->y = leadTarget[1];
+            targetPos->z = leadTarget[2];
             targetPos->w = 1.0f;
         }
 
@@ -923,10 +1028,11 @@ namespace
         if (redirected <= 8 || (redirected % 16u) == 0)
         {
             Diagnostics::Log("silent aim redirected projectile: count=%llu owner=%p "
-                             "start=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) speed=%.2f "
+                             "start=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f) lead=(%.2f,%.2f,%.2f) speed=%.2f "
                              "vel=(%.2f,%.2f,%.2f) fwd=(%.3f,%.3f,%.3f)",
                              static_cast<unsigned long long>(redirected), owner->instance,
-                             start->x, start->y, start->z, target[0], target[1], target[2], speed,
+                             start->x, start->y, start->z, target[0], target[1], target[2],
+                             leadTarget[0], leadTarget[1], leadTarget[2], speed,
                              newVelocity.x, newVelocity.y, newVelocity.z,
                              newOrientation.y.x, newOrientation.y.y, newOrientation.y.z);
         }
@@ -1460,7 +1566,7 @@ namespace Game::SilentAim
         g_state.projectileGravityMultiplier.store(multiplier, std::memory_order_release);
     }
 
-    void PublishTarget(const float worldTarget[3], bool active)
+    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3])
     {
         if (!active || !worldTarget || !g_state.hookCreated.load(std::memory_order_acquire) ||
             !std::isfinite(worldTarget[0]) || !std::isfinite(worldTarget[1]) || !std::isfinite(worldTarget[2]))
@@ -1472,6 +1578,19 @@ namespace Game::SilentAim
         g_state.targetX.store(worldTarget[0], std::memory_order_relaxed);
         g_state.targetY.store(worldTarget[1], std::memory_order_relaxed);
         g_state.targetZ.store(worldTarget[2], std::memory_order_relaxed);
+        if (worldVelocity && std::isfinite(worldVelocity[0]) &&
+            std::isfinite(worldVelocity[1]) && std::isfinite(worldVelocity[2]))
+        {
+            g_state.targetVx.store(worldVelocity[0], std::memory_order_relaxed);
+            g_state.targetVy.store(worldVelocity[1], std::memory_order_relaxed);
+            g_state.targetVz.store(worldVelocity[2], std::memory_order_relaxed);
+        }
+        else
+        {
+            g_state.targetVx.store(0.0f, std::memory_order_relaxed);
+            g_state.targetVy.store(0.0f, std::memory_order_relaxed);
+            g_state.targetVz.store(0.0f, std::memory_order_relaxed);
+        }
         g_state.targetPublishedAt.store(GetTickCount64(), std::memory_order_release);
         g_state.targetGeneration.fetch_add(1, std::memory_order_release);
         g_state.targetActive.store(true, std::memory_order_release);
@@ -1480,7 +1599,9 @@ namespace Game::SilentAim
     void ClearTarget()
     {
         g_state.targetActive.store(false, std::memory_order_release);
-        g_state.targetPublishedAt.store(0, std::memory_order_release);
+        // Retain targetPublishedAt and target coordinates so in-flight projectile launch
+        // animations (which fire 200-500ms after the player releases aim) can still acquire
+        // the target during the 1200ms grace period.
     }
 
     DiagnosticsSnapshot GetDiagnostics()
@@ -1515,6 +1636,9 @@ namespace Game::SilentAim
         result.orientationRedirects = g_state.orientationRedirects.load(std::memory_order_relaxed);
         result.projectileGravityMultiplier =
             g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
+        result.targetVx = g_state.targetVx.load(std::memory_order_relaxed);
+        result.targetVy = g_state.targetVy.load(std::memory_order_relaxed);
+        result.targetVz = g_state.targetVz.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -1554,6 +1678,10 @@ namespace Game::SilentAim
         g_state.spawnerVisualProvider.store(nullptr, std::memory_order_release);
         g_state.spawnerArmedAt.store(0, std::memory_order_release);
         g_state.projectileGravityMultiplier.store(1.0f, std::memory_order_release);
+        g_state.targetPublishedAt.store(0, std::memory_order_release);
+        g_state.targetVx.store(0.0f, std::memory_order_release);
+        g_state.targetVy.store(0.0f, std::memory_order_release);
+        g_state.targetVz.store(0.0f, std::memory_order_release);
         const std::uint32_t producerCount = g_state.producerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < producerCount && index < kMaxProducerHooks; ++index)
         {

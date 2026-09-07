@@ -25,6 +25,10 @@ namespace Aimbot
         ULONGLONG g_lastApplyTick = 0;
         std::uint64_t g_lastAnomalousAimEntityId = 0;
         std::uint64_t g_lastAnomalousAimSample = 0;
+        std::uint64_t g_trackedVelocityEntityId = 0;
+        float g_lastTrackedPos[3] = {0.0f, 0.0f, 0.0f};
+        ULONGLONG g_lastTrackedTick = 0;
+        float g_smoothedVelocity[3] = {0.0f, 0.0f, 0.0f};
         Stats g_stats;
 
         void StopAim()
@@ -35,6 +39,11 @@ namespace Aimbot
             g_aimActive = false;
             g_lockedEntityId = 0;
             g_lastApplyTick = 0;
+            g_trackedVelocityEntityId = 0;
+            g_lastTrackedTick = 0;
+            g_smoothedVelocity[0] = 0.0f;
+            g_smoothedVelocity[1] = 0.0f;
+            g_smoothedVelocity[2] = 0.0f;
         }
 
         bool IsGameForeground()
@@ -278,21 +287,73 @@ namespace Aimbot
         if (g_lockedEntityId == 0)
             g_lockedEntityId = bestEntityId;
         const ULONGLONG now = GetTickCount64();
+
+        float targetVelocity[3] = {0.0f, 0.0f, 0.0f};
+        if (settings.leadPrediction)
+        {
+            if (bestEntityId == g_trackedVelocityEntityId && g_lastTrackedTick != 0 && now > g_lastTrackedTick)
+            {
+                const float dt = (now - g_lastTrackedTick) / 1000.0f;
+                if (dt >= 0.005f && dt <= 0.25f)
+                {
+                    const float dx = bestWorld[0] - g_lastTrackedPos[0];
+                    const float dy = bestWorld[1] - g_lastTrackedPos[1];
+                    const float dz = bestWorld[2] - g_lastTrackedPos[2];
+                    const float rawVx = dx / dt;
+                    const float rawVy = dy / dt;
+                    const float rawVz = dz / dt;
+                    const float rawSpeedSq = rawVx * rawVx + rawVy * rawVy + rawVz * rawVz;
+                    if (rawSpeedSq < 900.0f) // Under 30 m/s: valid physical NPC movement
+                    {
+                        constexpr float alpha = 0.35f;
+                        g_smoothedVelocity[0] = g_smoothedVelocity[0] * (1.0f - alpha) + rawVx * alpha;
+                        g_smoothedVelocity[1] = g_smoothedVelocity[1] * (1.0f - alpha) + rawVy * alpha;
+                        g_smoothedVelocity[2] = g_smoothedVelocity[2] * (1.0f - alpha) + rawVz * alpha;
+                    }
+                }
+            }
+            else
+            {
+                g_trackedVelocityEntityId = bestEntityId;
+                g_smoothedVelocity[0] = 0.0f;
+                g_smoothedVelocity[1] = 0.0f;
+                g_smoothedVelocity[2] = 0.0f;
+            }
+            g_lastTrackedPos[0] = bestWorld[0];
+            g_lastTrackedPos[1] = bestWorld[1];
+            g_lastTrackedPos[2] = bestWorld[2];
+            g_lastTrackedTick = now;
+
+            targetVelocity[0] = g_smoothedVelocity[0];
+            targetVelocity[1] = g_smoothedVelocity[1];
+            targetVelocity[2] = g_smoothedVelocity[2];
+        }
+        else
+        {
+            g_trackedVelocityEntityId = 0;
+            g_lastTrackedTick = 0;
+        }
+
         if (settings.silentAim)
         {
             if (g_aimActive)
                 Game::AimAssist::ClearMemoryAim();
             g_aimActive = false;
-            Game::SilentAim::PublishTarget(bestWorld, true);
+            Game::SilentAim::PublishTarget(bestWorld, true, settings.leadPrediction ? targetVelocity : nullptr);
             static ULONGLONG lastSilentLogTick = 0;
             if (now - lastSilentLogTick >= 2000)
             {
                 const Game::SilentAim::DiagnosticsSnapshot diagnostics = Game::SilentAim::GetDiagnostics();
-                Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) healthValid=%u health=%.2f/%.2f "
-                                 "dead=%u candidates=%u eligible=%u noPool=%u overCap=%u occluded=%u crosshairCoreHook=%u "
-                                 "projHook=%u orientHook=%u calls=%llu redirects=%llu projRedirects=%llu orientRedirects=%llu "
-                                 "rejected=%llu gMult=%.2f",
+                const float speed = std::sqrt(targetVelocity[0] * targetVelocity[0] +
+                                              targetVelocity[1] * targetVelocity[1] +
+                                              targetVelocity[2] * targetVelocity[2]);
+                Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) vel=(%.2f,%.2f,%.2f) "
+                                 "speed=%.2f healthValid=%u health=%.2f/%.2f dead=%u candidates=%u eligible=%u "
+                                 "noPool=%u overCap=%u occluded=%u crosshairCoreHook=%u projHook=%u orientHook=%u "
+                                 "calls=%llu redirects=%llu projRedirects=%llu orientRedirects=%llu "
+                                 "rejected=%llu gMult=%.2f lead=%u",
                                  static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
+                                 targetVelocity[0], targetVelocity[1], targetVelocity[2], speed,
                                  selected && selected->healthValid ? 1u : 0u,
                                  selected ? selected->healthCurrent : 0.0f,
                                  selected ? selected->healthMax : 0.0f,
@@ -307,7 +368,8 @@ namespace Aimbot
                                  static_cast<unsigned long long>(diagnostics.redirectedShots),
                                  static_cast<unsigned long long>(diagnostics.orientationRedirects),
                                  static_cast<unsigned long long>(diagnostics.rejectedShots),
-                                 diagnostics.projectileGravityMultiplier);
+                                 diagnostics.projectileGravityMultiplier,
+                                 settings.leadPrediction ? 1u : 0u);
                 lastSilentLogTick = now;
             }
             return;

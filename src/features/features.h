@@ -81,6 +81,7 @@ namespace Features
         float fovRadiusDegrees = 13.0f;
         float smoothing = 8.0f;
         float maxDistanceMeters = 150.0f;
+        bool leadPrediction = true;
     };
 
     struct MiscSettings

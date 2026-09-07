@@ -261,6 +261,8 @@ namespace Widgets
             UiKit::EndDisabled();
             UiKit::SliderRow("aim_distance", Loc::Text(Loc::Str::AimDistance), &aimbot.maxDistanceMeters, 10.0f,
                              300.0f, Loc::Text(Loc::Str::MetersFormat));
+            UiKit::CheckRow("lead_prediction", Loc::Text(Loc::Str::LeadPrediction), &aimbot.leadPrediction,
+                            aimbot.leadPrediction ? Loc::Text(Loc::Str::LeadPredictionHint) : nullptr);
             UiKit::SectionEnd();
             UiKit::EndDisabled();
 
@@ -440,6 +442,12 @@ namespace Widgets
                 char gravityBuf[32];
                 std::snprintf(gravityBuf, sizeof(gravityBuf), "%.2fx", silent.projectileGravityMultiplier);
                 UiKit::MetricRow("projectile gravity mult", gravityBuf);
+                const float speed = std::sqrt(silent.targetVx * silent.targetVx +
+                                              silent.targetVy * silent.targetVy +
+                                              silent.targetVz * silent.targetVz);
+                char speedBuf[32];
+                std::snprintf(speedBuf, sizeof(speedBuf), "%.2f m/s", speed);
+                UiKit::MetricRow("target speed", speedBuf);
                 if (silent.producerHooks == 0 && silent.listenerHooks == 0)
                 {
                     UiKit::MetricGroup("Observation hooks", "disabled in this build", palette.textDisabled);

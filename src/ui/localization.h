@@ -58,6 +58,8 @@ namespace Loc
         FovRadius,
         Smoothing,
         AimDistance,
+        LeadPrediction,
+        LeadPredictionHint,
         TargetEnemies,
         TargetPolice,
         OnlyVisibleTargets,

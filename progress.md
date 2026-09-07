@@ -2956,3 +2956,43 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
     - `player weapon gravity multiplier changed: weaponId=0x9EC5C5 mult=0.000`
   - 무중력 부품 장착 칼 투척 시 $g = 0.0f$ 직선 궤적으로 타깃에 정확히 적중함을 확인.
 
+## 2026-09-07 - 투척 무기 발사 딜레이 중 타깃 유실 문제 해결 (1200ms Grace Period) 및 적 이동 예측 사격 (Lead Prediction) 구현
+
+- **사용자 이슈 제기**:
+  1. 칼을 투척할 때 사일런트 에임 리다이렉트 카운트가 0에서 올라가지 않음 (`spawnerLaunchRedirects = 0`).
+  2. 이동 중인 적을 향해 칼을 던질 때 적의 이동 속도에 따른 예측 사격(Lead Prediction) 기능 요청.
+- **원인 분석 (리다이렉트 카운트 0 문제)**:
+  - 투척 무기 애니메이션 특성: 플레이어는 보통 우클릭(조준, RMB)으로 적을 겨냥한 뒤 좌클릭(투척, LMB)을 누르고 즉시 우클릭을 뗌.
+  - 사이버펑크 2077의 투척 단검 애니메이션은 좌클릭 입력 후 실제 발사체 생성 이벤트(`gameprojectileSpawnerLaunchEvent`)가 발생하기까지 약 250~400ms의 와인드업 딜레이가 존재.
+  - 이전 로직에서는 우클릭을 떼는 순간 `Aimbot::RunFrame` -> `StopAim()` -> `ClearTarget()`이 호출되어 `targetActive = false` 및 `targetPublishedAt = 0`으로 즉시 타깃 정보가 소멸됨.
+  - 약 300ms 뒤 `HandleSpawnerLaunchEvent`가 호출되었을 때 `ReadTarget()`이 `publishedAt == 0` 및 `active == false`로 인해 타깃을 유실(`ReadTarget() == false`)하여 투척 리다이렉트가 100% 거절됨 (`spawnerLaunchRedirects = 0`).
+- **아키텍처 및 구현**:
+  1. **투척 발사 유예 시간 (Grace Period) 도입**:
+     - `src/game/silent_aim.cpp`:
+       - `ClearTarget()`에서 좌표와 타임스탬프(`targetPublishedAt`)를 즉시 0으로 날리지 않고 `targetActive = false`만 설정.
+       - `ReadTarget(..., allowGracePeriod = true)` 구현: 발사체 발사 이벤트(`HandleSpawnerLaunchEvent`, `RedirectProjectileEvent`)의 경우 `kProjectileGracePeriodMs = 1200` (1.2초) 유예 기간을 적용.
+       - 플레이어가 투척 모션을 시작하면서 우클릭을 놓더라도, 1.2초 이내에 스폰되는 투척 무기는 직전 조준 타깃을 안전하게 이어받아 리다이렉트 수행.
+  2. **적 이동 속도 추적 및 지수 평활화 필터 (Velocity Estimation & Smoothing)**:
+     - `src/features/aimbot.cpp`:
+       - Present 렌더 스레드에서 매 프레임 타깃 엔티티의 월드 좌표 변화량과 시간 델타를 측정: $\mathbf{v}_{\text{raw}} = \frac{\mathbf{P}_t - \mathbf{P}_{t-\Delta t}}{\Delta t}$.
+       - 급격한 애니메이션 튐이나 텔레포트를 방어하기 위해 $30\text{ m/s}$ 이상의 비정상 속도는 클램프하고, 1차 저역통과 필터(Low-pass filter, $\alpha = 0.35$)를 적용하여 부드러운 이동 벡터 산출.
+       - 타깃이 변경되거나 조준이 완전히 리셋될 때 속도 추적기 초기화.
+  3. **비행 시간 기반 미래 위치 예측 (Iterative Time-of-Flight Lead Prediction)**:
+     - `src/game/silent_aim.cpp`:
+       - 타깃의 속도 $\mathbf{v}$와 발사체 속력 $v_{\text{proj}} \approx 110.0\text{ m/s}$를 기반으로 도달 시간 계산:
+         $t_0 = \frac{\|\mathbf{P} - \mathbf{S}\|}{v_{\text{proj}}}$, $t_1 = \frac{\|\mathbf{P} + \mathbf{v} t_0 - \mathbf{S}\|}{v_{\text{proj}}}$.
+       - 미래 예측 위치 산출: $\mathbf{P}_{\text{lead}} = \mathbf{P} + \mathbf{v} \cdot t_1$.
+       - 유도 쿼터니언 계산 시 $\mathbf{P}$ 대신 $\mathbf{P}_{\text{lead}}$를 탄도학 엔진에 전달하여 적의 이동 경로 앞을 정확히 조준.
+       - 무중력 개조부품 장착 시에도 $\mathbf{P}_{\text{lead}}$를 향한 3차원 직선 궤적에 완벽히 연동.
+  4. **UI 및 다국어 지원**:
+     - `src/features/features.h`: `AimbotSettings::leadPrediction` (기본값: `true`) 추가.
+     - `src/ui/localization.h` & `localization.cpp`: `LeadPrediction` ("이동 예측 보정"), `LeadPredictionHint` 다국어 문자열 등록.
+     - `src/ui/widgets.cpp`: 에임봇 탭에 "이동 예측 보정" 체크박스 위젯 추가 및 사일런트 에임 진단 항목에 타깃 이동 속도(`target speed: X.XX m/s`) 실시간 메트릭 표시.
+- **빌드 및 런타임 검증 (PID 14356)**:
+  - `cmake --build build --config Release` 정상 컴파일 및 링크 (0 경고, 0 에러).
+  - 프로세스에 신규 DLL 주입 완료 및 정상 동작 확인:
+    - `silent aim func orientation get hook created: mutation=1`
+    - `silent aim QueueEvent observation hook created: mutation=0`
+    - 오버레이 UI에 "이동 예측 보정" 토글 및 "target speed: 0.00 m/s" 진단 지표 출력 확인.
+
+

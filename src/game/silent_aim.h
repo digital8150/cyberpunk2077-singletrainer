@@ -35,6 +35,9 @@ namespace Game::SilentAim
         std::uint64_t spawnerLaunchRedirects = 0;
         std::uint64_t orientationRedirects = 0;
         float projectileGravityMultiplier = 1.0f;
+        float targetVx = 0.0f;
+        float targetVy = 0.0f;
+        float targetVz = 0.0f;
     };
 
     // Resolves the native crosshair core (hitscan mutation path) and projectile ShootEvent listeners
@@ -43,9 +46,9 @@ namespace Game::SilentAim
 
     void SetProjectileGravityMultiplier(float multiplier);
 
-    // Present publishes only plain coordinates. Native callbacks use freshness as an early filter, so a target
-    // that stops being published (out of FOV, dead, or occluded while visibleOnly is on) stops being redirected.
-    void PublishTarget(const float worldTarget[3], bool active);
+    // Present publishes coordinates and estimated target velocity for lead prediction. Native callbacks
+    // use freshness as an early filter, so a target that stops being published stops being redirected.
+    void PublishTarget(const float worldTarget[3], bool active, const float worldVelocity[3] = nullptr);
     void ClearTarget();
     DiagnosticsSnapshot GetDiagnostics();
     void Shutdown();
