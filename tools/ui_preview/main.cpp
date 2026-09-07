@@ -396,6 +396,7 @@ int main(int argc, char** argv)
     settings.esp.enabled = true;
     settings.debug.showInternalStats = true;
     settings.debug.showGraph = options.performance;
+    settings.debug.graphAdvanced = options.variant == "advanced";
     if (options.performance) Diagnostics::Profile::g_enabled.store(options.variant != "off");
     if (options.variant == "off")
     {

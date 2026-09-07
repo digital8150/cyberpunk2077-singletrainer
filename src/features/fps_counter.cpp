@@ -8,6 +8,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cfloat>
 
 namespace FpsCounter
 {
@@ -15,7 +16,7 @@ namespace FpsCounter
     {
         using Slot = Diagnostics::Profile::Slot;
         constexpr unsigned kHistory = 120;
-        constexpr float kWidth = 640.0f;
+        constexpr float kWidth = 662.0f;
         constexpr ImU32 kText = IM_COL32(239, 245, 252, 255);
         constexpr ImU32 kMuted = IM_COL32(169, 187, 205, 255);
         constexpr ImU32 kPresent = IM_COL32(93, 213, 255, 255);
@@ -53,6 +54,10 @@ namespace FpsCounter
         bool g_wasEnabled = false;
         bool g_expanded[2] = {true, true};
         float g_alpha = 1.0f;
+        float TextSize(UiKit::Font role)
+        {
+            return role == UiKit::Font::Mono ? 14.0f : (std::max)(12.0f, UiKit::FontSize(role));
+        }
 
         ImU32 Ink(ImU32 color)
         {
@@ -61,12 +66,13 @@ namespace FpsCounter
         void Text(ImDrawList* draw, float x, float y, const char* text, ImU32 color = kText,
                   UiKit::Font font = UiKit::Font::Micro)
         {
-            UiKit::PaintText(draw, font, ImVec2(x + 1, y + 1), Ink(IM_COL32(0, 0, 0, 220)), text);
-            UiKit::PaintText(draw, font, ImVec2(x, y), Ink(color), text);
+            draw->AddText(UiKit::FontFace(font), TextSize(font), ImVec2(x + 1, y + 1), Ink(IM_COL32(0, 0, 0, 220)), text);
+            draw->AddText(UiKit::FontFace(font), TextSize(font), ImVec2(x, y), Ink(color), text);
         }
         void Right(ImDrawList* draw, float x, float y, const char* text, ImU32 color = kText)
         {
-            Text(draw, x - UiKit::MeasureText(UiKit::Font::Mono, text).x, y, text, color, UiKit::Font::Mono);
+            const float width = UiKit::FontFace(UiKit::Font::Mono)->CalcTextSizeA(TextSize(UiKit::Font::Mono), FLT_MAX, 0, text).x;
+            Text(draw, x - width, y, text, color, UiKit::Font::Mono);
         }
         void Rule(ImDrawList* draw, float x, float y, float width)
         {
@@ -186,7 +192,7 @@ namespace FpsCounter
                     Right(draw, p.x + 530, y, "--", kMuted);
                     Right(draw, p.x + 630, y, "--", kMuted);
                 }
-                y += 21;
+                y += 24;
             }
             return y;
         }
@@ -204,7 +210,7 @@ namespace FpsCounter
         {
             unsigned rows = 0;
             for (auto& row : kRows) if (!row.depth || g_expanded[row.branch]) ++rows;
-            const float contentHeight = 286 + rows * 21.0f;
+            const float contentHeight = settings.graphAdvanced ? 350 + rows * 24.0f : 300.0f;
             const float height = (std::min)(contentHeight, io.DisplaySize.y - 16);
             const float width = (std::min)(kWidth, io.DisplaySize.x);
             auto clamp = [&](ImVec2 p) {
@@ -226,7 +232,18 @@ namespace FpsCounter
             if (!menuVisible) flags |= ImGuiWindowFlags_NoInputs;
             ImGui::Begin("##performance_graph", nullptr, flags);
             ImDrawList* draw = ImGui::GetWindowDrawList();
-            const ImVec2 p(position.x + 5, position.y + 4 - ImGui::GetScrollY());
+            static bool previousAdvanced = settings.graphAdvanced;
+            if (previousAdvanced != settings.graphAdvanced) ImGui::SetScrollY(0);
+            previousAdvanced = settings.graphAdvanced;
+            const int bgAlpha = static_cast<int>(std::clamp(settings.graphBackgroundOpacityPercent, 0.0f, 85.0f) * 2.55f);
+            if (bgAlpha > 0)
+            {
+                draw->AddRectFilled(position, ImVec2(position.x + width, position.y + height),
+                                    IM_COL32(10, 17, 26, bgAlpha), 10.0f);
+                draw->AddRect(position, ImVec2(position.x + width, position.y + height),
+                              IM_COL32(165, 198, 224, bgAlpha / 3), 10.0f);
+            }
+            const ImVec2 p(position.x + 16, position.y + 12 - ImGui::GetScrollY());
             g_alpha = std::clamp(settings.graphOpacityPercent / 100.0f, 0.35f, 1.0f);
             const bool enabled = Diagnostics::Profile::Enabled();
             if (enabled) Diagnostics::Profile::ReadWindow(g_window);
@@ -248,11 +265,41 @@ namespace FpsCounter
                     settings.graphPositionY = next.y;
                 }
             }
-            Plots(draw, ImVec2(p.x, p.y + 32));
+            const bool ko = Features::GetSettings().ui.language == Features::Language::Korean;
+            const char* modeNames[] = {ko ? "단순" : "SIMPLE", ko ? "고급" : "ADVANCED"};
+            for (unsigned mode = 0; mode < 2; ++mode)
+            {
+                const ImVec2 button(p.x + mode * 104, p.y + 32);
+                const bool selected = settings.graphAdvanced == (mode == 1);
+                if (selected)
+                    draw->AddRectFilled(button, ImVec2(button.x + 96, button.y + 25), Ink(IM_COL32(60, 110, 145, 90)), 5);
+                Text(draw, button.x + 10, button.y + 5, modeNames[mode], selected ? kPresent : kMuted);
+                if (menuVisible)
+                {
+                    ImGui::PushID(static_cast<int>(mode));
+                    ImGui::SetCursorScreenPos(button);
+                    ImGui::InvisibleButton("##graph_mode", ImVec2(96, 25));
+                    if (ImGui::IsItemClicked()) settings.graphAdvanced = mode == 1;
+                    ImGui::PopID();
+                }
+            }
+            Plots(draw, ImVec2(p.x, p.y + 72));
             snprintf(status, sizeof(status), "TREND ~12s / 100ms bins     DETAIL %.1fs window / F = Present, T = main tick",
                      g_window.durationMs / 1000.0);
-            Text(draw, p.x, p.y + 130, status, kMuted);
-            const float y = Table(draw, ImVec2(p.x, p.y + 151), menuVisible, valid);
+            Text(draw, p.x, p.y + 173, status, kMuted);
+            if (!settings.graphAdvanced)
+            {
+                Rule(draw, p.x, p.y + 197, 630);
+                ValueLine(draw, p.x, p.y + 210, "Present CPU", Slot::PresentTotal, valid, "us");
+                ValueLine(draw, p.x + 330, p.y + 210, "Main tick CPU", Slot::TickTotal, valid, "us");
+                Text(draw, p.x, p.y + 242, ko ? "CPU 평균 / 최대 · 상세 계측은 고급 모드" : "CPU average / maximum. Open Advanced for detailed timings.", kMuted);
+                ImGui::SetCursorPos(ImVec2(0, contentHeight - 1));
+                ImGui::Dummy(ImVec2(1, 1));
+                ImGui::End();
+                ImGui::PopStyleVar(2);
+                return;
+            }
+            const float y = Table(draw, ImVec2(p.x, p.y + 197), menuVisible, valid);
             Rule(draw, p.x, y + 2, 630);
             Text(draw, p.x, y + 9, "POSE DELIVERY    average / maximum", kText);
             ValueLine(draw, p.x, y + 31, "Requested", Slot::PoseRequested, valid, "NPC");

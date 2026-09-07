@@ -516,6 +516,13 @@ namespace Widgets
             UiKit::ToggleRow("show_fps", Loc::Text(Loc::Str::ShowFps), &debug.showFps);
             UiKit::ToggleRow("show_graph", Loc::Text(Loc::Str::ShowGraph), &debug.showGraph);
             UiKit::BeginDisabled(!debug.showGraph);
+            const bool graphKo = settings.ui.language == Features::Language::Korean;
+            const char* graphModes[] = {graphKo ? "단순" : "Simple", graphKo ? "고급" : "Advanced"};
+            int graphMode = debug.graphAdvanced ? 1 : 0;
+            if (UiKit::ComboRow("graph_mode", graphKo ? "그래프 모드" : "Graph mode", &graphMode, graphModes, 2))
+                debug.graphAdvanced = graphMode == 1;
+            UiKit::SliderRow("graph_background", graphKo ? "그래프 배경 불투명도" : "Graph background opacity",
+                             &debug.graphBackgroundOpacityPercent, 0.0f, 85.0f, Loc::Text(Loc::Str::PercentFormat));
             UiKit::SliderRow("graph_opacity", Loc::Text(Loc::Str::GraphOpacity), &debug.graphOpacityPercent,
                              35.0f, 100.0f, Loc::Text(Loc::Str::PercentFormat));
             UiKit::EndDisabled();

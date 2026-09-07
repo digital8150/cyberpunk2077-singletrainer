@@ -45,6 +45,8 @@ namespace
                lhs.misc.noSpread == rhs.misc.noSpread &&
                lhs.debug.showFps == rhs.debug.showFps &&
                lhs.debug.showGraph == rhs.debug.showGraph &&
+               lhs.debug.graphAdvanced == rhs.debug.graphAdvanced &&
+               lhs.debug.graphBackgroundOpacityPercent == rhs.debug.graphBackgroundOpacityPercent &&
                lhs.debug.graphOpacityPercent == rhs.debug.graphOpacityPercent &&
                lhs.debug.graphPositionX == rhs.debug.graphPositionX &&
                lhs.debug.graphPositionY == rhs.debug.graphPositionY &&
@@ -218,6 +220,8 @@ namespace
 
         ok &= WriteBool(L"debug", L"show_fps", settings.debug.showFps);
         ok &= WriteBool(L"debug", L"show_graph", settings.debug.showGraph);
+        ok &= WriteBool(L"debug", L"graph_advanced", settings.debug.graphAdvanced);
+        ok &= WriteFloat(L"debug", L"graph_background_opacity", settings.debug.graphBackgroundOpacityPercent);
         ok &= WriteFloat(L"debug", L"graph_opacity", settings.debug.graphOpacityPercent);
         ok &= WriteFloat(L"debug", L"graph_position_x", settings.debug.graphPositionX);
         ok &= WriteFloat(L"debug", L"graph_position_y", settings.debug.graphPositionY);
@@ -311,6 +315,9 @@ namespace Config
         settings.debug.showFps =
             ReadBoolMigrated(L"debug", L"show_fps", L"trainer", L"show_fps", settings.debug.showFps);
         settings.debug.showGraph = ReadBool(L"debug", L"show_graph", settings.debug.showGraph);
+        settings.debug.graphAdvanced = ReadBool(L"debug", L"graph_advanced", settings.debug.graphAdvanced);
+        settings.debug.graphBackgroundOpacityPercent =
+            ReadFloat(L"debug", L"graph_background_opacity", settings.debug.graphBackgroundOpacityPercent, 0.0f, 85.0f);
         settings.debug.graphOpacityPercent =
             ReadFloat(L"debug", L"graph_opacity", settings.debug.graphOpacityPercent, 35.0f, 100.0f);
         settings.debug.graphPositionX =

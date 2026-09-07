@@ -40,6 +40,9 @@ int main()
     auto& s = Features::GetSettings();
     check(s.aimbot.activationKey == 5 && s.aimbot.silentAim, "preserve legacy active profile");
     check(s.alternateAimbot == s.aimbot, "seed second profile from legacy settings");
+    check(!s.debug.graphAdvanced && s.debug.graphBackgroundOpacityPercent == 45.0f, "legacy graph defaults");
+    s.debug.graphAdvanced = true;
+    s.debug.graphBackgroundOpacityPercent = 55.0f;
     s.aimbot.subActivationKey = 6;
     s.aimbot.boneMask = 1 | 4 | 8;
     s.aimbot.leadPrediction = false;
@@ -61,20 +64,27 @@ int main()
     check(s.aimbot == second && s.alternateAimbot == first, "round-trip both complete profiles after switching");
     check(s.activeAimbotProfile == 1 && s.profileSwitchKey == 0x76, "round-trip active profile and switch key");
     check(!s.esp.showName && s.esp.showDistance, "independent label toggles");
+    check(s.debug.graphAdvanced && s.debug.graphBackgroundOpacityPercent == 55.0f, "graph mode/background round trip");
     // Exercise the production dirty/debounce path, including leadPrediction (previously omitted).
     s.aimbot.leadPrediction = !s.aimbot.leadPrediction;
     s.alternateAimbot.boneMask = 16;
+    s.debug.graphAdvanced = false;
+    s.debug.graphBackgroundOpacityPercent = 18.0f;
     Config::Update();
     Sleep(550);
     Config::Update();
     check(GetPrivateProfileIntW(L"aimbot", L"lead_prediction", 99, ini.c_str()) == 0, "autosave lead prediction");
     check(GetPrivateProfileIntW(L"aimbot_alternate", L"bone_mask", 0, ini.c_str()) == 16, "autosave alternate profile");
+    check(GetPrivateProfileIntW(L"debug", L"graph_advanced", 99, ini.c_str()) == 0, "autosave graph mode");
+    check(GetPrivateProfileIntW(L"debug", L"graph_background_opacity", 99, ini.c_str()) == 18, "autosave graph background");
     Config::Shutdown();
     write(L"aimbot", L"bone_mask", L"32");
     write(L"aimbot", L"sub_activation_key", L"999");
     write(L"aimbot_profiles", L"active", L"99");
+    write(L"debug", L"graph_background_opacity", L"999");
     s = {};
     check(Config::Initialize(), "load invalid settings");
+    check(s.debug.graphBackgroundOpacityPercent == 85.0f, "bound graph background opacity");
     check(s.aimbot.boneMask == 1 && s.aimbot.subActivationKey == 0 && s.activeAimbotProfile <= 1,
           "invalid mask/key/profile cannot escape bounds");
     Config::Shutdown();

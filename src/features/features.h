@@ -105,7 +105,9 @@ namespace Features
         bool showFps = true;
         // FPS/프레임타임/트레이너 CPU 시간 그래프.
         bool showGraph = false;
-        // Text/line opacity only (35-100%); the performance HUD has no background.
+        bool graphAdvanced = false;
+        float graphBackgroundOpacityPercent = 45.0f;
+        // Text/line opacity is independent of the HUD background.
         float graphOpacityPercent = 88.0f;
         // 음수는 아직 사용자가 배치하지 않은 상태다. 첫 표시 때 좌하단 기본 위치를 계산하고, 이후에는
         // 실제 화면 좌표를 저장한다. 해상도가 바뀌면 렌더러가 현재 디스플레이 안으로 다시 clamp한다.
