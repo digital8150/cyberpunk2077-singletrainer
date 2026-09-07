@@ -288,10 +288,10 @@ namespace Aimbot
             if (now - lastSilentLogTick >= 2000)
             {
                 const Game::SilentAim::DiagnosticsSnapshot diagnostics = Game::SilentAim::GetDiagnostics();
-                Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) "
-                                 "healthValid=%u health=%.2f/%.2f dead=%u "
-                                 "candidates=%u eligible=%u noPool=%u overCap=%u occluded=%u "
-                                 "crosshairCoreHook=%u projHook=%u orientHook=%u calls=%llu redirects=%llu projRedirects=%llu orientRedirects=%llu rejected=%llu",
+                Diagnostics::Log("silent aim armed: target=%016llX world=(%.2f,%.2f,%.2f) healthValid=%u health=%.2f/%.2f "
+                                 "dead=%u candidates=%u eligible=%u noPool=%u overCap=%u occluded=%u crosshairCoreHook=%u "
+                                 "projHook=%u orientHook=%u calls=%llu redirects=%llu projRedirects=%llu orientRedirects=%llu "
+                                 "rejected=%llu gMult=%.2f",
                                  static_cast<unsigned long long>(bestEntityId), bestWorld[0], bestWorld[1], bestWorld[2],
                                  selected && selected->healthValid ? 1u : 0u,
                                  selected ? selected->healthCurrent : 0.0f,
@@ -306,7 +306,8 @@ namespace Aimbot
                                  static_cast<unsigned long long>(diagnostics.nativeCrosshairCoreRedirects),
                                  static_cast<unsigned long long>(diagnostics.redirectedShots),
                                  static_cast<unsigned long long>(diagnostics.orientationRedirects),
-                                 static_cast<unsigned long long>(diagnostics.rejectedShots));
+                                 static_cast<unsigned long long>(diagnostics.rejectedShots),
+                                 diagnostics.projectileGravityMultiplier);
                 lastSilentLogTick = now;
             }
             return;

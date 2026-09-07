@@ -437,6 +437,9 @@ namespace Widgets
                 UiKit::MetricRow("crosshair core calls", Count(silent.nativeCrosshairCoreCalls));
                 UiKit::MetricRow("spawner launch events", Count(silent.spawnerLaunchEvents));
                 UiKit::MetricRow("spawner launch redirects", Count(silent.spawnerLaunchRedirects));
+                char gravityBuf[32];
+                std::snprintf(gravityBuf, sizeof(gravityBuf), "%.2fx", silent.projectileGravityMultiplier);
+                UiKit::MetricRow("projectile gravity mult", gravityBuf);
                 if (silent.producerHooks == 0 && silent.listenerHooks == 0)
                 {
                     UiKit::MetricGroup("Observation hooks", "disabled in this build", palette.textDisabled);

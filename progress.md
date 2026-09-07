@@ -2923,3 +2923,36 @@ Release 클린 빌드 통과, 경고 0 (C4129 포함 전부 사라짐). **인게
     - `silent aim hooks created: producers=0 projectileListeners=1 weaponListenerHooks=0 queueHook=1 crosshairCore=1 orientationHook=1`
   - 게임 내에서 안정적으로 크래시 없이 동작 확인.
 
+## 2026-09-07 - 무중력(Zero-G) 개조부품 동적 감지 및 탄도학 계산 개선 (직선 궤적)
+
+- **사용자 이슈 제기**:
+  - 인게임 무기 개조부품 중 "무중력"(Zero-G, `ThrowMod2_Base`)을 장착한 투척 단검/도끼의 경우 중력 영향을 받지 않는데, 사일런트 에임이 고정 중력($g = 20.0f$)을 가정한 포물선 상향 피치각을 부여하여 타깃 머리 위로 빗나가는 현상 발생.
+- **게임 엔진 분석 및 역공학**:
+  - TweakDB 및 스크립트(`meleeProjectile.script`):
+    - 무중력 부품은 `BaseStats.MeleeProjectileGravitySimulationMultiplier` 스탯 모디파이어를 `0.0f`로 설정.
+    - 엔진 내부에서 `gravitySimulation = GetProjectileTweakDBFloatParameter("gravitySimulation") * m_gravitySimulationMult`로 계산.
+    - `gamedataStatType.MeleeProjectileGravitySimulationMultiplier`의 enum 값은 `990` (`0x3DE`).
+    - `gameStatsSystem::GetStatValue` RTTI: `param[0] = gameStatsObjectID` (16 bytes, entityId at +0x00), `param[1] = gamedataStatType` (int32 `990`), return `float`.
+- **스레드 안전한 동적 스탯 쿼리 및 탄도학 개선 아키텍처**:
+  - `AGENTS.md` 제1규칙(Script VM 호출은 반드시 게임 메인 틱에서만 직렬화) 준수:
+  1. `src/game/player_modifiers.cpp`:
+     - RTTI 리졸버에 `GetStatValue` 추가 (`fullNameHash = 0x23427AE352F89652`).
+     - 16바이트 `StatsObjectIdLayout` 정의 및 `QueryStatValue` 헬퍼 함수 구현.
+     - 메인 틱(`OnGameMainTick`)에서 현재 장착 무기(`GetEquippedWeaponId`)의 `MeleeProjectileGravitySimulationMultiplier`를 쿼리하여 `Game::SilentAim::SetProjectileGravityMultiplier`로 원자적 발행.
+     - 노리코일/노스프레드가 꺼져 있는 상태에서도 무기 중력 계수 감지가 항상 정상 동작하도록 메인 틱 실행 흐름 분기 개선.
+     - 무기 교체 또는 개조부품 변경 시 값이 달라질 때만 로그 출력(`player weapon gravity multiplier changed`).
+  2. `src/game/silent_aim.h` & `src/game/silent_aim.cpp`:
+     - `CalculateBallisticTrajectory` 시그니처에 `float gravity` 추가.
+     - $g < 0.001f$ (무중력 상태)일 때 기존 2차 방정식 포물선 계산 대신 시작점에서 타깃으로 향하는 정밀 3차원 직선 벡터($\mathbf{v} = \frac{\mathbf{target} - \mathbf{start}}{\|\mathbf{target} - \mathbf{start}\|} \times \text{speed}$) 및 회전 행렬 계산 분기 추가.
+     - `HandleSpawnerLaunchEvent` 및 `RedirectProjectileEvent`에서 atomic `projectileGravityMultiplier`를 읽어 유효 중력 $g = 20.0f \times \text{multiplier}$를 탄도학 함수에 전달.
+     - `DiagnosticsSnapshot`에 `projectileGravityMultiplier` 필드 추가 및 `GetDiagnostics()` / `Shutdown()` 연동.
+  3. `src/ui/widgets.cpp`:
+     - 오버레이 사일런트 에임 상세 진단에 `projectile gravity mult` (예: `0.00x` 또는 `1.00x`) 실시간 메트릭 표시 추가.
+  4. `src/features/aimbot.cpp`:
+     - 사일런트 에임 정기 로그에 `gMult=%.2f` 추가.
+- **빌드 및 런타임 인젝션 검증 (PID 14356)**:
+  - 무중력 칼을 장착한 상태에서 주입 시 실시간 로그 확인:
+    - `player modifier resolver: getPlayer=... add=... remove=... getStat=00007FF682E779B0 getItem=... modifierClass=... size=0x50 exactHandle=1 resolved=1`
+    - `player weapon gravity multiplier changed: weaponId=0x9EC5C5 mult=0.000`
+  - 무중력 부품 장착 칼 투척 시 $g = 0.0f$ 직선 궤적으로 타깃에 정확히 적중함을 확인.
+

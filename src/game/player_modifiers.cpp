@@ -2,12 +2,14 @@
 
 #include "entity_tracker.h"
 #include "rtti_invoker.h"
+#include "silent_aim.h"
 #include "../diagnostics.h"
 #include "../features/features.h"
 #include "../framework.h"
 
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +25,7 @@ namespace
     constexpr std::size_t kModifierCount = kRecoilModifierCount + kSpreadModifierCount;
     constexpr std::uint32_t kNoRecoilMask = 1u << 0;
     constexpr std::uint32_t kNoSpreadMask = 1u << 1;
+    constexpr std::int32_t kStatMeleeProjectileGravitySimulationMultiplier = 990;
     constexpr ULONGLONG kWorldGateFallbackMilliseconds = 1000;
     constexpr ULONGLONG kWeaponLookupGraceMilliseconds = 250;
 
@@ -79,6 +82,7 @@ namespace
         Game::Rtti::Function* getLocalPlayer = nullptr;
         Game::Rtti::Function* addModifier = nullptr;
         Game::Rtti::Function* removeModifier = nullptr;
+        Game::Rtti::Function* getStatValue = nullptr;
         Game::Rtti::Function* getItemInSlot = nullptr;
         Game::Rtti::Class* modifierDataClass = nullptr;
         std::size_t modifierDataSize = 0;
@@ -368,10 +372,14 @@ namespace
                     statsType, Game::Rtti::Hash("AddModifier"));
                 Game::Rtti::Function* removeModifier = Game::Rtti::FindFunction(
                     statsType, Game::Rtti::Hash("RemoveModifier"));
+                Game::Rtti::Function* getStatValue = Game::Rtti::FindFunction(
+                    statsType, Game::Rtti::Hash("GetStatValue"));
                 if (addModifier && Game::Rtti::ParameterCount(addModifier) == 2)
                     g_runtime.addModifier = addModifier;
                 if (removeModifier && Game::Rtti::ParameterCount(removeModifier) == 2)
                     g_runtime.removeModifier = removeModifier;
+                if (getStatValue && Game::Rtti::ParameterCount(getStatValue) == 2)
+                    g_runtime.getStatValue = getStatValue;
             }
 
             if (systems.transactionSystem)
@@ -405,11 +413,12 @@ namespace
                                                   g_runtime.modifierDataSize == kModifierDataSize &&
                                                   g_runtime.exactHandleOwnership;
         g_runtimeAvailable.store(modifierResolvedAfterAttempt, std::memory_order_release);
-        Diagnostics::Log("player modifier resolver: getPlayer=%p add=%p remove=%p getItem=%p modifierClass=%p "
-                         "size=0x%zX exactHandle=%d resolved=%d",
+        Diagnostics::Log("player modifier resolver: getPlayer=%p add=%p remove=%p getStat=%p getItem=%p "
+                         "modifierClass=%p size=0x%zX exactHandle=%d resolved=%d",
                          g_runtime.getLocalPlayer, g_runtime.addModifier, g_runtime.removeModifier,
-                         g_runtime.getItemInSlot, g_runtime.modifierDataClass, g_runtime.modifierDataSize,
-                         g_runtime.exactHandleOwnership ? 1 : 0, modifierResolvedAfterAttempt ? 1 : 0);
+                         g_runtime.getStatValue, g_runtime.getItemInSlot, g_runtime.modifierDataClass,
+                         g_runtime.modifierDataSize, g_runtime.exactHandleOwnership ? 1 : 0,
+                         modifierResolvedAfterAttempt ? 1 : 0);
         if (!modifierResolvedAfterAttempt)
             g_failures.fetch_add(1, std::memory_order_relaxed);
         return modifierResolvedAfterAttempt;
@@ -563,6 +572,39 @@ namespace
         return EquippedWeaponResult::Found;
     }
 
+    struct StatsObjectIdLayout
+    {
+        std::uint64_t id = 0;
+        std::uint64_t idType = 0;
+    };
+    static_assert(sizeof(StatsObjectIdLayout) == 0x10);
+
+    float QueryStatValue(const SystemContext& systems, std::uint64_t entityId, std::int32_t statType,
+                         float defaultValue = 1.0f)
+    {
+        if (!g_runtime.getStatValue || !systems.statsSystem || entityId == 0)
+            return defaultValue;
+
+        StatsObjectIdLayout targetObj{entityId, 0};
+        std::int32_t stat = statType;
+        Game::Rtti::Argument arguments[] = {{&targetObj}, {&stat}};
+        float value = defaultValue;
+        bool invoked = false;
+        __try
+        {
+            invoked = Game::Rtti::Invoke(g_runtime.getStatValue, systems.statsSystem, arguments, 2, &value);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            invoked = false;
+        }
+
+        if (!invoked || !std::isfinite(value))
+            return defaultValue;
+
+        return value;
+    }
+
     bool ModifierCall(const SystemContext& systems, Game::Rtti::Function* function, std::uint64_t targetId,
                       ModifierEntry& modifier)
     {
@@ -581,7 +623,8 @@ namespace
         if (!hasHandleInstance)
             return false;
 
-        Game::Rtti::Argument arguments[] = {{&targetId}, {&modifier.handle}};
+        StatsObjectIdLayout targetObj{targetId, 0};
+        Game::Rtti::Argument arguments[] = {{&targetObj}, {&modifier.handle}};
         bool result = false;
         bool hasReturnValue = false;
         __try
@@ -861,7 +904,8 @@ namespace
     }
 
     bool ProcessModifierState(const SystemContext& systems, const Game::Rtti::Handle& player,
-                              std::uint64_t playerId, bool hasPlayer, std::uint32_t desiredMask)
+                              std::uint64_t playerId, bool hasPlayer, std::uint32_t desiredMask,
+                              std::uint64_t weaponId, EquippedWeaponResult weaponResult)
     {
         const std::uintptr_t playerInstance = hasPlayer ? HandleInstanceIdentity(player) : 0;
         bool currentlyActive = g_active.load(std::memory_order_acquire);
@@ -897,8 +941,6 @@ namespace
             currentlyActive = false;
         }
 
-        std::uint64_t weaponId = 0;
-        const EquippedWeaponResult weaponResult = GetEquippedWeaponId(systems, player, weaponId);
         const bool usingWeapon = weaponResult == EquippedWeaponResult::Found;
         if (weaponResult != EquippedWeaponResult::Found && weaponResult != EquippedWeaponResult::ApiUnavailable)
         {
@@ -965,11 +1007,9 @@ namespace Game::PlayerModifiers
                                                        : g_desiredModifierMask.load(std::memory_order_acquire);
         const bool modifierActive = g_active.load(std::memory_order_acquire);
         const bool retirementPending = g_worldRetirementPending.load(std::memory_order_acquire);
-        const bool modifierPathNeeded = desiredModifierMask != 0 || modifierActive || retirementPending;
-        if (!modifierPathNeeded)
+        if (cleanupRequested && !modifierActive && !retirementPending)
         {
-            if (cleanupRequested)
-                g_cleanupAcknowledged.store(true, std::memory_order_release);
+            g_cleanupAcknowledged.store(true, std::memory_order_release);
             SetMainTickStage(MainTickStage::Idle);
             return;
         }
@@ -1039,8 +1079,40 @@ namespace Game::PlayerModifiers
         std::uint64_t playerId = 0;
         const bool hasPlayer = GetLocalPlayer(systems, player, playerId);
 
-        SetMainTickStage(MainTickStage::ProcessModifiers);
-        ProcessModifierState(systems, player, playerId, hasPlayer, desiredModifierMask);
+        std::uint64_t weaponId = 0;
+        EquippedWeaponResult weaponResult = EquippedWeaponResult::NoItem;
+        if (hasPlayer)
+        {
+            weaponResult = GetEquippedWeaponId(systems, player, weaponId);
+            const bool usingWeapon = weaponResult == EquippedWeaponResult::Found;
+
+            float gravityMultiplier = 1.0f;
+            if (usingWeapon && weaponId != 0)
+            {
+                gravityMultiplier =
+                    QueryStatValue(systems, weaponId, kStatMeleeProjectileGravitySimulationMultiplier, 1.0f);
+            }
+            Game::SilentAim::SetProjectileGravityMultiplier(gravityMultiplier);
+
+            static float s_lastLoggedGravity = -999.0f;
+            if (std::abs(gravityMultiplier - s_lastLoggedGravity) > 0.001f)
+            {
+                s_lastLoggedGravity = gravityMultiplier;
+                Diagnostics::Log("player weapon gravity multiplier changed: weaponId=0x%llX mult=%.3f",
+                                 static_cast<unsigned long long>(weaponId), gravityMultiplier);
+            }
+        }
+        else
+        {
+            Game::SilentAim::SetProjectileGravityMultiplier(1.0f);
+        }
+
+        const bool modifierPathNeeded = desiredModifierMask != 0 || modifierActive || retirementPending;
+        if (modifierPathNeeded)
+        {
+            SetMainTickStage(MainTickStage::ProcessModifiers);
+            ProcessModifierState(systems, player, playerId, hasPlayer, desiredModifierMask, weaponId, weaponResult);
+        }
 
         SetMainTickStage(MainTickStage::ReleasePlayer);
         ReleaseLocalHandle(player);
@@ -1083,6 +1155,7 @@ namespace Game::PlayerModifiers
 
     void Shutdown()
     {
+        Game::SilentAim::SetProjectileGravityMultiplier(1.0f);
         g_desiredModifierMask.store(0, std::memory_order_release);
         g_cleanupRequested.store(false, std::memory_order_release);
         g_cleanupAcknowledged.store(false, std::memory_order_release);

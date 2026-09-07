@@ -34,11 +34,14 @@ namespace Game::SilentAim
         std::uint64_t spawnerLaunchEvents = 0;
         std::uint64_t spawnerLaunchRedirects = 0;
         std::uint64_t orientationRedirects = 0;
+        float projectileGravityMultiplier = 1.0f;
     };
 
     // Resolves the native crosshair core (hitscan mutation path) and projectile ShootEvent listeners
     // (throwing knife/axe ballistic mutation path). Call after MH_Initialize and before MH_EnableHook.
     bool CreateHook();
+
+    void SetProjectileGravityMultiplier(float multiplier);
 
     // Present publishes only plain coordinates. Native callbacks use freshness as an early filter, so a target
     // that stops being published (out of FOV, dead, or occluded while visibleOnly is on) stops being redirected.

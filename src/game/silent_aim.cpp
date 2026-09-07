@@ -225,6 +225,7 @@ namespace
         std::atomic<float> lastCameraY{0.0f};
         std::atomic<float> lastCameraZ{0.0f};
         std::atomic_bool lastCameraValid{false};
+        std::atomic<float> projectileGravityMultiplier{1.0f};
     };
 
     State g_state;
@@ -509,7 +510,7 @@ namespace
     }
 
     bool CalculateBallisticTrajectory(const Vector4Layout& start, const float target[3],
-                                      float speed, Vector4Layout& outVelocity, MatrixLayout& outOrientation)
+                                      float speed, float gravity, Vector4Layout& outVelocity, MatrixLayout& outOrientation)
     {
         const float dx = target[0] - start.x;
         const float dy = target[1] - start.y;
@@ -526,21 +527,39 @@ namespace
         float vy = 0.0f;
         float vz = 0.0f;
 
-        const float g = kProjectileGravity;
-        const float A = 0.25f * g * g;
-        const float B = g * dz - speed * speed;
-        const float C = distTotalSq;
-        const float disc = B * B - 4.0f * A * C;
-
-        if (disc >= 0.0f && distHorizontal > 0.05f)
+        const float g = (std::isfinite(gravity) && gravity >= 0.0f) ? gravity : kProjectileGravity;
+        if (g < 0.001f)
         {
-            const float u = (-B - std::sqrt(disc)) / (2.0f * A);
-            if (u > 0.0001f)
+            // Zero-gravity weapon modification (e.g. "무중력" mod): straight line directly to target.
+            const float scale = speed / distTotal;
+            vx = dx * scale;
+            vy = dy * scale;
+            vz = dz * scale;
+        }
+        else
+        {
+            const float A = 0.25f * g * g;
+            const float B = g * dz - speed * speed;
+            const float C = distTotalSq;
+            const float disc = B * B - 4.0f * A * C;
+
+            if (disc >= 0.0f && distHorizontal > 0.05f)
             {
-                const float t = std::sqrt(u);
-                vx = dx / t;
-                vy = dy / t;
-                vz = dz / t + 0.5f * g * t;
+                const float u = (-B - std::sqrt(disc)) / (2.0f * A);
+                if (u > 0.0001f)
+                {
+                    const float t = std::sqrt(u);
+                    vx = dx / t;
+                    vy = dy / t;
+                    vz = dz / t + 0.5f * g * t;
+                }
+                else
+                {
+                    const float scale = speed / distTotal;
+                    vx = dx * scale;
+                    vy = dy * scale;
+                    vz = dz * scale;
+                }
             }
             else
             {
@@ -549,13 +568,6 @@ namespace
                 vy = dy * scale;
                 vz = dz * scale;
             }
-        }
-        else
-        {
-            const float scale = speed / distTotal;
-            vx = dx * scale;
-            vy = dy * scale;
-            vz = dz * scale;
         }
 
         outVelocity.x = vx;
@@ -750,7 +762,9 @@ namespace
                 Vector4Layout launchVel{};
                 MatrixLayout launchRot{};
                 constexpr float kDefaultKnifeSpeed = 110.0f;
-                if (CalculateBallisticTrajectory(start, target, kDefaultKnifeSpeed, launchVel, launchRot))
+                const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
+                const float effectiveGravity = kProjectileGravity * ((std::isfinite(mult) && mult >= 0.0f) ? mult : 1.0f);
+                if (CalculateBallisticTrajectory(start, target, kDefaultKnifeSpeed, effectiveGravity, launchVel, launchRot))
                 {
                     const Vector4Layout quat = MatrixToQuaternion(launchRot);
                     g_state.spawnerQuatX.store(quat.x, std::memory_order_relaxed);
@@ -767,10 +781,11 @@ namespace
             const std::uint64_t redirected = g_state.redirectedShots.fetch_add(1, std::memory_order_relaxed) + 1;
             if (redirected <= 8 || (redirected % 16u) == 0)
             {
+                const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
                 Diagnostics::Log("silent aim spawner launch redirected: count=%llu entity=%p owner=%p "
-                                 "target=(%.2f,%.2f,%.2f) logical=%p visual=%p",
+                                 "target=(%.2f,%.2f,%.2f) logical=%p visual=%p gMult=%.2f",
                                  static_cast<unsigned long long>(redirected), entity, owner->instance,
-                                 target[0], target[1], target[2], logicalProvider, visualProvider);
+                                 target[0], target[1], target[2], logicalProvider, visualProvider, mult);
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -869,7 +884,9 @@ namespace
 
         Vector4Layout newVelocity{};
         MatrixLayout newOrientation{};
-        if (!CalculateBallisticTrajectory(*start, target, speed, newVelocity, newOrientation))
+        const float mult = g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
+        const float effectiveGravity = kProjectileGravity * ((std::isfinite(mult) && mult >= 0.0f) ? mult : 1.0f);
+        if (!CalculateBallisticTrajectory(*start, target, speed, effectiveGravity, newVelocity, newOrientation))
         {
             g_state.rejectedShots.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -1438,6 +1455,11 @@ namespace Game::SilentAim
         }
     }
 
+    void SetProjectileGravityMultiplier(float multiplier)
+    {
+        g_state.projectileGravityMultiplier.store(multiplier, std::memory_order_release);
+    }
+
     void PublishTarget(const float worldTarget[3], bool active)
     {
         if (!active || !worldTarget || !g_state.hookCreated.load(std::memory_order_acquire) ||
@@ -1491,6 +1513,8 @@ namespace Game::SilentAim
         result.spawnerLaunchEvents = g_state.spawnerLaunchEvents.load(std::memory_order_relaxed);
         result.spawnerLaunchRedirects = g_state.spawnerLaunchRedirects.load(std::memory_order_relaxed);
         result.orientationRedirects = g_state.orientationRedirects.load(std::memory_order_relaxed);
+        result.projectileGravityMultiplier =
+            g_state.projectileGravityMultiplier.load(std::memory_order_relaxed);
         return result;
     }
 
@@ -1529,6 +1553,7 @@ namespace Game::SilentAim
         g_state.spawnerLogicalProvider.store(nullptr, std::memory_order_release);
         g_state.spawnerVisualProvider.store(nullptr, std::memory_order_release);
         g_state.spawnerArmedAt.store(0, std::memory_order_release);
+        g_state.projectileGravityMultiplier.store(1.0f, std::memory_order_release);
         const std::uint32_t producerCount = g_state.producerHooks.exchange(0, std::memory_order_acq_rel);
         for (std::uint32_t index = 0; index < producerCount && index < kMaxProducerHooks; ++index)
         {
